@@ -166,3 +166,101 @@ A comprehensive security review has been conducted on this plan:
 - [ ] Integrate into `MultiProvider` and `AgentConfig`.
 - [ ] Implement `vertex/` prefix routing.
 - [ ] Verify with `vertex/gemini-2.5-flash`.
+
+## Stage 2: Robust Multi-Model Support
+
+This stage extends the `VertexProvider` to support dynamic model switching, including non-foundation models (e.g., Anthropic Claude, Meta Llama) and global endpoints for Google preview models.
+
+### 1. Architecture: Response Adapters
+
+To support `streamRawPredict` for various publishers (Google, Anthropic, Meta) which return different stream formats, we will introduce a `ResponseAdapter` trait.
+
+- **Trait Definition**:
+
+  ```rust
+  trait ResponseAdapter {
+      fn parse_chunk(&self, chunk: &[u8]) -> Result<Vec<AgentMessage>, Error>;
+  }
+  ```
+
+- **Implementations**:
+  - `GeminiAdapter`: Handles standard Google `streamGenerateContent` JSON format.
+  - `AnthropicAdapter`: Handles Anthropic's SSE format (event: completion, data: ...).
+  - `LlamaAdapter`: Handles standard Llama/vLLM formats if standardization exists.
+  - `OpenAIAdapter`: Handles generic OpenAI-compatible SSE format (`data: [DONE]`, `data: {...}`).
+
+### 2. Model Resolution & Routing
+
+The `VertexProvider` will route requests based on the `model_id`.
+
+- **Routing Logic**:
+  - **Explicit Endpoint**: `vertex/endpoint/{region}/{id}` (e.g., `vertex/endpoint/us-central1/123456`, `vertex/endpoint/us-central1/mg-endpoint-548d...`)
+    - **Security**: `id` must match `^[a-z0-9-]+$`. `region` must match allowed pattern `[a-z0-9-]+`.
+    - **Adapter**: Defaults to `GeminiAdapter` unless specified (e.g., via config override).
+  - **Publisher Models**:
+    - `vertex/anthropic/...` -> Uses `AnthropicAdapter` + `streamRawPredict`.
+    - `vertex/meta/...` -> Uses `LlamaAdapter` + `streamRawPredict`.
+    - `vertex/google/...` -> Uses `GeminiAdapter` + `streamGenerateContent`.
+  - **Global Models**:
+    - **Automatic**: Models matching `gemini-3.*-preview` or `gemini-experimental` automatically use `aiplatform.googleapis.com`.
+    - **Configured**: Additional models listed in `vertex_global_models` config.
+
+### 3. Automatic Adapter Resolution & Discovery
+
+The system must automatically determine *how* to run a discovered model without manual adapter configuration.
+
+- **Discovery & Inference Logic**:
+  - When `vertex_allowed_publishers` are queried or Endpoints are listed:
+    1. **Fetch Metadata**: Get `Model` resource from Vertex API.
+    2. **Infer Adapter**:
+       - **Google/Gemini**: `publisher="google"` AND `name` contains "gemini". -> `GeminiAdapter`
+       - **Anthropic**: `publisher="anthropic"` (or "google" with specific container images). -> `AnthropicAdapter`
+       - **Meta/Llama**: `publisher="meta"` OR specific container image URIs. -> `LlamaAdapter`
+       - **Hugging Face/Custom**: Analyze `containerSpec.imageUri` or `env` vars.
+         - known vLLM/TGI images -> `OpenAIAdapter` (vLLM usually supports this).
+         - explicitly marked "openai" -> `OpenAIAdapter`.
+         - unknown -> Default to `OpenAIAdapter` (Most common standard) or warn.
+    3. **Cache**: Store `{ model_id: (adapter_type, endpoint_url) }` in `~/.config/carapace/vertex_cache.json`.
+
+### 4. User Workflow
+
+1. **List**: `carapace list-models --backend vertex`
+   - Scans project, infers adapters, updates cache.
+   - Outputs: `Short ID | Display Name | Adapter | Status`
+     - *Short ID Example*: `mg-endpoint-123` (derived from full resource name)
+2. **Select & Run**:
+   - **Interactive**: User can just type the Short ID (e.g., `mg-endpoint-123`).
+     - CLI resolves `mg-endpoint-123` -> `vertex/endpoint/...` from cache.
+   - **Command Line**: `carapace chat --model vertex/mg-endpoint-123`
+   - **Automatic Execution**: Provider looks up ID in cache -> finds Adapter -> executes request.
+
+### 5. Configuration
+
+- `vertex_project_id`: GCP Project ID.
+- `vertex_location`: GCP Region.
+- `vertex_model_id`: Default model Short ID to use.
+- `vertex_global_models`: List of *additional* model IDs that force the global endpoint (built-in list includes `gemini-3.*-preview`).
+- `vertex_allowed_publishers`: Whitelist of publishers to discover (default: `[google, anthropic, meta]`).
+
+### 6. Security Enhancements
+
+- **SSRF Prevention**:
+  - Validate `endpoint_id` matches `^[a-z0-9-]+$` (supporting both numeric IDs and `mg-endpoint-...` formats).
+  - Validate `region` against a regex `^[a-z]+-[a-z]+\d+$`.
+- **IAM Scoping**:
+  - Document that the Service Account should minimally have `aiplatform.user` role.
+  - Notes for `GCloudCliProvider`: It runs as the user, so "allowed endpoints" config is recommended for shared environments.
+
+### 7. Implementation Steps for Stage 2
+
+1. **Define `ResponseAdapter` trait** and implement for `Gemini`, `Anthropic`, and `OpenAI`.
+2. **Implement `ModelInference` logic**:
+   - Create functions to map `Model` resource fields to `ResponseAdapter` variants.
+   - Implement "Short ID" generation (last segment of resource name).
+3. **Implement `discovery` module**:
+   - `fetch_all_models()`
+   - `update_cache()`
+4. **Add CLI Command**: `list-models`.
+5. **Update `VertexProvider`** to:
+   - Load adapter from cache/inference.
+   - Resolve Short IDs from cache during initialization.
