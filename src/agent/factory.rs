@@ -289,6 +289,12 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         .or_else(|| std::env::var("VERTEX_LOCATION").ok())
         .unwrap_or_else(|| "us-central1".to_string());
 
+    let vertex_model = vertex_cfg
+        .and_then(|v| v.get("model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_MODEL").ok());
+
     let vertex_provider = if let Some(project_id) = vertex_project_id {
         info!(
             "LLM provider configured: Vertex (project: {}, location: {})",
@@ -298,6 +304,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             Arc::new(agent::vertex::VertexProvider::new(
                 project_id,
                 vertex_location,
+                vertex_model,
             )) as Arc<dyn agent::LlmProvider>,
         )
     } else {
@@ -330,7 +337,7 @@ pub struct ProviderFingerprint {
     pub gemini: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
-    pub vertex: Option<(String, String)>,
+    pub vertex: Option<(String, String, Option<String>)>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -408,6 +415,11 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| std::env::var("VERTEX_LOCATION").ok());
+    let vertex_model = vertex_cfg
+        .and_then(|v| v.get("model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_MODEL").ok());
 
     let bedrock_enabled = bedrock_cfg
         .and_then(|b| b.get("enabled"))
@@ -441,20 +453,13 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
         bedrock: if bedrock_enabled {
             match (bedrock_region, bedrock_access_key) {
-                (Some(r), Some(ak)) => {
-                    let combined = format!("{}{}", r, ak);
-                    Some(hash_key_prefix(&combined))
-                }
+                (Some(r), Some(k)) => Some(format!("{}:{}...{}", r, &k[..4], &k[k.len() - 4..])),
                 _ => None,
             }
         } else {
             None
         },
-        vertex: match (vertex_project_id, vertex_location) {
-            (Some(p), Some(l)) => Some((p, l)),
-            (Some(p), None) => Some((p, "us-central1".to_string())),
-            _ => None,
-        },
+        vertex: vertex_project_id.map(|p| (p, vertex_location.unwrap_or_default(), vertex_model)),
     }
 }
 

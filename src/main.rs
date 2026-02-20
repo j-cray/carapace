@@ -124,6 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+
+        Some(Command::ListModels { project_id, location }) => {
+            cli::handle_list_models(&project_id, &location).await
+        }
     }
 }
 

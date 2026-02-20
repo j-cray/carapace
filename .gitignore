@@ -25,3 +25,5 @@ fuzz/artifacts
 test_config.json5
 test_vertex_config.json5
 .direnv
+carapace.json5
+carapace.json

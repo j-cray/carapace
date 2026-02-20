@@ -496,7 +496,10 @@ fn default_ack_reaction_scope() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VertexDefaults {
-    #[serde(default = "default_vertex_project_id")]
+    #[serde(
+        default = "default_vertex_project_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     project_id: Option<String>,
 
     #[serde(default = "default_vertex_location")]
@@ -793,6 +796,21 @@ mod tests {
             config["agents"]["defaults"]["maxConcurrent"],
             DEFAULT_AGENT_MAX_CONCURRENT
         );
+    }
+
+    #[test]
+    fn test_vertex_project_id_omitted_when_missing() {
+        // Ensure env var is not set
+        env::remove_var("VERTEX_PROJECT_ID");
+
+        let mut config = json!({});
+        apply_defaults(&mut config);
+
+        // Should be absent, NOT null
+        assert!(config["vertex"].get("projectId").is_none());
+
+        // Location should still be present (default us-central1)
+        assert_eq!(config["vertex"]["location"], "us-central1");
     }
 
     #[test]

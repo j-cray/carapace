@@ -774,6 +774,16 @@ fn validate_vertex(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             });
         }
     }
+
+    if let Some(model) = vertex.get("model") {
+        if !model.is_string() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".vertex.model".to_string(),
+                message: "model must be a string".to_string(),
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
