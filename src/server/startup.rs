@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::routing::get;
 use axum::Router;
 use serde_json::Value;
@@ -24,6 +25,51 @@ use crate::plugins::PluginRegistry;
 use crate::server::http::{HttpConfig, MiddlewareConfig};
 use crate::server::ws::WsServerState;
 use crate::sessions;
+use crate::tasks::{DurableTask, TaskExecutionOutcome, TaskExecutor};
+
+struct RuntimeTaskExecutor {
+    state: Arc<WsServerState>,
+}
+
+const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
+const NO_PROVIDER_MAX_RETRY_ATTEMPTS: u32 = 3_600;
+
+#[async_trait]
+impl TaskExecutor for RuntimeTaskExecutor {
+    async fn execute(&self, task: DurableTask) -> TaskExecutionOutcome {
+        let payload = match serde_json::from_value::<crate::cron::CronPayload>(task.payload) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return TaskExecutionOutcome::Failed {
+                    error: format!("invalid task payload: {err}"),
+                };
+            }
+        };
+
+        match crate::cron::executor::execute_payload(&task.id, &payload, &self.state).await {
+            Ok(_) => TaskExecutionOutcome::Done,
+            Err(crate::cron::executor::CronExecuteError::LlmNotConfigured) => {
+                if task.attempts >= NO_PROVIDER_MAX_RETRY_ATTEMPTS {
+                    TaskExecutionOutcome::Failed {
+                        error: format!(
+                            "{} (retry limit reached: {})",
+                            crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
+                            NO_PROVIDER_MAX_RETRY_ATTEMPTS
+                        ),
+                    }
+                } else {
+                    TaskExecutionOutcome::RetryWait {
+                        delay_ms: NO_PROVIDER_RETRY_DELAY_MS,
+                        error: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
+                    }
+                }
+            }
+            Err(crate::cron::executor::CronExecuteError::Other(error)) => {
+                TaskExecutionOutcome::Failed { error }
+            }
+        }
+    }
+}
 
 /// Everything needed to start a non-TLS Carapace server.
 pub struct ServerConfig {
@@ -98,6 +144,7 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     tokio::fs::create_dir_all(&state_dir).await?;
     tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
     tokio::fs::create_dir_all(state_dir.join("cron")).await?;
+    tokio::fs::create_dir_all(state_dir.join("tasks")).await?;
     crate::logging::audit::AuditLog::init(state_dir.clone()).await;
     init_media_store_cleanup().await;
     Ok(state_dir)
@@ -267,6 +314,17 @@ pub fn spawn_background_tasks(
     raw_config: &Value,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
+    // Durable task worker loop
+    let task_executor = Arc::new(RuntimeTaskExecutor {
+        state: ws_state.clone(),
+    });
+    tokio::spawn(crate::tasks::task_worker_loop(
+        ws_state.task_queue().clone(),
+        task_executor,
+        Duration::from_secs(1),
+        shutdown_rx.clone(),
+    ));
+
     // Delivery loop
     if let Some(plugin_reg) = ws_state.plugin_registry().cloned() {
         let pipeline = ws_state.message_pipeline().clone();
@@ -438,4 +496,88 @@ pub async fn run_server_with_config(
         ws_state: config.ws_state,
         server_task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cron::CronPayload;
+    use crate::server::ws::WsServerConfig;
+
+    fn durable_task_with_payload(payload: serde_json::Value, attempts: u32) -> DurableTask {
+        DurableTask {
+            id: "task-1".to_string(),
+            state: crate::tasks::TaskState::Queued,
+            attempts,
+            next_run_at_ms: None,
+            last_error: None,
+            payload,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_retries_when_provider_missing() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let payload = serde_json::to_value(CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: None,
+            thinking: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        })
+        .expect("payload serializes");
+
+        let outcome = executor
+            .execute(durable_task_with_payload(payload, 1))
+            .await;
+        assert_eq!(
+            outcome,
+            TaskExecutionOutcome::RetryWait {
+                delay_ms: NO_PROVIDER_RETRY_DELAY_MS,
+                error: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_fails_after_provider_retry_limit() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let payload = serde_json::to_value(CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: None,
+            thinking: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        })
+        .expect("payload serializes");
+
+        let outcome = executor
+            .execute(durable_task_with_payload(
+                payload,
+                NO_PROVIDER_MAX_RETRY_ATTEMPTS,
+            ))
+            .await;
+        assert_eq!(
+            outcome,
+            TaskExecutionOutcome::Failed {
+                error: format!(
+                    "{} (retry limit reached: {})",
+                    crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
+                    NO_PROVIDER_MAX_RETRY_ATTEMPTS
+                ),
+            }
+        );
+    }
 }
