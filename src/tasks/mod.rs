@@ -58,6 +58,18 @@ impl TaskState {
     }
 }
 
+/// Classified blocked reasons for operator-visible task handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskBlockedReason {
+    ApprovalRequired,
+    ConfigMissing,
+    DeliveryFailure,
+    ExternalDependency,
+    OperatorActionRequired,
+    Unknown,
+}
+
 /// Per-task continuation policy budgets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +91,24 @@ impl Default for TaskPolicy {
     }
 }
 
+/// Partial operator patch for a task continuation policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskPolicyPatch {
+    pub max_attempts: Option<u32>,
+    pub max_total_runtime_ms: Option<u64>,
+    pub max_turns: Option<u32>,
+    pub max_run_timeout_seconds: Option<u32>,
+}
+
+impl TaskPolicyPatch {
+    pub fn has_updates(&self) -> bool {
+        self.max_attempts.is_some()
+            || self.max_total_runtime_ms.is_some()
+            || self.max_turns.is_some()
+            || self.max_run_timeout_seconds.is_some()
+    }
+}
+
 /// A single persisted task record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,6 +125,8 @@ pub struct DurableTask {
     pub run_ids: Vec<String>,
     #[serde(default)]
     pub policy: TaskPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<TaskBlockedReason>,
     /// True when the task was created with an explicit continuation policy.
     /// Legacy tasks loaded from pre-policy queue files default to false.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -217,6 +249,7 @@ impl TaskQueue {
             updated_at_ms: now,
             run_ids: Vec::new(),
             policy,
+            blocked_reason: None,
             policy_explicit: true,
         };
 
@@ -300,6 +333,7 @@ impl TaskQueue {
                     updated_at_ms: now,
                     run_ids: Vec::new(),
                     policy: policy_fallback,
+                    blocked_reason: None,
                     policy_explicit: true,
                 }
             }
@@ -381,6 +415,7 @@ impl TaskQueue {
                 task.last_error = None;
                 task.next_run_at_ms = None;
                 task.updated_at_ms = now;
+                task.blocked_reason = None;
                 if let Some(run_id) = run_id {
                     let run_id = run_id.trim();
                     if !run_id.is_empty() && !task.run_ids.iter().any(|existing| existing == run_id)
@@ -402,12 +437,13 @@ impl TaskQueue {
                 task.last_error = Some(error.to_string());
                 task.next_run_at_ms = None;
                 task.updated_at_ms = now;
+                task.blocked_reason = None;
             },
         )
     }
 
     /// Mark a task as blocked.
-    pub fn mark_blocked(&self, id: &str, reason: &str) -> bool {
+    pub fn mark_blocked(&self, id: &str, reason: &str, category: TaskBlockedReason) -> bool {
         self.update_task_if(
             id,
             |task| task.state == TaskState::Running,
@@ -416,6 +452,7 @@ impl TaskQueue {
                 task.last_error = Some(reason.to_string());
                 task.next_run_at_ms = None;
                 task.updated_at_ms = now;
+                task.blocked_reason = Some(category);
             },
         )
     }
@@ -430,6 +467,7 @@ impl TaskQueue {
                 task.last_error = reason.map(ToString::to_string);
                 task.next_run_at_ms = None;
                 task.updated_at_ms = now;
+                task.blocked_reason = None;
             },
         )
     }
@@ -452,6 +490,74 @@ impl TaskQueue {
                 task.state = TaskState::RetryWait;
                 task.last_error = Some(error.to_string());
                 task.next_run_at_ms = Some(now.saturating_add(delay_ms));
+                task.updated_at_ms = now;
+                task.blocked_reason = None;
+            },
+        )
+    }
+
+    /// Resume a blocked task by moving it back to `retry_wait`.
+    pub fn resume_blocked_task(&self, id: &str, delay_ms: u64, reason: &str) -> bool {
+        self.update_task_if(
+            id,
+            |task| task.state == TaskState::Blocked,
+            |task, now| {
+                task.state = TaskState::RetryWait;
+                task.last_error = Some(reason.to_string());
+                task.next_run_at_ms = Some(now.saturating_add(delay_ms));
+                task.updated_at_ms = now;
+                task.blocked_reason = None;
+            },
+        )
+    }
+
+    /// Patch mutable task fields for operator remediation.
+    ///
+    /// Intended for blocked/failed/cancelled/retry_wait/queued tasks where an
+    /// operator needs to adjust payload or policy before retrying/resuming.
+    pub fn patch_task(
+        &self,
+        id: &str,
+        payload: Option<Value>,
+        policy_patch: Option<TaskPolicyPatch>,
+        reason: Option<&str>,
+    ) -> bool {
+        if payload.is_none()
+            && reason.is_none()
+            && policy_patch
+                .as_ref()
+                .is_none_or(|patch| !patch.has_updates())
+        {
+            return false;
+        }
+
+        self.update_task_if(
+            id,
+            |task| !matches!(task.state, TaskState::Running | TaskState::Done),
+            move |task, now| {
+                if let Some(payload) = &payload {
+                    task.payload = payload.clone();
+                }
+                if let Some(policy_patch) = &policy_patch {
+                    if let Some(max_attempts) = policy_patch.max_attempts {
+                        task.policy.max_attempts = max_attempts;
+                    }
+                    if let Some(max_total_runtime_ms) = policy_patch.max_total_runtime_ms {
+                        task.policy.max_total_runtime_ms = max_total_runtime_ms;
+                    }
+                    if let Some(max_turns) = policy_patch.max_turns {
+                        task.policy.max_turns = max_turns;
+                    }
+                    if let Some(max_run_timeout_seconds) = policy_patch.max_run_timeout_seconds {
+                        task.policy.max_run_timeout_seconds = max_run_timeout_seconds;
+                    }
+                    if policy_patch.has_updates() {
+                        task.policy_explicit = true;
+                    }
+                }
+                if let Some(reason) = reason {
+                    task.last_error = Some(reason.to_string());
+                }
                 task.updated_at_ms = now;
             },
         )
@@ -562,11 +668,23 @@ fn is_due(task: &DurableTask, now: u64) -> bool {
 /// Result of executing a claimed task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskExecutionOutcome {
-    Done { run_id: Option<String> },
-    RetryWait { delay_ms: u64, error: String },
-    Blocked { reason: String },
-    Failed { error: String },
-    Cancelled { reason: Option<String> },
+    Done {
+        run_id: Option<String>,
+    },
+    RetryWait {
+        delay_ms: u64,
+        error: String,
+    },
+    Blocked {
+        reason: String,
+        category: TaskBlockedReason,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled {
+        reason: Option<String>,
+    },
 }
 
 #[async_trait]
@@ -637,13 +755,13 @@ pub async fn task_worker_loop(
                     })
                     .await,
                 ),
-                TaskExecutionOutcome::Blocked { reason } => (
+                TaskExecutionOutcome::Blocked { reason, category } => (
                     "blocked",
                     tokio::task::spawn_blocking({
                         let queue = queue.clone();
                         let task_id = task_id.clone();
                         let reason = reason.clone();
-                        move || queue.mark_blocked(&task_id, &reason)
+                        move || queue.mark_blocked(&task_id, &reason, category)
                     })
                     .await,
                 ),
@@ -732,6 +850,33 @@ mod tests {
     }
 
     #[test]
+    fn test_resume_blocked_task_allows_only_blocked_state() {
+        let queue = TaskQueue::in_memory();
+        let blocked = queue.enqueue(
+            serde_json::json!({"kind":"systemEvent","text":"blocked"}),
+            None,
+        );
+        let queued = queue.enqueue(
+            serde_json::json!({"kind":"systemEvent","text":"queued"}),
+            None,
+        );
+
+        let _ = queue.claim_due(u64::MAX, 32);
+        assert!(queue.mark_blocked(
+            &blocked.id,
+            "awaiting operator",
+            TaskBlockedReason::OperatorActionRequired
+        ));
+        assert!(!queue.resume_blocked_task(&queued.id, 1000, "resume queued"));
+        assert!(queue.resume_blocked_task(&blocked.id, 1000, "resume blocked"));
+
+        let updated = queue.get(&blocked.id).expect("blocked task should exist");
+        assert_eq!(updated.state, TaskState::RetryWait);
+        assert_eq!(updated.last_error.as_deref(), Some("resume blocked"));
+        assert!(updated.blocked_reason.is_none());
+    }
+
+    #[test]
     fn test_mark_done_requires_running_and_records_run_id() {
         let queue = TaskQueue::in_memory();
         let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
@@ -751,10 +896,18 @@ mod tests {
         let queue = TaskQueue::in_memory();
         let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
         let _ = queue.claim_due(now_ms(), 1);
-        assert!(queue.mark_blocked(&task.id, "waiting approval"));
+        assert!(queue.mark_blocked(
+            &task.id,
+            "waiting approval",
+            TaskBlockedReason::ApprovalRequired
+        ));
         let updated = queue.get(&task.id).expect("task should exist");
         assert_eq!(updated.state, TaskState::Blocked);
         assert_eq!(updated.last_error.as_deref(), Some("waiting approval"));
+        assert_eq!(
+            updated.blocked_reason,
+            Some(TaskBlockedReason::ApprovalRequired)
+        );
         assert_eq!(updated.next_run_at_ms, None);
     }
 
@@ -897,6 +1050,7 @@ mod tests {
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
+                    blocked_reason: Some(TaskBlockedReason::Unknown),
                     policy_explicit: true,
                 });
             }
@@ -929,6 +1083,7 @@ mod tests {
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
+                    blocked_reason: None,
                     policy_explicit: true,
                 });
             }
@@ -972,6 +1127,7 @@ mod tests {
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
+                    blocked_reason: None,
                     policy_explicit: true,
                 });
             }
@@ -1102,6 +1258,7 @@ mod tests {
             queue.clone(),
             TaskExecutionOutcome::Blocked {
                 reason: "needs operator action".to_string(),
+                category: TaskBlockedReason::OperatorActionRequired,
             },
         )
         .await;
@@ -1109,6 +1266,10 @@ mod tests {
         let updated = queue.get(&task.id).expect("task should exist");
         assert_eq!(updated.state, TaskState::Blocked);
         assert_eq!(updated.last_error.as_deref(), Some("needs operator action"));
+        assert_eq!(
+            updated.blocked_reason,
+            Some(TaskBlockedReason::OperatorActionRequired)
+        );
         assert_eq!(updated.next_run_at_ms, None);
     }
 
