@@ -38,6 +38,7 @@ pub enum VerifyOutcomeSelection {
     Discord,
     Telegram,
     Hooks,
+    Autonomy,
 }
 
 #[derive(Subcommand, Debug)]
@@ -181,7 +182,7 @@ pub enum Command {
         port: Option<u16>,
     },
 
-    /// Verify that a first-run outcome works end-to-end.
+    /// Verify outcome paths, including long-running autonomy execution.
     Verify {
         /// Which outcome to verify (default: infer from config).
         #[arg(long, value_enum, default_value_t = VerifyOutcomeSelection::Auto)]
@@ -961,6 +962,21 @@ async fn send_control_request(
     query: &[(&str, String)],
     body: Option<Value>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let GatewayAuth { token, password } = resolve_gateway_auth().await;
+    let auth = GatewayAuth { token, password };
+    let url = build_control_url(host, port, path, query)?;
+    send_control_request_with_client_and_auth(&client, &auth, method, url, body).await
+}
+
+fn build_control_url(
+    host: &str,
+    port: u16,
+    path: &str,
+    query: &[(&str, String)],
+) -> Result<Url, Box<dyn std::error::Error>> {
     let mut url = Url::parse(&format!("http://{}:{}{}", host, port, path))
         .map_err(|e| format!("failed to build control URL: {e}"))?;
     if !query.is_empty() {
@@ -969,25 +985,31 @@ async fn send_control_request(
             pairs.append_pair(key, value);
         }
     }
+    Ok(url)
+}
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
-    let GatewayAuth { token, password } = resolve_gateway_auth().await;
-
+async fn send_control_request_with_client_and_auth(
+    client: &reqwest::Client,
+    auth: &GatewayAuth,
+    method: reqwest::Method,
+    url: Url,
+    body: Option<Value>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let request_url = url.clone();
     let mut request = client.request(method, url);
-    if let Some(token) = token {
+    if let Some(token) = auth.token.as_deref() {
         request = request.bearer_auth(token);
-    } else if let Some(password) = password {
+    } else if let Some(password) = auth.password.as_deref() {
         request = request.bearer_auth(password);
     }
     if let Some(body) = body {
         request = request.json(&body);
     }
 
-    let response = request.send().await.map_err(|e| {
-        format!("failed to send control request (host={host}, port={port}, path={path}): {e}")
-    })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("failed to send control request ({request_url}): {e}"))?;
     let status = response.status();
     let bytes = response.bytes().await?;
     if !status.is_success() {
@@ -2326,14 +2348,47 @@ impl SetupOutcome {
     }
 }
 
-impl VerifyOutcomeSelection {
-    fn resolved(self, cfg: &Value) -> SetupOutcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyOutcome {
+    LocalChat,
+    Discord,
+    Telegram,
+    Hooks,
+    Autonomy,
+}
+
+impl VerifyOutcome {
+    fn key(self) -> &'static str {
         match self {
-            Self::Auto => infer_setup_outcome_from_config(cfg),
-            Self::LocalChat => SetupOutcome::LocalChat,
-            Self::Discord => SetupOutcome::Discord,
-            Self::Telegram => SetupOutcome::Telegram,
-            Self::Hooks => SetupOutcome::Hooks,
+            Self::LocalChat => "local-chat",
+            Self::Discord => "discord",
+            Self::Telegram => "telegram",
+            Self::Hooks => "hooks",
+            Self::Autonomy => "autonomy",
+        }
+    }
+}
+
+impl From<SetupOutcome> for VerifyOutcome {
+    fn from(value: SetupOutcome) -> Self {
+        match value {
+            SetupOutcome::LocalChat => Self::LocalChat,
+            SetupOutcome::Discord => Self::Discord,
+            SetupOutcome::Telegram => Self::Telegram,
+            SetupOutcome::Hooks => Self::Hooks,
+        }
+    }
+}
+
+impl VerifyOutcomeSelection {
+    fn resolved(self, cfg: &Value) -> VerifyOutcome {
+        match self {
+            Self::Auto => infer_setup_outcome_from_config(cfg).into(),
+            Self::LocalChat => VerifyOutcome::LocalChat,
+            Self::Discord => VerifyOutcome::Discord,
+            Self::Telegram => VerifyOutcome::Telegram,
+            Self::Hooks => VerifyOutcome::Hooks,
+            Self::Autonomy => VerifyOutcome::Autonomy,
         }
     }
 }
@@ -2919,11 +2974,11 @@ fn infer_setup_outcome_from_config(cfg: &Value) -> SetupOutcome {
     SetupOutcome::LocalChat
 }
 
-fn print_verify_summary(outcome: SetupOutcome, port: u16, checks: &[VerifyCheckResult]) {
+fn print_verify_summary(outcome: VerifyOutcome, port: u16, checks: &[VerifyCheckResult]) {
     println!();
     println!("Outcome verification summary");
     println!("----------------------------");
-    println!("Outcome: {}", outcome.prompt_key());
+    println!("Outcome: {}", outcome.key());
     println!("Gateway port: {}", port);
     println!();
     for check in checks {
@@ -2940,7 +2995,7 @@ fn print_verify_summary(outcome: SetupOutcome, port: u16, checks: &[VerifyCheckR
 }
 
 async fn verify_channel_send_path(
-    channel: SetupOutcome,
+    channel: VerifyOutcome,
     token: String,
     destination: String,
 ) -> Result<(), String> {
@@ -2961,12 +3016,12 @@ async fn verify_channel_send_path(
         };
 
         let delivery = match channel {
-            SetupOutcome::Discord => {
+            VerifyOutcome::Discord => {
                 let channel_impl =
                     DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token);
                 channel_impl.send_text(outbound)
             }
-            SetupOutcome::Telegram => {
+            VerifyOutcome::Telegram => {
                 let channel_impl =
                     TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token);
                 channel_impl.send_text(outbound)
@@ -3165,21 +3220,21 @@ async fn verify_hooks_outcome(
 }
 
 async fn verify_channel_outcome(
-    outcome: SetupOutcome,
+    outcome: VerifyOutcome,
     cfg: &Value,
     discord_to: Option<String>,
     telegram_to: Option<String>,
     checks: &mut Vec<VerifyCheckResult>,
 ) -> Result<(), String> {
     let (channel_label, channel_key, env_var, destination, destination_flag) = match outcome {
-        SetupOutcome::Discord => (
+        VerifyOutcome::Discord => (
             "Discord",
             "discord",
             "DISCORD_BOT_TOKEN",
             discord_to,
             "--discord-to <channel_id>",
         ),
-        SetupOutcome::Telegram => (
+        VerifyOutcome::Telegram => (
             "Telegram",
             "telegram",
             "TELEGRAM_BOT_TOKEN",
@@ -3260,6 +3315,317 @@ async fn verify_channel_outcome(
     Ok(())
 }
 
+async fn verify_autonomy_outcome(
+    port: u16,
+    cfg: &Value,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    async fn shutdown_embedded_gateway(
+        setup_server_handle: &mut Option<crate::server::startup::ServerHandle>,
+    ) {
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+    }
+
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome autonomy --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let control_client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Control client setup",
+                err.to_string(),
+                "fix local networking/runtime dependencies, then retry",
+            ));
+            shutdown_embedded_gateway(&mut setup_server_handle).await;
+            return Err("outcome verification failed".to_string());
+        }
+    };
+    // Resolve control-plane auth once and reuse for task create + polling.
+    // This includes env/config/keychain fallback behavior.
+    let mut control_auth = resolve_gateway_auth().await;
+    if control_auth.token.is_none() && control_auth.password.is_none() {
+        if let Some(token) = cfg
+            .get("gateway")
+            .and_then(|v| v.get("auth"))
+            .and_then(|v| v.get("token"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            control_auth.token = Some(token.to_string());
+        } else if let Some(password) = cfg
+            .get("gateway")
+            .and_then(|v| v.get("auth"))
+            .and_then(|v| v.get("password"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            control_auth.password = Some(password.to_string());
+        }
+    }
+
+    let policy_max_attempts: u32 = 1;
+    let policy_max_total_runtime_ms: u64 = 60_000;
+    let policy_max_turns: u32 = 1;
+    let policy_max_run_timeout_seconds: u32 = 30;
+    let create_body = serde_json::json!({
+        "payload": {
+            "kind": "agentTurn",
+            "message": "verify-autonomy",
+        },
+        "policy": {
+            "maxAttempts": policy_max_attempts,
+            "maxTotalRuntimeMs": policy_max_total_runtime_ms,
+            "maxTurns": policy_max_turns,
+            "maxRunTimeoutSeconds": policy_max_run_timeout_seconds
+        }
+    });
+
+    let create_url = match build_control_url("127.0.0.1", port, "/control/tasks", &[])
+        .map_err(|error| error.to_string())
+    {
+        Ok(url) => url,
+        Err(error) => {
+            checks.push(VerifyCheckResult::fail(
+                "Task create",
+                format!("failed to build control URL: {error}"),
+                "confirm host/port configuration and retry verification",
+            ));
+            shutdown_embedded_gateway(&mut setup_server_handle).await;
+            return Err("outcome verification failed".to_string());
+        }
+    };
+    let create_response = match send_control_request_with_client_and_auth(
+        &control_client,
+        &control_auth,
+        reqwest::Method::POST,
+        create_url,
+        Some(create_body),
+    )
+    .await
+    .map_err(|err| err.to_string())
+    {
+        Ok(response) => response,
+        Err(error_message) => {
+            checks.push(VerifyCheckResult::fail(
+                "Task create",
+                error_message,
+                format!("verify control auth and task queue availability, then retry `cara verify --outcome autonomy --port {port}`"),
+            ));
+            shutdown_embedded_gateway(&mut setup_server_handle).await;
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let created_task = create_response
+        .get("task")
+        .and_then(|task| task.as_object())
+        .cloned();
+    let Some(created_task) = created_task else {
+        checks.push(VerifyCheckResult::fail(
+            "Task create",
+            "task response missing task object",
+            "retry verification; if this persists, inspect server logs",
+        ));
+        shutdown_embedded_gateway(&mut setup_server_handle).await;
+        return Err("outcome verification failed".to_string());
+    };
+
+    let Some(task_id) = created_task
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+    else {
+        checks.push(VerifyCheckResult::fail(
+            "Task create",
+            "task response missing task id",
+            "retry verification; if this persists, inspect server logs",
+        ));
+        shutdown_embedded_gateway(&mut setup_server_handle).await;
+        return Err("outcome verification failed".to_string());
+    };
+
+    checks.push(VerifyCheckResult::pass(
+        "Task create",
+        format!("created task `{task_id}`"),
+    ));
+
+    let mut max_attempts_seen = created_task
+        .get("attempts")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    // Polling window must be at least as long as task runtime policy budgets
+    // (plus headroom) to avoid false negatives on healthy slow paths.
+    let polling_timeout_secs = policy_max_total_runtime_ms
+        .div_ceil(1000)
+        .max(u64::from(policy_max_run_timeout_seconds))
+        .saturating_add(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(polling_timeout_secs);
+    let mut terminal_task: Option<Value> = None;
+
+    while std::time::Instant::now() < deadline {
+        let path = format!("/control/tasks/{task_id}");
+        let task_url = match build_control_url("127.0.0.1", port, &path, &[])
+            .map_err(|error| error.to_string())
+        {
+            Ok(url) => url,
+            Err(error) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Task polling",
+                    format!("failed to build control URL: {error}"),
+                    "confirm host/port configuration and retry verification",
+                ));
+                shutdown_embedded_gateway(&mut setup_server_handle).await;
+                return Err("outcome verification failed".to_string());
+            }
+        };
+        let task_response = match send_control_request_with_client_and_auth(
+            &control_client,
+            &control_auth,
+            reqwest::Method::GET,
+            task_url,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())
+        {
+            Ok(response) => response,
+            Err(error_message) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Task polling",
+                    error_message,
+                    "confirm service health and control auth, then retry",
+                ));
+                shutdown_embedded_gateway(&mut setup_server_handle).await;
+                return Err("outcome verification failed".to_string());
+            }
+        };
+
+        let task = task_response.get("task").cloned();
+        if let Some(task) = task {
+            let attempts = task
+                .get("attempts")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            max_attempts_seen = max_attempts_seen.max(attempts);
+            if matches!(
+                task.get("state").and_then(|value| value.as_str()),
+                Some("done" | "blocked" | "failed" | "cancelled")
+            ) {
+                terminal_task = Some(task);
+                break;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    shutdown_embedded_gateway(&mut setup_server_handle).await;
+
+    if max_attempts_seen == 0 {
+        checks.push(VerifyCheckResult::fail(
+            "Task start proof",
+            "task never reported attempts > 0",
+            "inspect worker loop logs and retry verification",
+        ));
+        return Err("outcome verification failed".to_string());
+    }
+    checks.push(VerifyCheckResult::pass(
+        "Task start proof",
+        format!("task attempts observed: {max_attempts_seen}"),
+    ));
+
+    let Some(terminal_task) = terminal_task else {
+        checks.push(VerifyCheckResult::fail(
+            "Task terminal proof",
+            "task did not reach terminal state before timeout",
+            "inspect queue/worker logs and retry verification",
+        ));
+        return Err("outcome verification failed".to_string());
+    };
+
+    let state = terminal_task
+        .get("state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    match state {
+        "done" => {
+            let run_count = terminal_task
+                .get("runIds")
+                .and_then(|value| value.as_array())
+                .map_or(0, |runs| runs.len());
+            checks.push(VerifyCheckResult::pass(
+                "Task terminal proof",
+                format!("task reached done state (run IDs: {run_count})"),
+            ));
+            Ok(())
+        }
+        "blocked" => {
+            let blocked_reason = terminal_task
+                .get("blockedReason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            checks.push(VerifyCheckResult::pass(
+                "Task terminal proof",
+                format!("task reached blocked state ({blocked_reason})"),
+            ));
+            Ok(())
+        }
+        "failed" => {
+            let error = terminal_task
+                .get("lastError")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown error");
+            checks.push(VerifyCheckResult::fail(
+                "Task terminal proof",
+                format!("task failed: {error}"),
+                "check provider configuration or task policy and retry",
+            ));
+            Err("outcome verification failed".to_string())
+        }
+        "cancelled" => {
+            checks.push(VerifyCheckResult::fail(
+                "Task terminal proof",
+                "task was cancelled unexpectedly during verification",
+                "retry verify; if this repeats, inspect control-plane mutations",
+            ));
+            Err("outcome verification failed".to_string())
+        }
+        other => {
+            checks.push(VerifyCheckResult::fail(
+                "Task terminal proof",
+                format!("task reached unexpected state `{other}`"),
+                "inspect task state transitions and retry verification",
+            ));
+            Err("outcome verification failed".to_string())
+        }
+    }
+}
+
 async fn run_outcome_verifier(
     selection: VerifyOutcomeSelection,
     port: u16,
@@ -3273,11 +3639,12 @@ async fn run_outcome_verifier(
     let telegram_to = normalize_optional_input(telegram_to);
 
     let result = match outcome {
-        SetupOutcome::LocalChat => verify_local_chat_outcome(port, &mut checks).await,
-        SetupOutcome::Hooks => verify_hooks_outcome(port, &cfg, &mut checks).await,
-        SetupOutcome::Discord | SetupOutcome::Telegram => {
+        VerifyOutcome::LocalChat => verify_local_chat_outcome(port, &mut checks).await,
+        VerifyOutcome::Hooks => verify_hooks_outcome(port, &cfg, &mut checks).await,
+        VerifyOutcome::Discord | VerifyOutcome::Telegram => {
             verify_channel_outcome(outcome, &cfg, discord_to, telegram_to, &mut checks).await
         }
+        VerifyOutcome::Autonomy => verify_autonomy_outcome(port, &cfg, &mut checks).await,
     };
     if let Err(err) = result {
         print_verify_summary(outcome, port, &checks);
@@ -4531,6 +4898,34 @@ mod tests {
             }
             other => panic!("Expected Verify, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cli_verify_autonomy_outcome() {
+        let cli = Cli::try_parse_from(["cara", "verify", "--outcome", "autonomy"]).unwrap();
+        match cli.command {
+            Some(Command::Verify {
+                outcome,
+                port,
+                discord_to,
+                telegram_to,
+            }) => {
+                assert_eq!(outcome, VerifyOutcomeSelection::Autonomy);
+                assert_eq!(port, None);
+                assert!(discord_to.is_none());
+                assert!(telegram_to.is_none());
+            }
+            other => panic!("Expected Verify autonomy outcome, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_verify_outcome_selection_autonomy_resolved() {
+        let cfg = serde_json::json!({});
+        assert_eq!(
+            VerifyOutcomeSelection::Autonomy.resolved(&cfg),
+            VerifyOutcome::Autonomy
+        );
     }
 
     #[test]
