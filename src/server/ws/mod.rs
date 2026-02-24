@@ -542,7 +542,7 @@ impl WsServerState {
         }
     }
 
-    pub fn new_persistent(
+    fn new_persistent_unloaded(
         config: WsServerConfig,
         state_dir: PathBuf,
     ) -> Result<Self, WsConfigError> {
@@ -589,11 +589,9 @@ impl WsServerState {
                 scheduler
             },
             task_queue: {
-                let queue = Arc::new(tasks::TaskQueue::new(Some(
+                Arc::new(tasks::TaskQueue::new(Some(
                     state_dir.join("tasks").join("queue.json"),
-                )));
-                queue.load();
-                queue
+                )))
             },
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
@@ -602,6 +600,21 @@ impl WsServerState {
             plugin_registry: None,
             connection_tracker,
         })
+    }
+
+    /// Construct persistent WS server state, including async-safe task queue
+    /// load and recovery.
+    pub async fn new_persistent(
+        config: WsServerConfig,
+        state_dir: PathBuf,
+    ) -> Result<Self, WsConfigError> {
+        let state = Self::new_persistent_unloaded(config, state_dir)?;
+        state
+            .task_queue
+            .load_async()
+            .await
+            .map_err(WsConfigError::Runtime)?;
+        Ok(state)
     }
 
     pub fn with_node_pairing(mut self, registry: Arc<nodes::NodePairingRegistry>) -> Self {
@@ -990,6 +1003,8 @@ pub enum WsConfigError {
     Nodes(#[from] nodes::NodePairingError),
     #[error(transparent)]
     Devices(#[from] devices::DevicePairingError),
+    #[error("{0}")]
+    Runtime(String),
 }
 
 fn resolve_session_integrity_config(cfg: &Value) -> crate::sessions::integrity::IntegrityConfig {
@@ -1043,7 +1058,7 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
         tracing::warn!(error = %err, "Credential migration failed");
     }
     let config = build_ws_config_from_value(cfg).await?;
-    let mut state = WsServerState::new_persistent(config, state_dir)?;
+    let mut state = WsServerState::new_persistent(config, state_dir).await?;
 
     // Wire session integrity HMAC key from resolved auth/server secret.
     let integrity_config = resolve_session_integrity_config(cfg);
