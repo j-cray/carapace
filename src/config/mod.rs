@@ -99,6 +99,18 @@ pub fn get_config_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
+    // Check current working directory
+    if let Ok(cwd) = env::current_dir() {
+        let json5 = cwd.join("carapace.json5");
+        if json5.exists() {
+            return json5;
+        }
+        let json = cwd.join("carapace.json");
+        if json.exists() {
+            return json;
+        }
+    }
+
     if let Ok(state_dir) = env::var("CARAPACE_STATE_DIR") {
         let dir = PathBuf::from(state_dir);
         let json5 = dir.join("carapace.json5");

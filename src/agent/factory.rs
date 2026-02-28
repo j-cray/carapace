@@ -212,7 +212,6 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         |p, url| p.with_base_url(url),
     )?;
 
-    // Bedrock
     let bedrock = {
         let bedrock_cfg = cfg.get("bedrock");
         // Check explicit disable
@@ -275,12 +274,50 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         }
     };
 
+    // Vertex
+    let vertex_cfg = cfg.get("vertex");
+    let vertex_project_id = vertex_cfg
+        .and_then(|v| v.get("projectId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_PROJECT_ID").ok());
+
+    let vertex_location = vertex_cfg
+        .and_then(|v| v.get("location"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_LOCATION").ok())
+        .unwrap_or_else(|| "us-central1".to_string());
+
+    let vertex_model = vertex_cfg
+        .and_then(|v| v.get("model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_MODEL").ok());
+
+    let vertex_provider = if let Some(project_id) = vertex_project_id {
+        info!(
+            "LLM provider configured: Vertex (project: {}, location: {})",
+            project_id, vertex_location
+        );
+        Some(
+            Arc::new(agent::vertex::VertexProvider::new(
+                project_id,
+                vertex_location,
+                vertex_model,
+            )) as Arc<dyn agent::LlmProvider>,
+        )
+    } else {
+        None
+    };
+
     // Build multi-provider dispatcher
     let multi_provider = MultiProvider::new(anthropic_provider, openai_provider)
         .with_ollama(ollama_provider)
         .with_gemini(gemini_provider)
         .with_venice(venice_provider)
-        .with_bedrock(bedrock);
+        .with_bedrock(bedrock)
+        .with_vertex(vertex_provider);
 
     if multi_provider.has_any_provider() {
         Ok(Some(multi_provider))
@@ -300,6 +337,7 @@ pub struct ProviderFingerprint {
     pub gemini: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
+    pub vertex: Option<(String, String, Option<String>)>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -366,6 +404,23 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
     });
 
     let bedrock_cfg = cfg.get("bedrock");
+    let vertex_cfg = cfg.get("vertex");
+    let vertex_project_id = vertex_cfg
+        .and_then(|v| v.get("projectId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_PROJECT_ID").ok());
+    let vertex_location = vertex_cfg
+        .and_then(|v| v.get("location"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_LOCATION").ok());
+    let vertex_model = vertex_cfg
+        .and_then(|v| v.get("model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_MODEL").ok());
+
     let bedrock_enabled = bedrock_cfg
         .and_then(|b| b.get("enabled"))
         .and_then(|v| v.as_bool())
@@ -398,15 +453,13 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
         bedrock: if bedrock_enabled {
             match (bedrock_region, bedrock_access_key) {
-                (Some(r), Some(ak)) => {
-                    let combined = format!("{}{}", r, ak);
-                    Some(hash_key_prefix(&combined))
-                }
+                (Some(r), Some(k)) => Some(format!("{}:{}...{}", r, &k[..4], &k[k.len() - 4..])),
                 _ => None,
             }
         } else {
             None
         },
+        vertex: vertex_project_id.map(|p| (p, vertex_location.unwrap_or_default(), vertex_model)),
     }
 }
 
@@ -474,17 +527,16 @@ mod tests {
 
     #[test]
     fn test_fingerprint_empty_config() {
-        with_clean_provider_env(|| {
-            // With no env vars and no config, all providers should be None
-            let cfg = json!({});
-            let fp = fingerprint_providers(&cfg);
-            assert!(fp.anthropic.is_none());
-            assert!(fp.openai.is_none());
-            assert!(fp.ollama.is_none());
-            assert!(fp.gemini.is_none());
-            assert!(fp.venice.is_none());
-            assert!(fp.bedrock.is_none());
-        });
+        // With no env vars and no config, all providers should be None
+        let cfg = json!({});
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.anthropic.is_none());
+        assert!(fp.openai.is_none());
+        assert!(fp.ollama.is_none());
+        assert!(fp.gemini.is_none());
+        assert!(fp.venice.is_none());
+        assert!(fp.bedrock.is_none());
+        assert!(fp.vertex.is_none());
     }
 
     #[test]
