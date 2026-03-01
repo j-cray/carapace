@@ -654,7 +654,7 @@ impl VertexProvider {
         }
     }
 
-    async fn get_token(&self) -> Result<String, AgentError> {
+    pub async fn get_token(&self) -> Result<String, AgentError> {
         // Read path
         {
             let cache = self.token_cache.read().await;
@@ -819,6 +819,10 @@ pub fn strip_vertex_prefix(model: &str) -> &str {
     } else {
         model
     }
+}
+
+pub fn is_vertex_model(model: &str) -> bool {
+    model.starts_with("vertex/") || model.starts_with("vertex:")
 }
 
 #[async_trait]
