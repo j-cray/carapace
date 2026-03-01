@@ -542,7 +542,7 @@ mod tests {
         });
         let fp = fingerprint_providers(&cfg);
         assert!(fp.bedrock.is_some());
-        assert_eq!(fp.bedrock.as_ref().unwrap().len(), 16); // 8 bytes = 16 hex chars
+        assert_eq!(fp.bedrock.as_deref(), Some("us-east-1:AKIA...MPLE"));
     }
 
     #[test]
