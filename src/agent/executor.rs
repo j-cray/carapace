@@ -920,27 +920,67 @@ pub async fn execute_run(
     .await
     .map_err(|e| AgentError::SessionStore(e.to_string()))?;
 
-    for _turn in 0..config.max_turns {
-        let should_continue = execute_single_turn(
-            &config,
-            &state,
-            &provider,
-            &cancel_token,
-            &run_id,
-            &session_key,
-            &session.id,
-            message_channel.as_deref(),
-            &seq,
-            &mut history,
-            &mut accumulated_text,
-            &mut total_input_tokens,
-            &mut total_output_tokens,
-            &mut final_stop_reason,
-        )
-        .await?;
+    let mut is_command = false;
+    if let Some(last_msg) = history.last() {
+        if last_msg.role == MessageRole::User && last_msg.content.starts_with("/vertex-model") {
+            is_command = true;
+            let parts: Vec<&str> = last_msg.content.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let model_name = parts[1];
+                match crate::config::load_config() {
+                    Ok(mut cfg) => {
+                        if !cfg["vertex"].is_object() {
+                            cfg["vertex"] = json!({});
+                        }
+                        cfg["vertex"]["model"] = json!(model_name);
+                        match crate::config::save_config(&cfg) {
+                            Ok(_) => {
+                                accumulated_text = format!("Vertex AI model changed to: {}", model_name);
+                            }
+                            Err(e) => {
+                                accumulated_text = format!("Failed to save config: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        accumulated_text = format!("Failed to load config: {}", e);
+                    }
+                }
+            } else {
+                accumulated_text = "Usage: /vertex-model <model-name>".to_string();
+            }
 
-        if !should_continue {
-            break;
+            let msg = ChatMessage::assistant(&session.id, &accumulated_text);
+            crate::sessions::append_message_blocking(state.session_store().clone(), msg.clone())
+                .await
+                .map_err(|e| AgentError::SessionStore(e.to_string()))?;
+            history.push(msg);
+        }
+    }
+
+    if !is_command {
+        for _turn in 0..config.max_turns {
+            let should_continue = execute_single_turn(
+                &config,
+                &state,
+                &provider,
+                &cancel_token,
+                &run_id,
+                &session_key,
+                &session.id,
+                message_channel.as_deref(),
+                &seq,
+                &mut history,
+                &mut accumulated_text,
+                &mut total_input_tokens,
+                &mut total_output_tokens,
+                &mut final_stop_reason,
+            )
+            .await?;
+
+            if !should_continue {
+                break;
+            }
         }
     }
 
