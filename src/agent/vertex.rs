@@ -638,13 +638,7 @@ impl VertexProvider {
         // Let's just default to GCloudCli for now as most users are local, AND verify if we are in cloud?
         // The plan said: "If gcloud is not found (NotFound), it falls back".
         // Let's make a `CompositeTokenProvider`.
-        let token_manager: Arc<dyn TokenProvider> = if std::env::var("UseGCloudCli").is_ok() {
-            Arc::new(GCloudCliProvider)
-        } else {
-            // Default to MetadataProvider, fallback to GCloudCliProvider if it fails?
-            // For now, let's implement a FallbackTokenProvider that tries both.
-            Arc::new(FallbackTokenProvider::new())
-        };
+        let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new());
 
         Self {
             client: reqwest::Client::builder()
