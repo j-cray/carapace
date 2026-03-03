@@ -32,6 +32,8 @@ static UPDATE_OPERATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 
 #[cfg(test)]
 static TEST_FORCE_COPY_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FORCE_RESTORE_FAIL: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubAsset {
@@ -495,11 +497,15 @@ fn apply_staged_update_at_paths(
     };
 
     if let Err(copy_err) = copy_result {
+        #[cfg(test)]
+        if TEST_FORCE_RESTORE_FAIL.swap(false, Ordering::SeqCst) {
+            let _ = fs::remove_file(&backup_path);
+        }
         if let Err(restore_err) = fs::rename(&backup_path, current_path) {
             return Err(UpdateError::non_retryable(
                 Some(UpdatePhase::Applying),
                 format!(
-                    "CRITICAL: copy failed ({copy_err}) AND restore failed ({restore_err}). Backup at: {}",
+                    "CRITICAL: copy failed ({copy_err}) AND restore failed ({restore_err}). Backup path (if present): {}",
                     backup_path.display()
                 ),
             ));
@@ -1446,6 +1452,39 @@ pub async fn auto_resume_with_backoff(
 mod tests {
     use super::*;
 
+    static TEST_APPLY_FAILURE_FLAGS_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+
+    struct ApplyFailureFlagsGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ApplyFailureFlagsGuard {
+        fn lock() -> Self {
+            let lock = TEST_APPLY_FAILURE_FLAGS_LOCK
+                .lock()
+                .expect("apply failure flags lock poisoned");
+            TEST_FORCE_COPY_FAIL.store(false, Ordering::SeqCst);
+            TEST_FORCE_RESTORE_FAIL.store(false, Ordering::SeqCst);
+            Self { _lock: lock }
+        }
+
+        fn force_copy_failure(&self) {
+            TEST_FORCE_COPY_FAIL.store(true, Ordering::SeqCst);
+        }
+
+        fn force_restore_failure(&self) {
+            TEST_FORCE_RESTORE_FAIL.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for ApplyFailureFlagsGuard {
+        fn drop(&mut self) {
+            TEST_FORCE_COPY_FAIL.store(false, Ordering::SeqCst);
+            TEST_FORCE_RESTORE_FAIL.store(false, Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn test_expected_asset_name_matches_release_pattern() {
         let asset = expected_asset_name();
@@ -1663,12 +1702,32 @@ mod tests {
         let current = dir.path().join("cara");
         std::fs::write(&staged, b"new-binary").unwrap();
         std::fs::write(&current, b"old-binary").unwrap();
-        TEST_FORCE_COPY_FAIL.store(true, Ordering::SeqCst);
+        let flags = ApplyFailureFlagsGuard::lock();
+        flags.force_copy_failure();
 
         let err = apply_staged_update_at_paths(&staged, &current)
             .expect_err("forced copy failure should fail");
         assert!(err.message.contains("failed to copy staged binary"));
         assert_eq!(std::fs::read(&current).unwrap(), b"old-binary");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_apply_staged_update_copy_and_restore_failure_surfaces_critical_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        let current = dir.path().join("cara");
+        std::fs::write(&staged, b"new-binary").unwrap();
+        std::fs::write(&current, b"old-binary").unwrap();
+        let flags = ApplyFailureFlagsGuard::lock();
+        flags.force_copy_failure();
+        flags.force_restore_failure();
+
+        let err = apply_staged_update_at_paths(&staged, &current)
+            .expect_err("forced copy+restore failure should fail");
+        assert!(err.message.contains("CRITICAL: copy failed"));
+        assert!(err.message.contains("restore failed"));
+        assert!(err.message.contains("Backup path (if present):"));
     }
 
     #[tokio::test]
