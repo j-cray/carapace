@@ -68,6 +68,15 @@ pub struct SignalGroupInfo {
     pub group_id: Option<String>,
 }
 
+/// Builds the receive URL for the signal-cli-rest-api with the send_read_receipts flag.
+pub fn build_receive_url(base_url: &str, phone_number: &str) -> String {
+    format!(
+        "{}/v1/receive/{}?timeout=5&send_read_receipts=true",
+        base_url,
+        urlencoding::encode(phone_number)
+    )
+}
+
 /// Run the Signal receive loop.
 ///
 /// Polls `GET {base_url}/v1/receive/{number}` every 2 seconds, parses inbound
@@ -84,11 +93,8 @@ pub async fn signal_receive_loop(
         .timeout(RECEIVE_TIMEOUT)
         .build()
         .expect("failed to build Signal receive HTTP client");
-    let receive_url = format!(
-        "{}/v1/receive/{}?timeout=5&send_read_receipts=true",
-        base_url,
-        urlencoding::encode(&phone_number)
-    );
+
+    let receive_url = build_receive_url(&base_url, &phone_number);
 
     info!(
         url = %receive_url,
@@ -432,6 +438,21 @@ mod tests {
                 .map(|s| s.as_str()),
             Some("8fe77508-3017-48de-82ed-5722f4b48625")
         );
+    }
+
+    #[test]
+    fn test_build_receive_url() {
+        let base_url = "http://loopback:8080";
+        let phone_number = "+12506417114";
+
+        let url = super::build_receive_url(base_url, phone_number);
+
+        // Ensure + gets url-encoded
+        assert!(url.contains("%2B12506417114"));
+        assert!(url.starts_with("http://loopback:8080/v1/receive/"));
+        // Ensure read receipts feature flag is enabled
+        assert!(url.contains("send_read_receipts=true"));
+        assert_eq!(url, "http://loopback:8080/v1/receive/%2B12506417114?timeout=5&send_read_receipts=true");
     }
 
 }
