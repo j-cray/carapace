@@ -217,6 +217,16 @@ async fn process_envelope(
         None => return, // No sender info
     };
 
+    let receipt_recipient = match envelope
+        .source_number
+        .as_ref()
+        .or(envelope.source.as_ref())
+        .or(envelope.source_uuid.as_ref())
+    {
+        Some(s) => s.to_string(),
+        None => sender.to_string(), // Fallback (should be unreachable given `sender` matches same options)
+    };
+
     info!(
         sender = %sender,
         text_len = text.len(),
@@ -331,7 +341,7 @@ async fn process_envelope(
             .as_millis() as u64
     });
 
-    let payload = build_read_receipt_payload(&sender_clone, timestamp);
+    let payload = build_read_receipt_payload(&receipt_recipient, timestamp);
 
     tokio::spawn(async move {
         match client.post(&receipt_url).json(&payload).send().await {
