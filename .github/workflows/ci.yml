@@ -108,6 +108,26 @@ jobs:
       - name: Enforce runtime bridge boundaries
         run: ./scripts/check-runtime-bridge-usage.sh
 
+  ws-golden:
+    name: WS Golden
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+      - run: ./scripts/run-nextest-guarded.sh --all-targets server::ws::golden_tests::golden_trace
+      - name: Upload nextest stall diagnostics (ws-golden)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-ws-golden-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -122,20 +142,28 @@ jobs:
   test-pr:
     name: Test (ubuntu PR)
     runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request'
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: cargo nextest run --all-targets
+      - run: ./scripts/run-nextest-guarded.sh --all-targets
+      - name: Upload nextest stall diagnostics (test-pr)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-test-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   test-push:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -145,13 +173,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: cargo nextest run --all-targets
+      - name: Run nextest (guarded)
+        if: runner.os != 'Windows'
+        run: ./scripts/run-nextest-guarded.sh --all-targets
+      - name: Run nextest (Windows)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --all-targets
+      - name: Upload nextest stall diagnostics (test-push)
+        if: failure() && runner.os != 'Windows'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-test-push-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   test-pr-windows:
     name: Test (windows PR)
     runs-on: windows-latest
-    needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -188,7 +229,27 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: taiki-e/install-action@f63130e3904c76fd4045473e61389a5266ee4cc0 # cargo-deny
-      - run: cargo deny check
+      - name: Run cargo deny with transient-network retries
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          delay_seconds=15
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            echo "cargo deny check attempt ${attempt}/${max_attempts}"
+            if cargo deny check; then
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "cargo deny check failed (likely transient upstream/network issue); retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              delay_seconds=$((delay_seconds * 2))
+            fi
+          done
+
+          echo "cargo deny check failed after ${max_attempts} attempts."
+          exit 1
 
   gitleaks:
     name: Secret Scan
@@ -253,7 +314,7 @@ jobs:
       - name: Report unsafe usage
         run: cargo geiger --all-targets --output-format ascii 2>&1 | tee geiger-report.txt
       - name: Upload geiger report
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: geiger-report
           path: geiger-report.txt
@@ -304,6 +365,7 @@ jobs:
       - fmt
       - clippy
       - runtime-bridge-guard
+      - ws-golden
       - build
       - test-pr
       - test-pr-windows
@@ -325,6 +387,7 @@ jobs:
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
+          WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
           TEST_PR_RESULT: ${{ needs['test-pr'].result }}
           TEST_PR_WINDOWS_RESULT: ${{ needs['test-pr-windows'].result }}
@@ -347,6 +410,7 @@ jobs:
             "fmt"
             "clippy"
             "runtime-bridge-guard"
+            "ws-golden"
             "build"
             "test-pr"
             "test-pr-windows"
@@ -368,6 +432,7 @@ jobs:
             "$FMT_RESULT"
             "$CLIPPY_RESULT"
             "$RUNTIME_BRIDGE_GUARD_RESULT"
+            "$WS_GOLDEN_RESULT"
             "$BUILD_RESULT"
             "$TEST_PR_RESULT"
             "$TEST_PR_WINDOWS_RESULT"

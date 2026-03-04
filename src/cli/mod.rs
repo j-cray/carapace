@@ -453,6 +453,7 @@ use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+#[cfg(not(test))]
 use std::io::IsTerminal;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1209,7 +1210,7 @@ pub(crate) async fn resolve_gateway_auth() -> GatewayAuth {
 
     let mut token_creds = None;
     let mut password_creds = None;
-    let state_dir = crate::server::ws::resolve_state_dir();
+    let state_dir = resolve_state_dir();
     if let Ok(mut creds) = credentials::read_gateway_auth(state_dir).await {
         token_creds = std::mem::take(&mut creds.token).and_then(|v| {
             let token = v.trim().to_string();
@@ -2068,6 +2069,13 @@ pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Err
         included_sections.push("cron");
     }
 
+    // Durable task queue/state directory.
+    let tasks_dir = state_dir.join("tasks");
+    if tasks_dir.is_dir() {
+        archive.append_dir_all("tasks", &tasks_dir)?;
+        included_sections.push("tasks");
+    }
+
     // Usage data file.
     let usage_path = state_dir.join("usage.json");
     if usage_path.exists() {
@@ -2177,6 +2185,8 @@ fn validate_backup_file(archive_path: &PathBuf) -> Result<Vec<String>, Box<dyn s
                 Some("memory")
             } else if path_str.starts_with("cron/") {
                 Some("cron")
+            } else if path_str == "tasks" || path_str.starts_with("tasks/") {
+                Some("tasks")
             } else if path_str.starts_with("usage/") {
                 Some("usage")
             } else {
@@ -2261,6 +2271,13 @@ fn restore_files_from_tar(
             extract_entry(&mut entry, &target)?;
             if !restored.contains(&"cron".to_string()) {
                 restored.push("cron".to_string());
+            }
+        } else if path_str == "tasks" || path_str.starts_with("tasks/") {
+            let rel = path.strip_prefix("tasks").unwrap_or(&path);
+            let target = state_dir.join("tasks").join(rel);
+            extract_entry(&mut entry, &target)?;
+            if !restored.contains(&"tasks".to_string()) {
+                restored.push("tasks".to_string());
             }
         } else if path_str.starts_with("usage/") {
             let rel = path.strip_prefix("usage").unwrap_or(&path);
@@ -2477,6 +2494,125 @@ fn parse_setup_outcome(raw: &str) -> Option<SetupOutcome> {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct SetupInteractiveTestHarness {
+    force_interactive: Option<bool>,
+    visible_inputs: std::collections::VecDeque<String>,
+    hidden_inputs: std::collections::VecDeque<String>,
+    provider_validation_results: std::collections::VecDeque<Result<(), String>>,
+    channel_validation_results: std::collections::VecDeque<Result<(), String>>,
+    visible_prompt_count: usize,
+    hidden_prompt_count: usize,
+    provider_validation_calls: usize,
+    channel_validation_calls: usize,
+}
+
+#[cfg(test)]
+static SETUP_INTERACTIVE_TEST_HARNESS: std::sync::LazyLock<
+    std::sync::Mutex<Option<SetupInteractiveTestHarness>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+// Test harness state is process-global; harness-using tests must serialize via ENV_VAR_TEST_LOCK.
+
+#[cfg(test)]
+fn set_setup_interactive_test_harness(harness: SetupInteractiveTestHarness) {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(slot.is_none(), "setup test harness already installed");
+    *slot = Some(harness);
+}
+
+#[cfg(test)]
+fn clear_setup_interactive_test_harness() {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_snapshot() -> Option<SetupInteractiveTestHarness> {
+    let slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.clone()
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_override_interactive() -> Option<bool> {
+    let slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.as_ref().and_then(|state| state.force_interactive)
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_prompt_input(prompt: &str, hidden: bool) -> Option<String> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    let value = if hidden {
+        state.hidden_prompt_count = state.hidden_prompt_count.saturating_add(1);
+        state.hidden_inputs.pop_front()
+    } else {
+        state.visible_prompt_count = state.visible_prompt_count.saturating_add(1);
+        state.visible_inputs.pop_front()
+    };
+    if value.is_some() {
+        return value;
+    }
+    drop(slot);
+    if hidden {
+        panic!("missing scripted hidden input for prompt: {prompt}");
+    }
+    panic!("missing scripted visible input for prompt: {prompt}");
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_provider_validation_result() -> Option<Result<(), String>> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    state.provider_validation_calls = state.provider_validation_calls.saturating_add(1);
+    let result = state.provider_validation_results.pop_front();
+    if result.is_some() {
+        return result;
+    }
+    drop(slot);
+    panic!("missing scripted provider validation result");
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_channel_validation_result() -> Option<Result<(), String>> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    state.channel_validation_calls = state.channel_validation_calls.saturating_add(1);
+    let result = state.channel_validation_results.pop_front();
+    if result.is_some() {
+        return result;
+    }
+    drop(slot);
+    panic!("missing scripted channel validation result");
+}
+
+fn stdin_is_interactive() -> bool {
+    #[cfg(test)]
+    {
+        // Keep tests deterministic: default to non-interactive unless explicitly forced.
+        setup_interactive_test_harness_override_interactive().unwrap_or(false)
+    }
+
+    #[cfg(not(test))]
+    {
+        std::io::stdin().is_terminal()
+    }
+}
+
 fn prompt_setup_outcome() -> Result<SetupOutcome, Box<dyn std::error::Error>> {
     loop {
         let selection = prompt_with_default(
@@ -2550,6 +2686,11 @@ fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enable
 }
 
 fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    if let Some(scripted) = setup_interactive_test_harness_take_prompt_input(prompt, false) {
+        return Ok(scripted.trim().to_string());
+    }
+
     use std::io::{self, Write};
 
     print!("{}", prompt);
@@ -2560,6 +2701,11 @@ fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn prompt_hidden_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    if let Some(scripted) = setup_interactive_test_harness_take_prompt_input(prompt, true) {
+        return Ok(scripted.trim().to_string());
+    }
+
     let input = rpassword::prompt_password(prompt)?;
     Ok(input.trim().to_string())
 }
@@ -2691,6 +2837,11 @@ fn prompt_custom_secret(
 }
 
 async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
+        return result;
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
@@ -2780,6 +2931,11 @@ fn prompt_and_configure_bot_channel(
 }
 
 async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_channel_validation_result() {
+        return result;
+    }
+
     match channel {
         "discord" => {
             let token = token.to_string();
@@ -3819,7 +3975,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let interactive = std::io::stdin().is_terminal();
+    let interactive = stdin_is_interactive();
 
     let default_gateway_token = generate_hex_secret(32)?;
 
@@ -4291,28 +4447,24 @@ pub async fn handle_update(
     version: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
-
-    let (release, client) = fetch_release_info(current_version, version).await?;
-
-    let tag_name = release
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let _release_name = release
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(tag_name);
-    let html_url = release
-        .get("html_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let latest_version = tag_name.strip_prefix('v').unwrap_or(tag_name);
+    let release = match crate::update::fetch_release_info(current_version, version).await {
+        Ok(release) => release,
+        Err(err) => {
+            eprintln!("Failed to check for updates: {}", err.message);
+            if err.retryable {
+                eprintln!("This may be a temporary issue; retry in a moment.");
+            }
+            return Err(err.message.into());
+        }
+    };
+    let latest_version = crate::update::tag_to_version(&release.tag_name);
+    let html_url = release.html_url.as_str();
 
     if check {
         println!("Current version: v{}", current_version);
         println!("Latest version:  v{}", latest_version);
 
-        if current_version == latest_version {
+        if current_version == latest_version.as_str() {
             println!("Already up to date (v{})", current_version);
         } else {
             println!(
@@ -4325,7 +4477,7 @@ pub async fn handle_update(
     }
 
     // Install mode.
-    let target_version = version.unwrap_or(latest_version);
+    let target_version = version.unwrap_or(latest_version.as_str());
     if target_version == current_version {
         println!("Already up to date (v{})", current_version);
         return Ok(());
@@ -4336,137 +4488,67 @@ pub async fn handle_update(
         current_version, target_version
     );
 
-    download_and_install_binary(&release, &client, current_version, target_version, html_url).await
-}
-
-/// Fetch release information from the GitHub API.
-async fn fetch_release_info(
-    current_version: &str,
-    version: Option<&str>,
-) -> Result<(Value, reqwest::Client), Box<dyn std::error::Error>> {
-    let api_url = match version {
-        Some(v) => format!(
-            "https://api.github.com/repos/puremachinery/carapace/releases/tags/v{}",
-            v
-        ),
-        None => "https://api.github.com/repos/puremachinery/carapace/releases/latest".to_string(),
+    let request = crate::update::InstallRequest {
+        current_version: current_version.to_string(),
+        state_dir: resolve_state_dir(),
+        requested_version: Some(target_version.to_string()),
+        apply_update: true,
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let response = match client
-        .get(&api_url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("cara/{}", current_version))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to check for updates: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        eprintln!("GitHub API error (HTTP {}): {}", status, body_text);
-        return Err(format!("HTTP {}", status).into());
-    }
-
-    let release: Value = response.json().await?;
-    Ok((release, client))
-}
-
-/// Download and install a binary from a GitHub release.
-async fn download_and_install_binary(
-    release: &Value,
-    client: &reqwest::Client,
-    current_version: &str,
-    target_version: &str,
-    html_url: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let asset_name = format!("cara-{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-
-    let assets = release
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let matching_asset = assets.iter().find(|a| {
-        a.get("name")
-            .and_then(|n| n.as_str())
-            .is_some_and(|n| n.contains(&asset_name))
-    });
-
-    let asset = match matching_asset {
-        Some(a) => a,
-        None => {
-            eprintln!(
-                "No matching binary asset found for platform '{}'. Download manually from: {}",
-                asset_name, html_url
-            );
-            return Ok(());
-        }
-    };
-
-    let download_url = asset
-        .get("browser_download_url")
-        .and_then(|u| u.as_str())
-        .ok_or("asset has no download URL")?;
-    let name = asset
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or(&asset_name);
-
-    println!("Downloading {}...", name);
-
-    let dl_response = client
-        .get(download_url)
-        .header("User-Agent", format!("cara/{}", current_version))
-        .send()
-        .await?;
-
-    if !dl_response.status().is_success() {
-        eprintln!("Download failed with HTTP {}", dl_response.status());
-        return Err(format!("download failed: HTTP {}", dl_response.status()).into());
-    }
-
-    let bytes = dl_response.bytes().await?;
-    if bytes.is_empty() {
-        return Err("downloaded asset is empty".into());
-    }
-
-    // Stage the binary
-    let state_dir = crate::server::ws::resolve_state_dir();
-    let updates_dir = state_dir.join("updates");
-    std::fs::create_dir_all(&updates_dir)?;
-    let staged_path = updates_dir.join(format!("cara-{}", target_version));
-    std::fs::write(&staged_path, &bytes)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    println!("Applying update...");
-
-    let staged_str = staged_path.to_string_lossy();
-    match crate::server::ws::apply_staged_update(&staged_str) {
-        Ok(result) => {
+    match crate::update::install_or_resume(request).await {
+        Ok(outcome) => {
+            if outcome.resumed {
+                if let Some(max_attempts) = outcome.transaction.as_ref().map(|tx| tx.max_attempts) {
+                    println!(
+                        "Resumed pending update transaction (attempt {}/{}).",
+                        outcome.attempt, max_attempts
+                    );
+                } else {
+                    println!(
+                        "Resumed pending update transaction (attempt {}).",
+                        outcome.attempt
+                    );
+                }
+            }
             println!("Update applied successfully.");
-            println!("  Binary: {}", result.binary_path);
-            println!("  SHA-256: {}", result.sha256);
-            crate::server::ws::cleanup_old_binaries();
+            println!("  Staged path: {}", outcome.staged_path);
+            if let Some(apply) = outcome.apply_result {
+                println!("  Binary: {}", apply.binary_path);
+                println!("  SHA-256: {}", apply.sha256);
+            }
+            println!(
+                "  Sigstore bundle verification: {}",
+                if outcome.verification.bundle_verified {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            );
+            println!(
+                "  Checksum verification: {}",
+                if outcome.verification.checksum_verified {
+                    "passed"
+                } else {
+                    "not available"
+                }
+            );
+            println!(
+                "  Signing identity: {}",
+                outcome.verification.expected_identity
+            );
             println!("Restart cara to use v{}.", target_version);
         }
-        Err(e) => {
-            eprintln!("Failed to apply update: {}", e);
-            return Err(e.into());
+        Err(err) => {
+            eprintln!("Update failed (phase: {:?}): {}", err.phase, err.message);
+            if err.retryable {
+                eprintln!("This failure is retryable; rerun `cara update` to resume.");
+            } else {
+                eprintln!(
+                    "This failure is non-retryable; resolve release artifact/policy mismatch before retrying."
+                );
+            }
+            eprintln!("Release page: {}", html_url);
+            return Err(err.message.into());
         }
     }
 
@@ -4733,7 +4815,9 @@ mod tests {
     use crate::runtime_bridge::{run_sync_blocking, CURRENT_THREAD_RUNTIME_MESSAGE};
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
+    use std::collections::VecDeque;
     use std::ffi::OsString;
+    use std::path::PathBuf;
     use std::sync::{LazyLock, Mutex};
 
     // Serializes env-var touching tests in this module.
@@ -4769,6 +4853,54 @@ mod tests {
         EnvVarGuard {
             key: key.to_string(),
             previous,
+        }
+    }
+
+    struct SetupInteractiveHarnessGuard;
+
+    impl Drop for SetupInteractiveHarnessGuard {
+        fn drop(&mut self) {
+            clear_setup_interactive_test_harness();
+        }
+    }
+
+    fn install_setup_interactive_harness(
+        harness: SetupInteractiveTestHarness,
+    ) -> SetupInteractiveHarnessGuard {
+        set_setup_interactive_test_harness(harness);
+        SetupInteractiveHarnessGuard
+    }
+
+    struct SetupInteractiveTestEnv {
+        _temp: tempfile::TempDir,
+        config_path: PathBuf,
+        _config_guard: EnvVarGuard,
+        _openai_guard: EnvVarGuard,
+        _anthropic_guard: EnvVarGuard,
+        _telegram_guard: EnvVarGuard,
+        _discord_guard: EnvVarGuard,
+        _harness_guard: SetupInteractiveHarnessGuard,
+    }
+
+    fn setup_interactive_test_env(harness: SetupInteractiveTestHarness) -> SetupInteractiveTestEnv {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let config_guard =
+            set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+        let anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let telegram_guard = unset_env_var_scoped("TELEGRAM_BOT_TOKEN");
+        let discord_guard = unset_env_var_scoped("DISCORD_BOT_TOKEN");
+        let harness_guard = install_setup_interactive_harness(harness);
+        SetupInteractiveTestEnv {
+            _temp: temp,
+            config_path,
+            _config_guard: config_guard,
+            _openai_guard: openai_guard,
+            _anthropic_guard: anthropic_guard,
+            _telegram_guard: telegram_guard,
+            _discord_guard: discord_guard,
+            _harness_guard: harness_guard,
         }
     }
 
@@ -5585,8 +5717,10 @@ mod tests {
         let state_dir = temp.path().join("state");
         let sessions_dir = state_dir.join("sessions");
         let cron_dir = state_dir.join("cron");
+        let tasks_dir = state_dir.join("tasks");
         std::fs::create_dir_all(&sessions_dir).unwrap();
         std::fs::create_dir_all(&cron_dir).unwrap();
+        std::fs::create_dir_all(&tasks_dir).unwrap();
 
         // Create some fake session data.
         std::fs::write(
@@ -5605,6 +5739,8 @@ mod tests {
 
         // Create fake usage data.
         std::fs::write(state_dir.join("usage.json"), r#"{"totalTokens":42}"#).unwrap();
+        // Create fake task data (durable task queue is stored as a JSON array).
+        std::fs::write(tasks_dir.join("queue.json"), r#"[]"#).unwrap();
 
         // Build archive.
         let archive_path = temp.path().join("test-backup.tar.gz");
@@ -5626,6 +5762,8 @@ mod tests {
         builder.append_dir_all("sessions", &sessions_dir).unwrap();
         // Add cron.
         builder.append_dir_all("cron", &cron_dir).unwrap();
+        // Add tasks.
+        builder.append_dir_all("tasks", &tasks_dir).unwrap();
         // Add usage.
         builder
             .append_path_with_name(state_dir.join("usage.json"), "usage/usage.json")
@@ -5642,6 +5780,7 @@ mod tests {
         let mut found_marker = false;
         let mut found_session = false;
         let mut found_cron = false;
+        let mut found_tasks = false;
         let mut found_usage = false;
 
         for entry in archive.entries().unwrap() {
@@ -5653,6 +5792,8 @@ mod tests {
                 found_session = true;
             } else if path.contains("jobs.json") {
                 found_cron = true;
+            } else if path.contains("queue.json") {
+                found_tasks = true;
             } else if path.contains("usage.json") {
                 found_usage = true;
             }
@@ -5661,22 +5802,27 @@ mod tests {
         assert!(found_marker, "Archive should contain backup marker");
         assert!(found_session, "Archive should contain session data");
         assert!(found_cron, "Archive should contain cron data");
+        assert!(found_tasks, "Archive should contain task queue data");
         assert!(found_usage, "Archive should contain usage data");
     }
 
     #[test]
     fn test_backup_restore_round_trip() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
 
         // Set up source state directory.
         let source_state = temp.path().join("source");
         let source_sessions = source_state.join("sessions");
         let source_cron = source_state.join("cron");
+        let source_tasks = source_state.join("tasks");
         std::fs::create_dir_all(&source_sessions).unwrap();
         std::fs::create_dir_all(&source_cron).unwrap();
+        std::fs::create_dir_all(&source_tasks).unwrap();
 
         std::fs::write(source_sessions.join("sess1.json"), r#"{"id":"sess1"}"#).unwrap();
         std::fs::write(source_cron.join("store.json"), r#"{"version":1}"#).unwrap();
+        std::fs::write(source_tasks.join("queue.json"), r#"[]"#).unwrap();
         std::fs::write(source_state.join("usage.json"), r#"{"totalTokens":100}"#).unwrap();
 
         // Create an archive.
@@ -5697,6 +5843,7 @@ mod tests {
             .append_dir_all("sessions", &source_sessions)
             .unwrap();
         builder.append_dir_all("cron", &source_cron).unwrap();
+        builder.append_dir_all("tasks", &source_tasks).unwrap();
         builder
             .append_path_with_name(source_state.join("usage.json"), "usage/usage.json")
             .unwrap();
@@ -5704,66 +5851,32 @@ mod tests {
         let enc = builder.into_inner().unwrap();
         enc.finish().unwrap();
 
-        // Set up a fresh target state directory and restore into it.
+        // Set up a fresh target state directory and restore into it using the
+        // production restore path.
         let target_state = temp.path().join("target");
-        std::fs::create_dir_all(&target_state).unwrap();
-
-        // Manually extract (simulating what handle_restore does).
-        let file = std::fs::File::open(&archive_path).unwrap();
-        let dec = flate2::read::GzDecoder::new(file);
-        let mut archive = tar::Archive::new(dec);
-
-        for entry_result in archive.entries().unwrap() {
-            let mut entry = entry_result.unwrap();
-            let path = entry.path().unwrap().to_path_buf();
-            let path_str = path.to_string_lossy().to_string();
-
-            if path_str == BACKUP_MARKER {
-                continue;
-            }
-
-            if path_str.starts_with("sessions/") {
-                let rel = path.strip_prefix("sessions").unwrap_or(&path);
-                let target = target_state.join("sessions").join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_dir() {
-                    std::fs::create_dir_all(&target).unwrap();
-                } else if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
-            } else if path_str.starts_with("cron/") {
-                let rel = path.strip_prefix("cron").unwrap_or(&path);
-                let target = target_state.join("cron").join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_dir() {
-                    std::fs::create_dir_all(&target).unwrap();
-                } else if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
-            } else if path_str.starts_with("usage/") {
-                let rel = path.strip_prefix("usage").unwrap_or(&path);
-                let target = target_state.join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
-            }
-        }
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+        let _state_guard = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            target_state.to_string_lossy().as_ref(),
+        );
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            target_config.to_string_lossy().as_ref(),
+        );
+        let (mut restored_sections, restored_sessions) =
+            restore_files_from_tar(&archive_path).unwrap();
+        assert_eq!(restored_sessions, 1);
+        restored_sections.sort_unstable();
+        assert_eq!(
+            restored_sections,
+            vec![
+                "cron".to_string(),
+                "sessions".to_string(),
+                "tasks".to_string(),
+                "usage".to_string()
+            ]
+        );
 
         // Verify restored data matches original.
         let restored_session =
@@ -5776,6 +5889,159 @@ mod tests {
 
         let restored_usage = std::fs::read_to_string(target_state.join("usage.json")).unwrap();
         assert_eq!(restored_usage, r#"{"totalTokens":100}"#);
+
+        let restored_tasks =
+            std::fs::read_to_string(target_state.join("tasks").join("queue.json")).unwrap();
+        assert_eq!(restored_tasks, r#"[]"#);
+    }
+
+    #[test]
+    fn test_handle_backup_includes_tasks_section() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let tasks_dir = state_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("queue.json"), r#"[]"#).unwrap();
+
+        let config_path = temp.path().join("carapace.json5");
+        std::fs::write(&config_path, "{}").unwrap();
+        let archive_path = temp.path().join("backup-with-tasks.tar.gz");
+
+        let _state_guard =
+            set_env_var_scoped("CARAPACE_STATE_DIR", state_dir.to_string_lossy().as_ref());
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            config_path.to_string_lossy().as_ref(),
+        );
+
+        handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+        let sections = validate_backup_file(&archive_path).unwrap();
+        assert!(
+            sections.contains(&"tasks".to_string()),
+            "backup should report tasks section when state/tasks exists"
+        );
+    }
+
+    #[test]
+    fn test_handle_backup_restore_round_trip_preserves_tasks() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let home_dir = temp.path().join("home");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let _home_guard = set_env_var_scoped("HOME", home_dir.to_string_lossy().as_ref());
+        let _userprofile_guard =
+            set_env_var_scoped("USERPROFILE", home_dir.to_string_lossy().as_ref());
+
+        let source_state = temp.path().join("source-state");
+        let source_tasks = source_state.join("tasks");
+        let source_sessions = source_state.join("sessions");
+        let source_cron = source_state.join("cron");
+        std::fs::create_dir_all(&source_tasks).unwrap();
+        std::fs::create_dir_all(&source_sessions).unwrap();
+        std::fs::create_dir_all(&source_cron).unwrap();
+        std::fs::write(
+            source_tasks.join("queue.json"),
+            r#"[{"id":"task-1","state":"queued"}]"#,
+        )
+        .unwrap();
+        std::fs::write(source_sessions.join("sess-a.json"), r#"{"id":"sess-a"}"#).unwrap();
+        std::fs::write(source_cron.join("jobs.json"), r#"{"jobs":[]}"#).unwrap();
+        std::fs::write(source_state.join("usage.json"), r#"{"sessions":{}}"#).unwrap();
+
+        let source_config = temp.path().join("source-config.json5");
+        std::fs::write(&source_config, "{}").unwrap();
+        let archive_path = temp.path().join("backup-roundtrip.tar.gz");
+
+        {
+            let _state_guard = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                source_state.to_string_lossy().as_ref(),
+            );
+            let _config_guard = set_env_var_scoped(
+                "CARAPACE_CONFIG_PATH",
+                source_config.to_string_lossy().as_ref(),
+            );
+            handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+        }
+
+        let target_state = temp.path().join("target-state");
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+
+        {
+            let _state_guard = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                target_state.to_string_lossy().as_ref(),
+            );
+            let _config_guard = set_env_var_scoped(
+                "CARAPACE_CONFIG_PATH",
+                target_config.to_string_lossy().as_ref(),
+            );
+            handle_restore(archive_path.to_string_lossy().as_ref(), true).unwrap();
+        }
+
+        let restored_tasks =
+            std::fs::read_to_string(target_state.join("tasks").join("queue.json")).unwrap();
+        assert_eq!(restored_tasks, r#"[{"id":"task-1","state":"queued"}]"#);
+    }
+
+    #[test]
+    fn test_tasks_section_detected_and_restored_for_directory_entry() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let archive_path = temp.path().join("tasks-dir-only.tar.gz");
+
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+
+        let marker = b"carapace-backup v1\n";
+        let mut marker_header = tar::Header::new_gnu();
+        marker_header.set_size(marker.len() as u64);
+        marker_header.set_mode(0o644);
+        marker_header.set_cksum();
+        builder
+            .append_data(&mut marker_header, BACKUP_MARKER, &marker[..])
+            .unwrap();
+
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o755);
+        dir_header.set_cksum();
+        builder
+            .append_data(&mut dir_header, "tasks", std::io::empty())
+            .unwrap();
+
+        let enc = builder.into_inner().unwrap();
+        enc.finish().unwrap();
+
+        let sections = validate_backup_file(&archive_path).unwrap();
+        assert!(
+            sections.contains(&"tasks".to_string()),
+            "top-level tasks directory entry should be detected as tasks section"
+        );
+
+        let target_state = temp.path().join("target-state");
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+
+        let _state_guard = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            target_state.to_string_lossy().as_ref(),
+        );
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            target_config.to_string_lossy().as_ref(),
+        );
+
+        let (restored, _) = restore_files_from_tar(&archive_path).unwrap();
+        assert!(restored.contains(&"tasks".to_string()));
+        assert!(
+            target_state.join("tasks").is_dir(),
+            "restore should recreate empty tasks directory from top-level tasks entry"
+        );
     }
 
     #[test]
@@ -6175,6 +6441,240 @@ mod tests {
             parsed["agents"]["defaults"]["model"], "claude-sonnet-4-20250514",
             "Default model should be claude-sonnet-4-20250514"
         );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_hidden_input_skips_telegram_validation_on_blank_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "y".to_string(),
+                "openai".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "hidden-token-123".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 3);
+        assert_eq!(state.channel_validation_calls, 0);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["gateway"]["auth"]["token"], "hidden-token-123");
+        assert!(
+            parsed.get("telegram").is_none(),
+            "telegram config should be absent when token is blank"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_visible_input_validates_telegram_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "12345:abc".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["telegram"]["enabled"], true);
+        assert_eq!(parsed["telegram"]["botToken"], "12345:abc");
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_telegram_validation_failure_aborts_when_user_declines_continue(
+    ) {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "12345:abc".to_string(),
+                "y".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Err(
+                "telegram token rejected".to_string()
+            )]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(
+            result.is_err(),
+            "setup should abort after validation failure"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("setup aborted after credential validation failure"),
+            "unexpected setup error"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "config file should not be written when setup aborts"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_hidden_input_skips_discord_validation_on_blank_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "y".to_string(),
+                "openai".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "discord".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "hidden-token-123".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 3);
+        assert_eq!(state.channel_validation_calls, 0);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["gateway"]["auth"]["token"], "hidden-token-123");
+        assert!(
+            parsed.get("discord").is_none(),
+            "discord config should be absent when token is blank"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_discord_validation_failure_aborts_when_user_declines_continue()
+    {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "discord".to_string(),
+                "discord-bot-token".to_string(),
+                "y".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Err(
+                "discord token rejected".to_string()
+            )]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(
+            result.is_err(),
+            "setup should abort after validation failure"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("setup aborted after credential validation failure"),
+            "unexpected setup error"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "config file should not be written when setup aborts"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
     }
 
     // -----------------------------------------------------------------------
