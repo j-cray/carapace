@@ -68,10 +68,10 @@ pub struct SignalGroupInfo {
     pub group_id: Option<String>,
 }
 
-/// Builds the receive URL for the signal-cli-rest-api with the send_read_receipts flag.
+/// Builds the receive URL for the signal-cli-rest-api with the read receipts flag.
 pub fn build_receive_url(base_url: &str, phone_number: &str) -> String {
     format!(
-        "{}/v1/receive/{}?timeout=5&send_read_receipts=true",
+        "{}/v1/receive/{}?timeout=5&i=true",
         base_url,
         urlencoding::encode(phone_number)
     )
@@ -451,8 +451,8 @@ mod tests {
         assert!(url.contains("%2B12506417114"));
         assert!(url.starts_with("http://loopback:8080/v1/receive/"));
         // Ensure read receipts feature flag is enabled
-        assert!(url.contains("send_read_receipts=true"));
-        assert_eq!(url, "http://loopback:8080/v1/receive/%2B12506417114?timeout=5&send_read_receipts=true");
+        assert!(url.contains("i=true"));
+        assert_eq!(url, "http://loopback:8080/v1/receive/%2B12506417114?timeout=5&i=true");
     }
 
 }
