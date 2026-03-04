@@ -351,8 +351,10 @@ async fn process_envelope(
 
     let payload = build_read_receipt_payload(&receipt_recipient, timestamp);
 
+    // Spawn read receipt
+    let client_clone = client.clone();
     tokio::spawn(async move {
-        match client.post(&receipt_url).json(&payload).send().await {
+        match client_clone.post(&receipt_url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 debug!(
                     sender = %sender_clone,
@@ -376,8 +378,68 @@ async fn process_envelope(
             }
         }
     });
-}
 
+    // Start typing indicator loop
+    let typing_url = format!(
+        "{}/v1/typing-indicator/{}",
+        base_url,
+        urlencoding::encode(phone_number)
+    );
+
+    // Fallback to 3 seconds if not present
+    let typing_interval = Duration::from_secs(
+        cfg.get("session")
+            .and_then(|s| s.get("typing_interval_seconds"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(3) as u64,
+    );
+
+    let typing_payload = serde_json::json!({
+        "recipient": peer_id
+    });
+
+    let run_id_clone = run_id.clone();
+    let state_clone = Arc::clone(state);
+
+    tokio::spawn(async move {
+        info!(run_id = %run_id_clone, peer_id = %peer_id, "Signal typing indicator started");
+        let mut loop_interval = tokio::time::interval(typing_interval);
+
+        loop {
+            loop_interval.tick().await;
+
+            let status = {
+                let registry = state_clone.agent_run_registry.lock();
+                registry.get(&run_id_clone).map(|r| r.status)
+            };
+
+            match status {
+                Some(crate::server::ws::AgentRunStatus::Completed)
+                | Some(crate::server::ws::AgentRunStatus::Failed)
+                | Some(crate::server::ws::AgentRunStatus::Cancelled)
+                | None => {
+                    // Stop typing indicator
+                    let stop_payload = serde_json::json!({
+                        "recipient": peer_id
+                    });
+
+                    if let Err(e) = client.delete(&typing_url).json(&stop_payload).send().await {
+                        debug!("Failed to stop Signal typing indicator: {}", e);
+                    } else {
+                        info!(run_id = %run_id_clone, peer_id = %peer_id, "Signal typing indicator stopped");
+                    }
+                    break;
+                }
+                _ => {
+                    // Send typing indicator pulse
+                    if let Err(e) = client.put(&typing_url).json(&typing_payload).send().await {
+                        debug!("Failed to send Signal typing indicator pulse: {}", e);
+                    }
+                }
+            }
+        }
+    });
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,4 +592,104 @@ mod tests {
         assert_eq!(url, "http://loopback:8080/v1/receive/%2B12506417114?timeout=5&i=true");
     }
 
+    #[tokio::test]
+    async fn test_signal_typing_indicator_flow() {
+        use axum::{routing::{post, put}, Router, extract::Path};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+
+        let app = Router::new()
+            .route(
+                "/v1/receipts/{number}",
+                post({
+                    let reqs = requests.clone();
+                    move |Path(number): Path<String>| async move {
+                        reqs.lock().unwrap().push(format!("POST_RECEIPT_{}", number));
+                        axum::http::StatusCode::OK
+                    }
+                })
+            )
+            .route(
+                "/v1/typing-indicator/{number}",
+                put({
+                    let reqs = requests.clone();
+                    move |Path(number): Path<String>| async move {
+                        reqs.lock().unwrap().push(format!("PUT_TYPING_{}", number));
+                        axum::http::StatusCode::OK
+                    }
+                })
+                .delete({
+                    let reqs = requests.clone();
+                    move |Path(number): Path<String>| async move {
+                        reqs.lock().unwrap().push(format!("DELETE_TYPING_{}", number));
+                        axum::http::StatusCode::OK
+                    }
+                })
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base_url = format!("http://{}", addr);
+        let phone_number = "+15551234567";
+        let sender = "+15559876543";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = Arc::new(crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default()).with_session_store(store));
+
+        let json = format!(r#"{{
+            "source": "{}",
+            "timestamp": 1706745600000,
+            "dataMessage": {{
+                "message": "Hello from Signal test!",
+                "timestamp": 1706745600000
+            }}
+        }}"#, sender);
+
+        let envelope: SignalEnvelope = serde_json::from_str(&json).unwrap();
+        let client = reqwest::Client::new();
+
+        super::process_envelope(&envelope, &state, client, &base_url, phone_number).await;
+
+        // Give it a moment for the typing loop to run
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(reqs.contains(&format!("POST_RECEIPT_{}", phone_number)), "Requests: {:?}", reqs);
+            assert!(reqs.contains(&format!("PUT_TYPING_{}", phone_number)), "Requests: {:?}", reqs);
+            assert!(!reqs.contains(&format!("DELETE_TYPING_{}", phone_number)), "Requests: {:?}", reqs);
+        }
+
+        // Find the active run and mark it completed to trigger DELETE
+        let session_key = format!("signal:{}", sender);
+        let run_id = {
+            let registry = state.agent_run_registry.lock();
+            let runs = registry.get_active_runs_for_session(&session_key);
+            assert_eq!(runs.len(), 1, "Should have exactly one active run");
+            runs[0].clone()
+        };
+
+        {
+            let mut registry = state.agent_run_registry.lock();
+            registry.mark_completed(&run_id, "Done".to_string());
+        }
+
+        // Wait a bit for the next interval to notice the status change (default is 3s)
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(reqs.contains(&format!("DELETE_TYPING_{}", phone_number)), "Requests: {:?}", reqs);
+        }
+    }
 }
