@@ -18,7 +18,7 @@ use crate::sessions::{get_or_create_scoped_session, SessionMetadata};
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Timeout for each receive HTTP request.
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An envelope returned by `GET /v1/receive/{number}`.
 #[derive(Debug, Deserialize)]
