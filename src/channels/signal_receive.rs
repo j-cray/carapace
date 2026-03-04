@@ -81,7 +81,7 @@ pub async fn signal_receive_loop(
         .build()
         .expect("failed to build Signal receive HTTP client");
     let receive_url = format!(
-        "{}/v1/receive/{}",
+        "{}/v1/receive/{}?timeout=5",
         base_url,
         urlencoding::encode(&phone_number)
     );
@@ -119,7 +119,7 @@ pub async fn signal_receive_loop(
                             let env_val = item.get("envelope").unwrap_or(&item);
                             match serde_json::from_value::<SignalEnvelope>(env_val.clone()) {
                                 Ok(envelope) => {
-                                    process_envelope(&envelope, &state);
+                                    process_envelope(&envelope, &state).await;
                                 }
                                 Err(err) => {
                                     warn!("Failed to cleanly deserialize envelope: {} - JSON: {}", err, env_val);

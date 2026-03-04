@@ -921,8 +921,14 @@ pub async fn execute_run(
     .map_err(|e| AgentError::SessionStore(e.to_string()))?;
 
     let mut is_command = false;
+    // We need to check if the incoming message (which was just appended to history) is a command.
+    // The last message in history is the one we just received from the user.
     if let Some(last_msg) = history.last() {
         if last_msg.role == MessageRole::User && last_msg.content.starts_with("/vertex-model") {
+            // Note: because the current architecture receives the message from the channel,
+            // processes it through the pipeline, and then calls execute_run via queue,
+            // the system actually parses commands in the message queue *before* the agent run starts.
+            // But if it slips through to here, we DO NOT want to execute a LLM turn.
             is_command = true;
             let parts: Vec<&str> = last_msg.content.split_whitespace().collect();
             if parts.len() >= 2 {
