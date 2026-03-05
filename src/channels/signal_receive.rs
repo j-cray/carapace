@@ -14,8 +14,8 @@ use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::server::ws::WsServerState;
 use crate::sessions::{get_or_create_scoped_session, SessionMetadata};
 
-/// Interval between receive polls.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Backoff between failed receive polls.
+const ERROR_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Timeout for each receive HTTP request.
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,7 +71,7 @@ pub struct SignalGroupInfo {
 /// Builds the receive URL for the signal-cli-rest-api with the read receipts flag.
 pub fn build_receive_url(base_url: &str, phone_number: &str) -> String {
     format!(
-        "{}/v1/receive/{}?timeout=5&i=true",
+        "{}/v1/receive/{}?timeout=20&i=true",
         base_url,
         urlencoding::encode(phone_number)
     )
@@ -110,6 +110,8 @@ pub async fn signal_receive_loop(
             info!("Signal receive loop shutting down");
             break;
         }
+
+        let mut had_error = false;
 
         match client.get(&receive_url).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -150,6 +152,7 @@ pub async fn signal_receive_loop(
                 }
             }
             Ok(resp) => {
+                had_error = true;
                 consecutive_errors += 1;
                 let status = resp.status();
                 if consecutive_errors <= 3 {
@@ -158,6 +161,7 @@ pub async fn signal_receive_loop(
                 channel_registry.set_error("signal", format!("HTTP {}", status));
             }
             Err(e) => {
+                had_error = true;
                 consecutive_errors += 1;
                 if consecutive_errors <= 3 {
                     warn!("Signal receive error: {}", e);
@@ -170,13 +174,15 @@ pub async fn signal_receive_loop(
             }
         }
 
-        // Wait for poll interval or shutdown
-        tokio::select! {
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    info!("Signal receive loop shutting down");
-                    break;
+        if had_error {
+            // Wait for backoff interval or shutdown
+            tokio::select! {
+                _ = tokio::time::sleep(ERROR_BACKOFF) => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("Signal receive loop shutting down");
+                        break;
+                    }
                 }
             }
         }
@@ -589,7 +595,7 @@ mod tests {
         assert!(url.starts_with("http://loopback:8080/v1/receive/"));
         // Ensure read receipts feature flag is enabled
         assert!(url.contains("i=true"));
-        assert_eq!(url, "http://loopback:8080/v1/receive/%2B12506417114?timeout=5&i=true");
+        assert_eq!(url, "http://loopback:8080/v1/receive/%2B12506417114?timeout=20&i=true");
     }
 
     #[tokio::test]
