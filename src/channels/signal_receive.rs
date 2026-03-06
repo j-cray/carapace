@@ -487,7 +487,9 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes.len(), 1);
-        assert_eq!(envelopes[0].source.as_deref().or(envelopes[0].source_number.as_deref()), Some("+15559876543"));
+        let expected = Some("+15559876543");
+        let actual = envelopes[0].source.as_deref().or(envelopes[0].source_number.as_deref());
+        assert!(actual == expected, "source should match");
         let dm = envelopes[0].data_message.as_ref().unwrap();
         assert_eq!(dm.message.as_deref(), Some("Hello from Signal!"));
         assert_eq!(dm.timestamp, Some(1706745600000));
@@ -550,7 +552,9 @@ mod tests {
         ]"#;
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
-        assert_eq!(envelopes[0].source_number.as_deref(), Some("+15559876543"));
+        let expected = Some("+15559876543");
+        let actual = envelopes[0].source_number.as_deref();
+        assert!(actual == expected, "source_number should match");
     }
 
     #[test]
@@ -582,19 +586,17 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes.len(), 1);
-        assert_eq!(
-            envelopes[0].source_uuid.as_deref(),
-            Some("8fe77508-3017-48de-82ed-5722f4b48625")
-        );
-        assert_eq!(
-            envelopes[0]
-                .source_uuid
-                .as_ref()
-                .or(envelopes[0].source_number.as_ref())
-                .or(envelopes[0].source.as_ref())
-                .map(|s| s.as_str()),
-            Some("8fe77508-3017-48de-82ed-5722f4b48625")
-        );
+        let expected_uuid = Some("8fe77508-3017-48de-82ed-5722f4b48625");
+        let actual_uuid = envelopes[0].source_uuid.as_deref();
+        assert!(actual_uuid == expected_uuid, "source_uuid should match");
+
+        let actual_fallback = envelopes[0]
+            .source_uuid
+            .as_ref()
+            .or(envelopes[0].source_number.as_ref())
+            .or(envelopes[0].source.as_ref())
+            .map(|s| s.as_str());
+        assert!(actual_fallback == expected_uuid, "fallback source should match");
     }
 
     #[test]
@@ -614,10 +616,11 @@ mod tests {
 
         // Ensure + gets url-encoded
         assert!(url.contains("%2B12506417114"));
-        assert!(url.starts_with("http://loopback:8080/v1/receive/"));
+        assert!(url.starts_with("ws://loopback:8080/v1/receive/"));
         // Ensure read receipts feature flag is enabled
         assert!(url.contains("i=true"));
-        assert_eq!(url, "http://loopback:8080/v1/receive/%2B12506417114?timeout=20&i=true");
+        let expected = "ws://loopback:8080/v1/receive/%2B12506417114?i=true";
+        assert!(url == expected, "url should match");
     }
 
     #[tokio::test]
@@ -735,24 +738,33 @@ mod tests {
                 "/v1/receive/{number}",
                 get({
                     let ts = timestamps.clone();
-                    move |Path(_number): Path<String>| async move {
-                        let mut locked = ts.lock().unwrap();
-                        if locked.is_empty() {
-                            // First poll: record receive time and send a message
-                            locked.push(Instant::now());
-                            let json = serde_json::json!([{
-                                "source": "+15559876543",
-                                "timestamp": 1706745600000_u64,
-                                "dataMessage": {
-                                    "message": "Latency test",
-                                    "timestamp": 1706745600000_u64
+                    move |Path(_number): Path<String>, ws: axum::extract::ws::WebSocketUpgrade| async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            let should_send = {
+                                let mut locked = ts.lock().unwrap();
+                                if locked.is_empty() {
+                                    // First poll: record receive time and send a message
+                                    locked.push(Instant::now());
+                                    true
+                                } else {
+                                    false
                                 }
-                            }]);
-                            axum::Json(json)
-                        } else {
-                            // Subsequent polls: return empty immediately
-                            axum::Json(serde_json::json!([]))
-                        }
+                            };
+
+                            if should_send {
+                                let json = serde_json::json!({
+                                    "envelope": {
+                                        "source": "+15559876543",
+                                        "timestamp": 1706745600000_u64,
+                                        "dataMessage": {
+                                            "message": "Latency test",
+                                            "timestamp": 1706745600000_u64
+                                        }
+                                    }
+                                });
+                                let _ = socket.send(axum::extract::ws::Message::Text(json.to_string().into())).await;
+                            }
+                        })
                     }
                 })
             )
