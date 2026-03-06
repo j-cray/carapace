@@ -743,13 +743,12 @@ mod tests {
                         ws.on_upgrade(move |mut socket| async move {
                             let should_send = {
                                 let mut locked = ts.lock().unwrap();
-                                if locked.is_empty() {
+                                let is_first_connection = locked.is_empty();
+                                if is_first_connection {
                                     // First poll: record receive time and send a message
                                     locked.push(Instant::now());
-                                    true
-                                } else {
-                                    false
                                 }
+                                is_first_connection
                             };
 
                             if should_send {
