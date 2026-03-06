@@ -491,14 +491,12 @@ mod tests {
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes.len(), 1);
         let expected = Some("+15559876543");
-        let match_source = envelopes[0]
+        let actual = envelopes[0]
             .source
             .as_deref()
-            .or(envelopes[0].source_number.as_deref())
-            == expected;
-        if !match_source {
-            panic!("source should match");
-        }
+            .or(envelopes[0].source_number.as_deref());
+        let match_source = actual == expected;
+        assert!(match_source, "source should match");
         let dm = envelopes[0].data_message.as_ref().unwrap();
         assert_eq!(dm.message.as_deref(), Some("Hello from Signal!"));
         assert_eq!(dm.timestamp, Some(1706745600000));
@@ -562,10 +560,9 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         let expected = Some("+15559876543");
-        let match_source = envelopes[0].source_number.as_deref() == expected;
-        if !match_source {
-            panic!("source_number should match");
-        }
+        let actual = envelopes[0].source_number.as_deref();
+        let match_source = actual == expected;
+        assert!(match_source, "source_number should match");
     }
 
     #[test]
@@ -599,21 +596,18 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         let expected_uuid = Some("8fe77508-3017-48de-82ed-5722f4b48625");
 
-        let match_uuid = envelopes[0].source_uuid.as_deref() == expected_uuid;
-        if !match_uuid {
-            panic!("source_uuid should match");
-        }
+        let actual_uuid = envelopes[0].source_uuid.as_deref();
+        let match_uuid = actual_uuid == expected_uuid;
+        assert!(match_uuid, "source_uuid should match");
 
-        let match_fallback = envelopes[0]
+        let actual_fallback = envelopes[0]
             .source_uuid
             .as_ref()
             .or(envelopes[0].source_number.as_ref())
             .or(envelopes[0].source.as_ref())
-            .map(|s| s.as_str())
-            == expected_uuid;
-        if !match_fallback {
-            panic!("fallback source should match");
-        }
+            .map(|s| s.as_str());
+        let match_fallback = actual_fallback == expected_uuid;
+        assert!(match_fallback, "fallback source should match");
     }
 
     #[test]
