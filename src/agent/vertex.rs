@@ -55,7 +55,9 @@ impl TokenProvider for GCloudCliProvider {
 
         let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if token.is_empty() {
-            return Err(AgentError::Provider("gcloud returned empty token".to_string()));
+            return Err(AgentError::Provider(
+                "gcloud returned empty token".to_string(),
+            ));
         }
         Ok(token)
     }
@@ -102,7 +104,9 @@ impl TokenProvider for MetadataProvider {
         body.get("access_token")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| AgentError::Provider("metadata response missing access_token".to_string()))
+            .ok_or_else(|| {
+                AgentError::Provider("metadata response missing access_token".to_string())
+            })
     }
 }
 
@@ -135,7 +139,7 @@ impl ResponseAdapter for GeminiAdapter {
     }
 
     fn build_body(&self, request: &CompletionRequest) -> Value {
-         let mut body = json!({});
+        let mut body = json!({});
 
         // System instruction
         if let Some(ref system) = request.system {
@@ -283,9 +287,8 @@ impl ResponseAdapter for GeminiAdapter {
             };
 
             // Check if tool use happened
-            let has_tool_use = parts.map_or(false, |p| {
-                p.iter().any(|x| x.get("functionCall").is_some())
-            });
+            let has_tool_use =
+                parts.map_or(false, |p| p.iter().any(|x| x.get("functionCall").is_some()));
             let stop_reason = if has_tool_use {
                 StopReason::ToolUse
             } else {
@@ -335,7 +338,7 @@ impl ResponseAdapter for AnthropicAdapter {
             for block in &msg.content {
                 match block {
                     ContentBlock::Text { text } => {
-                       content.push(json!({ "type": "text", "text": text }));
+                        content.push(json!({ "type": "text", "text": text }));
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         content.push(json!({
@@ -345,8 +348,12 @@ impl ResponseAdapter for AnthropicAdapter {
                             "input": input
                         }));
                     }
-                    ContentBlock::ToolResult { tool_use_id, content: result_content, is_error } => {
-                         content.push(json!({
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: result_content,
+                        is_error,
+                    } => {
+                        content.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
                             "content": result_content,
@@ -360,13 +367,17 @@ impl ResponseAdapter for AnthropicAdapter {
         body["messages"] = json!(messages);
 
         if !request.tools.is_empty() {
-             let tools: Vec<Value> = request.tools.iter().map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.input_schema
+            let tools: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = json!(tools);
         }
 
@@ -467,11 +478,11 @@ impl ResponseAdapter for OpenAiAdapter {
 
         let mut messages = Vec::new();
         if let Some(system) = &request.system {
-             messages.push(json!({ "role": "system", "content": system }));
+            messages.push(json!({ "role": "system", "content": system }));
         }
 
         for msg in &request.messages {
-             let role = match msg.role {
+            let role = match msg.role {
                 LlmRole::User => "user",
                 LlmRole::Assistant => "assistant",
             };
@@ -498,7 +509,11 @@ impl ResponseAdapter for OpenAiAdapter {
                             }
                         }));
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
                         // Tool results are separate messages in OpenAI with role "tool"
                         tool_result = Some(json!({
                             "role": "tool",
@@ -510,29 +525,33 @@ impl ResponseAdapter for OpenAiAdapter {
             }
 
             if let Some(tr) = tool_result {
-                 messages.push(tr);
+                messages.push(tr);
             } else {
-                 let content_str = text_parts.join("\n");
-                 let mut msg_obj = json!({ "role": role, "content": content_str });
-                 if !tool_calls.is_empty() {
-                     msg_obj["tool_calls"] = json!(tool_calls);
-                 }
-                 messages.push(msg_obj);
+                let content_str = text_parts.join("\n");
+                let mut msg_obj = json!({ "role": role, "content": content_str });
+                if !tool_calls.is_empty() {
+                    msg_obj["tool_calls"] = json!(tool_calls);
+                }
+                messages.push(msg_obj);
             }
         }
         body["messages"] = json!(messages);
 
         if !request.tools.is_empty() {
-             let tools: Vec<Value> = request.tools.iter().map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.input_schema
-                    }
+            let tools: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = json!(tools);
         }
 
@@ -594,7 +613,7 @@ impl ResponseAdapter for OpenAiAdapter {
             if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
                 accumulated_usage.input_tokens = prompt;
             }
-             if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
                 accumulated_usage.output_tokens = completion;
             }
         }
@@ -690,23 +709,20 @@ impl VertexProvider {
     /// - `vertex/anthropic/claude-3-opus` -> Anthropic, claude-3-opus, AnthropicAdapter
     /// - `vertex/meta/llama3-405b` -> Meta, llama3-405b, OpenAiAdapter
     /// - `vertex` (generic) -> `default_model` -> Resolve recursively
-    fn resolve_request_config(
-        &self,
-        model_name: &str,
-    ) -> (Box<dyn ResponseAdapter>, String) {
+    fn resolve_request_config(&self, model_name: &str) -> (Box<dyn ResponseAdapter>, String) {
         let clean_model = strip_vertex_prefix(model_name);
 
         // Handle generic fallback
         let effective_model = if clean_model.is_empty() || clean_model == "default" {
-             if let Some(ref default) = self.default_model {
-                 // Use the default model, but strip any prefix it might have to avoid recursion if simple prefix stripping isn't enough?
-                 // Ideally default_model is stored clean or we recurse?
-                 // Let's assume default_model is the full ID like "gemini-1.5-pro" or "vertex/gemini-1.5-pro".
-                 strip_vertex_prefix(default)
-             } else {
-                 // Fallback if no default configured?
-                 "gemini-1.5-flash-001"
-             }
+            if let Some(ref default) = self.default_model {
+                // Use the default model, but strip any prefix it might have to avoid recursion if simple prefix stripping isn't enough?
+                // Ideally default_model is stored clean or we recurse?
+                // Let's assume default_model is the full ID like "gemini-1.5-pro" or "vertex/gemini-1.5-pro".
+                strip_vertex_prefix(default)
+            } else {
+                // Fallback if no default configured?
+                "gemini-1.5-flash-001"
+            }
         } else {
             clean_model
         };
@@ -717,28 +733,34 @@ impl VertexProvider {
             if effective_model.starts_with("anthropic/") {
                 (
                     "anthropic",
-                    effective_model.strip_prefix("anthropic/").unwrap_or(effective_model),
+                    effective_model
+                        .strip_prefix("anthropic/")
+                        .unwrap_or(effective_model),
                     Box::new(AnthropicAdapter),
                 )
             } else if effective_model.starts_with("meta/") {
                 (
                     "meta",
-                    effective_model.strip_prefix("meta/").unwrap_or(effective_model),
+                    effective_model
+                        .strip_prefix("meta/")
+                        .unwrap_or(effective_model),
                     Box::new(OpenAiAdapter),
                 )
             } else if effective_model.starts_with("google/") {
                 (
                     "google",
-                    effective_model.strip_prefix("google/").unwrap_or(effective_model),
+                    effective_model
+                        .strip_prefix("google/")
+                        .unwrap_or(effective_model),
                     Box::new(GeminiAdapter),
                 )
             } else if effective_model.starts_with("gemini-") {
                 // Determine if it's gemini (google)
-                 ("google", effective_model, Box::new(GeminiAdapter))
+                ("google", effective_model, Box::new(GeminiAdapter))
             } else {
                 // Default to Google/Gemini for unknown, or maybe OpenAI if likely 3rd party?
                 // Let's default to Google for now as it's "Vertex AI".
-                 ("google", effective_model, Box::new(GeminiAdapter))
+                ("google", effective_model, Box::new(GeminiAdapter))
             };
 
         let method = adapter.api_method();
@@ -747,7 +769,7 @@ impl VertexProvider {
         // These models are automatically routed to the global endpoint `aiplatform.googleapis.com`
         // unless overridden.
         if model_id.contains("gemini-3") {
-             let url = format!(
+            let url = format!(
                 "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
                 self.project_id, "global", publisher, model_id, method
             );
@@ -872,7 +894,8 @@ impl LlmProvider for VertexProvider {
         let cancel = cancel_token.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = process_vertex_sse_stream(stream, &tx, &cancel, adapter.as_ref()).await {
+            if let Err(e) = process_vertex_sse_stream(stream, &tx, &cancel, adapter.as_ref()).await
+            {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
@@ -932,7 +955,7 @@ where
             if let Some(data) = line.strip_prefix("data: ") {
                 match adapter.parse_chunk(data, &mut accumulated_usage) {
                     Ok(events) => {
-                         for event in events {
+                        for event in events {
                             let is_stop = matches!(event, StreamEvent::Stop { .. });
                             let is_error = matches!(event, StreamEvent::Error { .. });
                             if tx.send(event).await.is_err() {
@@ -944,10 +967,10 @@ where
                         }
                     }
                     Err(e) => {
-                         // Log parse error but maybe continue?
-                         // For now, treat as stream error
-                         let _ = tx.send(StreamEvent::Error { message: e }).await;
-                         return Ok(());
+                        // Log parse error but maybe continue?
+                        // For now, treat as stream error
+                        let _ = tx.send(StreamEvent::Error { message: e }).await;
+                        return Ok(());
                     }
                 }
             }
@@ -1023,30 +1046,35 @@ pub async fn list_models(
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| AgentError::Provider(format!("failed to list models for {publisher}: {e}")))?;
+            .map_err(|e| {
+                AgentError::Provider(format!("failed to list models for {publisher}: {e}"))
+            })?;
 
         if !response.status().is_success() {
-             tracing::warn!("Failed to list models for {}: {}", publisher, response.status());
-             continue;
+            tracing::warn!(
+                "Failed to list models for {}: {}",
+                publisher,
+                response.status()
+            );
+            continue;
         }
 
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| AgentError::Provider(format!("failed to parse model list for {publisher}: {e}")))?;
+        let body: Value = response.json().await.map_err(|e| {
+            AgentError::Provider(format!("failed to parse model list for {publisher}: {e}"))
+        })?;
 
         if let Some(models) = body.get("models").and_then(|v| v.as_array()) {
             for model in models {
-                 if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
-                     let parts: Vec<&str> = name.split('/').collect();
-                     if let Some(model_id) = parts.last() {
-                         if publisher == "google" {
-                             all_models.push(format!("vertex/{}", model_id));
-                         } else {
-                             all_models.push(format!("vertex/{}/{}", publisher, model_id));
-                         }
-                     }
-                 }
+                if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
+                    let parts: Vec<&str> = name.split('/').collect();
+                    if let Some(model_id) = parts.last() {
+                        if publisher == "google" {
+                            all_models.push(format!("vertex/{}", model_id));
+                        } else {
+                            all_models.push(format!("vertex/{}/{}", publisher, model_id));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1071,7 +1099,8 @@ mod tests {
                     "parts": [{ "text": "Hello" }]
                 }
             }]
-        }).to_string();
+        })
+        .to_string();
 
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert_eq!(events.len(), 1);
@@ -1090,12 +1119,13 @@ mod tests {
                 "promptTokenCount": 10,
                 "candidatesTokenCount": 20
             }
-        }).to_string();
-         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
-         // Should have Stop event
-         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
-         assert_eq!(usage.input_tokens, 10);
-         assert_eq!(usage.output_tokens, 20);
+        })
+        .to_string();
+        let events = adapter.parse_chunk(&data, &mut usage).unwrap();
+        // Should have Stop event
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
     }
 
     #[test]
@@ -1108,7 +1138,8 @@ mod tests {
             "type": "content_block_delta",
             "index": 0,
             "delta": { "type": "text_delta", "text": "Hello" }
-        }).to_string();
+        })
+        .to_string();
 
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert_eq!(events.len(), 1);
@@ -1122,11 +1153,11 @@ mod tests {
             "type": "message_delta",
             "delta": { "stop_reason": "end_turn", "stop_sequence": null },
             "usage": { "output_tokens": 15 }
-        }).to_string();
+        })
+        .to_string();
 
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
         assert_eq!(usage.output_tokens, 15);
     }
 }
-

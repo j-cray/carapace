@@ -188,9 +188,7 @@ pub async fn signal_receive_loop(
                 if consecutive_errors <= 3 {
                     warn!("Signal WS connect error: {}", e);
                 } else if consecutive_errors == 4 {
-                    warn!(
-                        "Signal WS errors continuing (suppressing further logs until recovery)"
-                    );
+                    warn!("Signal WS errors continuing (suppressing further logs until recovery)");
                 }
                 channel_registry.set_error("signal", e.to_string());
             }
@@ -210,8 +208,6 @@ pub async fn signal_receive_loop(
         }
     }
 }
-
-
 
 /// Builds the JSON payload for a Signal read receipt.
 fn build_read_receipt_payload(sender: &str, timestamp: u64) -> serde_json::Value {
@@ -233,7 +229,10 @@ async fn process_envelope(
     let data_message = match &envelope.data_message {
         Some(dm) => dm,
         None => {
-            info!("Dropped envelope without dataMessage (could be syncMessage/receipt): {:?}", envelope);
+            info!(
+                "Dropped envelope without dataMessage (could be syncMessage/receipt): {:?}",
+                envelope
+            );
             return;
         }
     };
@@ -370,12 +369,15 @@ async fn process_envelope(
         urlencoding::encode(phone_number)
     );
     let sender_clone = sender.to_string();
-    let timestamp = data_message.timestamp.or(envelope.timestamp).unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    });
+    let timestamp = data_message
+        .timestamp
+        .or(envelope.timestamp)
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        });
 
     let payload = build_read_receipt_payload(&receipt_recipient, timestamp);
 
@@ -488,7 +490,11 @@ mod tests {
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes.len(), 1);
         let expected = Some("+15559876543");
-        let match_source = envelopes[0].source.as_deref().or(envelopes[0].source_number.as_deref()) == expected;
+        let match_source = envelopes[0]
+            .source
+            .as_deref()
+            .or(envelopes[0].source_number.as_deref())
+            == expected;
         assert!(match_source, "source should match");
         let dm = envelopes[0].data_message.as_ref().unwrap();
         assert_eq!(dm.message.as_deref(), Some("Hello from Signal!"));
@@ -596,13 +602,17 @@ mod tests {
             .as_ref()
             .or(envelopes[0].source_number.as_ref())
             .or(envelopes[0].source.as_ref())
-            .map(|s| s.as_str()) == expected_uuid;
+            .map(|s| s.as_str())
+            == expected_uuid;
         assert!(match_fallback, "fallback source should match");
     }
 
     #[test]
     fn test_build_read_receipt_payload() {
-        let payload = super::build_read_receipt_payload("8fe77508-3017-48de-82ed-5722f4b48625", 1706745600000);
+        let payload = super::build_read_receipt_payload(
+            "8fe77508-3017-48de-82ed-5722f4b48625",
+            1706745600000,
+        );
         assert_eq!(payload["receipt_type"], "read");
         assert_eq!(payload["recipient"], "8fe77508-3017-48de-82ed-5722f4b48625");
         assert_eq!(payload["timestamp"], 1706745600000_u64);
@@ -626,7 +636,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_signal_typing_indicator_flow() {
-        use axum::{routing::{post, put}, Router, extract::Path};
+        use axum::{
+            extract::Path,
+            routing::{post, put},
+            Router,
+        };
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
         use tokio::net::TcpListener;
@@ -639,10 +653,12 @@ mod tests {
                 post({
                     let reqs = requests.clone();
                     move |Path(number): Path<String>| async move {
-                        reqs.lock().unwrap().push(format!("POST_RECEIPT_{}", number));
+                        reqs.lock()
+                            .unwrap()
+                            .push(format!("POST_RECEIPT_{}", number));
                         axum::http::StatusCode::OK
                     }
-                })
+                }),
             )
             .route(
                 "/v1/typing-indicator/{number}",
@@ -656,10 +672,12 @@ mod tests {
                 .delete({
                     let reqs = requests.clone();
                     move |Path(number): Path<String>| async move {
-                        reqs.lock().unwrap().push(format!("DELETE_TYPING_{}", number));
+                        reqs.lock()
+                            .unwrap()
+                            .push(format!("DELETE_TYPING_{}", number));
                         axum::http::StatusCode::OK
                     }
-                })
+                }),
             );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -676,16 +694,22 @@ mod tests {
         let store = Arc::new(crate::sessions::SessionStore::with_base_path(
             tmp.path().join("sessions"),
         ));
-        let state = Arc::new(crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default()).with_session_store(store));
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_session_store(store),
+        );
 
-        let json = format!(r#"{{
+        let json = format!(
+            r#"{{
             "source": "{}",
             "timestamp": 1706745600000,
             "dataMessage": {{
                 "message": "Hello from Signal test!",
                 "timestamp": 1706745600000
             }}
-        }}"#, sender);
+        }}"#,
+            sender
+        );
 
         let envelope: SignalEnvelope = serde_json::from_str(&json).unwrap();
         let client = reqwest::Client::new();
@@ -697,9 +721,21 @@ mod tests {
 
         {
             let reqs = requests.lock().unwrap();
-            assert!(reqs.contains(&format!("POST_RECEIPT_{}", phone_number)), "Requests: {:?}", reqs);
-            assert!(reqs.contains(&format!("PUT_TYPING_{}", phone_number)), "Requests: {:?}", reqs);
-            assert!(!reqs.contains(&format!("DELETE_TYPING_{}", phone_number)), "Requests: {:?}", reqs);
+            assert!(
+                reqs.contains(&format!("POST_RECEIPT_{}", phone_number)),
+                "Requests: {:?}",
+                reqs
+            );
+            assert!(
+                reqs.contains(&format!("PUT_TYPING_{}", phone_number)),
+                "Requests: {:?}",
+                reqs
+            );
+            assert!(
+                !reqs.contains(&format!("DELETE_TYPING_{}", phone_number)),
+                "Requests: {:?}",
+                reqs
+            );
         }
 
         // Find the active run and mark it completed to trigger DELETE
@@ -721,71 +757,86 @@ mod tests {
 
         {
             let reqs = requests.lock().unwrap();
-            assert!(reqs.contains(&format!("DELETE_TYPING_{}", phone_number)), "Requests: {:?}", reqs);
+            assert!(
+                reqs.contains(&format!("DELETE_TYPING_{}", phone_number)),
+                "Requests: {:?}",
+                reqs
+            );
         }
     }
 
     #[tokio::test]
     async fn test_signal_receive_to_response_latency() {
-        use axum::{routing::{get, post, put}, Router, extract::Path};
+        use axum::{
+            extract::Path,
+            routing::{get, post, put},
+            Router,
+        };
         use std::sync::{Arc, Mutex};
         use std::time::{Duration, Instant};
         use tokio::net::TcpListener;
 
         let timestamps = Arc::new(Mutex::new(Vec::new()));
 
-        let app = Router::new()
-            .route(
-                "/v1/receive/{number}",
-                get({
-                    let ts = timestamps.clone();
-                    move |Path(_number): Path<String>, ws: axum::extract::ws::WebSocketUpgrade| async move {
-                        ws.on_upgrade(move |mut socket| async move {
-                            let should_send = {
-                                let mut locked = ts.lock().unwrap();
-                                let is_first_connection = locked.is_empty();
-                                if is_first_connection {
-                                    // First poll: record receive time and send a message
-                                    locked.push(Instant::now());
-                                }
-                                is_first_connection
-                            };
-
-                            if should_send {
-                                let json = serde_json::json!({
-                                    "envelope": {
-                                        "source": "+15559876543",
-                                        "timestamp": 1706745600000_u64,
-                                        "dataMessage": {
-                                            "message": "Latency test",
-                                            "timestamp": 1706745600000_u64
-                                        }
+        let app =
+            Router::new()
+                .route(
+                    "/v1/receive/{number}",
+                    get({
+                        let ts = timestamps.clone();
+                        move |Path(_number): Path<String>,
+                              ws: axum::extract::ws::WebSocketUpgrade| async move {
+                            ws.on_upgrade(move |mut socket| async move {
+                                let should_send = {
+                                    let mut locked = ts.lock().unwrap();
+                                    let is_first_connection = locked.is_empty();
+                                    if is_first_connection {
+                                        // First poll: record receive time and send a message
+                                        locked.push(Instant::now());
                                     }
-                                });
-                                socket.send(axum::extract::ws::Message::Text(json.to_string().into())).await.expect("Failed to send message over websocket");
-                            }
-                        })
-                    }
-                })
-            )
-            .route(
-                "/v1/receipts/{number}",
-                post({
-                    let ts = timestamps.clone();
-                    move |Path(_number): Path<String>| async move {
-                        let mut locked = ts.lock().unwrap();
-                        if locked.len() == 1 {
-                             locked.push(Instant::now()); // Record response time
+                                    is_first_connection
+                                };
+
+                                if should_send {
+                                    let json = serde_json::json!({
+                                        "envelope": {
+                                            "source": "+15559876543",
+                                            "timestamp": 1706745600000_u64,
+                                            "dataMessage": {
+                                                "message": "Latency test",
+                                                "timestamp": 1706745600000_u64
+                                            }
+                                        }
+                                    });
+                                    socket
+                                        .send(axum::extract::ws::Message::Text(
+                                            json.to_string().into(),
+                                        ))
+                                        .await
+                                        .expect("Failed to send message over websocket");
+                                }
+                            })
                         }
-                        axum::http::StatusCode::OK
-                    }
-                })
-            )
-            .route(
-                "/v1/typing-indicator/{number}",
-                put(|| async move { axum::http::StatusCode::OK })
-                .delete(|| async move { axum::http::StatusCode::OK })
-            );
+                    }),
+                )
+                .route(
+                    "/v1/receipts/{number}",
+                    post({
+                        let ts = timestamps.clone();
+                        move |Path(_number): Path<String>| async move {
+                            let mut locked = ts.lock().unwrap();
+                            if locked.len() == 1 {
+                                locked.push(Instant::now()); // Record response time
+                            }
+                            axum::http::StatusCode::OK
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/typing-indicator/{number}",
+                    put(|| async move { axum::http::StatusCode::OK })
+                        .delete(|| async move { axum::http::StatusCode::OK }),
+                );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -800,7 +851,10 @@ mod tests {
         let store = Arc::new(crate::sessions::SessionStore::with_base_path(
             tmp.path().join("sessions"),
         ));
-        let state = Arc::new(crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default()).with_session_store(store));
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_session_store(store),
+        );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let channel_registry = Arc::new(crate::channels::ChannelRegistry::new());
@@ -822,13 +876,20 @@ mod tests {
         let locked_ts = timestamps.lock().unwrap();
 
         // Output detailed timing if it failed
-        assert!(locked_ts.len() >= 2, "Test failed: mock server was not hit enough times. Got {} hits", locked_ts.len());
+        assert!(
+            locked_ts.len() >= 2,
+            "Test failed: mock server was not hit enough times. Got {} hits",
+            locked_ts.len()
+        );
 
         let receive_time = locked_ts[0];
         let receipt_time = locked_ts[1];
         let latency = receipt_time.duration_since(receive_time);
 
         // Assert latency is extremely small (sub 50ms)
-        assert!(latency < Duration::from_millis(50), "Latency was too high: {latency:?}");
+        assert!(
+            latency < Duration::from_millis(50),
+            "Latency was too high: {latency:?}"
+        );
     }
 }

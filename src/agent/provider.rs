@@ -234,13 +234,13 @@ impl MultiProvider {
             })
         } else if crate::agent::gemini::is_gemini_model(model) {
             if self.gemini.is_some() {
-                self.gemini.as_deref().ok_or_else(|| {
-                    AgentError::Provider("".to_string())
-                })
+                self.gemini
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
             } else if self.vertex.is_some() {
-                self.vertex.as_deref().ok_or_else(|| {
-                    AgentError::Provider("".to_string())
-                })
+                self.vertex
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
             } else {
                 Err(AgentError::Provider(format!(
                     "model \"{model}\" requires Gemini provider, but no GOOGLE_API_KEY is configured"
@@ -261,13 +261,13 @@ impl MultiProvider {
         } else {
             // Default to Anthropic for claude-* and unknown models
             if self.anthropic.is_some() {
-                self.anthropic.as_deref().ok_or_else(|| {
-                    AgentError::Provider("".to_string())
-                })
+                self.anthropic
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
             } else if model == crate::agent::DEFAULT_MODEL && self.vertex.is_some() {
-                self.vertex.as_deref().ok_or_else(|| {
-                    AgentError::Provider("".to_string())
-                })
+                self.vertex
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
             } else {
                 Err(AgentError::Provider(format!(
                     "model \"{model}\" requires Anthropic provider, but no ANTHROPIC_API_KEY is configured"
