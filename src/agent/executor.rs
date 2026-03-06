@@ -941,7 +941,8 @@ pub async fn execute_run(
                         cfg["vertex"]["model"] = json!(model_name);
                         match crate::config::save_config(&cfg) {
                             Ok(_) => {
-                                accumulated_text = format!("Vertex AI model changed to: {}", model_name);
+                                accumulated_text =
+                                    format!("Vertex AI model changed to: {}", model_name);
                             }
                             Err(e) => {
                                 accumulated_text = format!("Failed to save config: {}", e);

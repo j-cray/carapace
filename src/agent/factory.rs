@@ -309,18 +309,18 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     let vertex_config = get_vertex_config(cfg);
 
     let vertex_provider = if let Some(project_id) = vertex_config.project_id {
-        let location = vertex_config.location.unwrap_or_else(|| "us-central1".to_string());
+        let location = vertex_config
+            .location
+            .unwrap_or_else(|| "us-central1".to_string());
         info!(
             "LLM provider configured: Vertex (project: {}, location: {})",
             project_id, location
         );
-        Some(
-            Arc::new(agent::vertex::VertexProvider::new(
-                project_id,
-                location,
-                vertex_config.model,
-            )) as Arc<dyn agent::LlmProvider>,
-        )
+        Some(Arc::new(agent::vertex::VertexProvider::new(
+            project_id,
+            location,
+            vertex_config.model,
+        )) as Arc<dyn agent::LlmProvider>)
     } else {
         None
     };
@@ -458,7 +458,13 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         } else {
             None
         },
-        vertex: vertex_config.project_id.map(|p| (p, vertex_config.location.unwrap_or_default(), vertex_config.model)),
+        vertex: vertex_config.project_id.map(|p| {
+            (
+                p,
+                vertex_config.location.unwrap_or_default(),
+                vertex_config.model,
+            )
+        }),
     }
 }
 
