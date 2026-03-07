@@ -6,9 +6,6 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::TokioResolver;
 
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
@@ -284,7 +281,7 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
         // Host is a hostname -- resolve DNS and validate every returned IP.
         let host_for_lookup = host.clone();
         let ip = run_sync_blocking_send(async move {
-            let mut builder = hickory_resolver::TokioResolver::builder_with_config(
+            let builder = hickory_resolver::TokioResolver::builder_with_config(
                 hickory_resolver::config::ResolverConfig::default(),
                 hickory_resolver::name_server::TokioConnectionProvider::default(),
             );
