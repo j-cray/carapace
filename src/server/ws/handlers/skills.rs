@@ -22,7 +22,10 @@ const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
 const MAX_SKILL_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 
 /// Default HTTP timeout for skill downloads (60 seconds).
+#[cfg(not(test))]
 const SKILL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const SKILL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Name of the skills manifest file stored alongside WASM binaries.
 const SKILLS_MANIFEST_FILE: &str = "skills-manifest.json";
