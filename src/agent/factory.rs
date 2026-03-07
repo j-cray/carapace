@@ -458,7 +458,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         } else {
             None
         },
-        vertex: vertex_config.project_id.map(|p| (p, vertex_config.location.unwrap_or_default(), vertex_config.model)),
+        vertex: vertex_config.project_id.map(|p| (p, vertex_config.location.unwrap_or_else(|| "us-central1".to_string()), vertex_config.model)),
     }
 }
 
