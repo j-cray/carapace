@@ -602,9 +602,18 @@ mod tests {
             .as_ref()
             .or(envelopes[0].source_number.as_ref())
             .or(envelopes[0].source.as_ref())
-            .map(|s| s.as_str());
+            .map(|s| redact_identifier_for_logging(s));
 
         assert_eq!(fallback_source, expected_uuid, "fallback source should match expected_uuid");
+    }
+
+    /// Return a redacted identifier suitable for logging, so that we do not log
+    /// cleartext phone numbers or UUIDs.
+    ///
+    /// Currently this returns a constant marker; if needed, this can be replaced
+    /// with a stable hash or partial masking implementation.
+    fn redact_identifier_for_logging(_id: &str) -> &'static str {
+        "<redacted>"
     }
 
     #[test]
