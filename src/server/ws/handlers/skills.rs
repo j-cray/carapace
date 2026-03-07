@@ -280,6 +280,7 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
         // Host is a hostname -- resolve DNS and validate every returned IP.
         let host_for_lookup = host.clone();
         let ip = run_sync_blocking_send(async move {
+            #[allow(unused_mut)]
             let mut builder = hickory_resolver::TokioResolver::builder_with_config(
                 hickory_resolver::config::ResolverConfig::default(),
                 hickory_resolver::name_server::TokioConnectionProvider::default(),
