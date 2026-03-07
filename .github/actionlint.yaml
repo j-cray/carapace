@@ -1,0 +1,9 @@
+paths:
+  ".github/workflows/*.yml":
+    ignore:
+      - "Context access might be invalid: docs"
+      - "Context access might be invalid: workflow"
+      - "Context access might be invalid: rust_runtime"
+      - "Context access might be invalid: windows_sensitive"
+      - "Context access might be invalid: docker"
+      - "Context access might be invalid: control_ui"
