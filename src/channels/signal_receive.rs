@@ -606,16 +606,14 @@ mod tests {
             "source_uuid should match"
         );
 
-        assert_eq!(
-            envelopes[0]
-                .source_uuid
-                .as_ref()
-                .or(envelopes[0].source_number.as_ref())
-                .or(envelopes[0].source.as_ref())
-                .map(|s| s.as_str()),
-            expected_uuid,
-            "fallback source should match"
-        );
+        let fallback_source = envelopes[0]
+            .source_uuid
+            .as_ref()
+            .or(envelopes[0].source_number.as_ref())
+            .or(envelopes[0].source.as_ref())
+            .map(|s| s.as_str());
+
+        assert_eq!(fallback_source, expected_uuid);
     }
 
     #[test]
