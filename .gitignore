@@ -32,9 +32,6 @@ run_local_with_signal.sh
 # Snapshots
 **/*.snap.new
 
-carapace.json
-src/server/ws/snapshots/
-
 # Test cache
 .nextest/
 /tmp/test_out.txt
