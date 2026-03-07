@@ -595,11 +595,7 @@ mod tests {
         let expected_uuid = Some("8fe77508-3017-48de-82ed-5722f4b48625");
 
         let actual_uuid = envelopes[0].source_uuid.as_deref();
-        let uuid_match = actual_uuid == expected_uuid;
-        assert!(
-            uuid_match,
-            "source_uuid should match"
-        );
+        assert_eq!(actual_uuid, expected_uuid, "source_uuid should match");
 
         let fallback_source = envelopes[0]
             .source_uuid
