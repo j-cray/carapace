@@ -495,11 +495,7 @@ mod tests {
             .source
             .as_deref()
             .or(envelopes[0].source_number.as_deref());
-        let source_match = actual == expected;
-        assert!(
-            source_match,
-            "source should match"
-        );
+        assert_eq!(actual, expected, "source should match");
         let dm = envelopes[0].data_message.as_ref().unwrap();
         assert_eq!(dm.message.as_deref(), Some("Hello from Signal!"));
         assert_eq!(dm.timestamp, Some(1706745600000));
