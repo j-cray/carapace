@@ -80,12 +80,10 @@ impl MetadataProvider {
 impl TokenProvider for MetadataProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via metadata server");
-        // The GCP metadata server is only available via HTTP internally.
-        // Construct the URL dynamically to bypass the CodeQL rust/non-https-url warning.
-        let scheme = "http";
-        let host = "metadata.google.internal";
-        let path = "computeMetadata/v1/instance/service-accounts/default/token";
-        let url = format!("{}://{}/{}", scheme, host, path);
+        // The GCP metadata server is only available via HTTP internally, and this is a trusted,
+        // well-known endpoint within the GCP environment. This is safe to ignore the non-https-url warning.
+        const METADATA_TOKEN_URL: &str = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+        let url = METADATA_TOKEN_URL;
         let response = self
             .client
             .get(url)
