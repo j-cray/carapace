@@ -591,6 +591,7 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes.len(), 1);
+        let expected_uuid = Some("8fe77508-3017-48de-82ed-5722f4b48625");
         let actual_uuid = envelopes[0].source_uuid.as_deref();
         assert_eq!(actual_uuid, expected_uuid, "source_uuid should match");
 
@@ -599,18 +600,9 @@ mod tests {
             .as_ref()
             .or(envelopes[0].source_number.as_ref())
             .or(envelopes[0].source.as_ref())
-            .map(|s| redact_identifier_for_logging(s));
+            .map(|s| s.as_str());
 
         assert_eq!(fallback_source, expected_uuid, "fallback source should match expected_uuid");
-    }
-
-    /// Return a redacted identifier suitable for logging, so that we do not log
-    /// cleartext phone numbers or UUIDs.
-    ///
-    /// Currently this returns a constant marker; if needed, this can be replaced
-    /// with a stable hash or partial masking implementation.
-    fn redact_identifier_for_logging(_id: &str) -> &'static str {
-        "<redacted>"
     }
 
     #[test]
