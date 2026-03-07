@@ -491,12 +491,13 @@ mod tests {
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes.len(), 1);
         let expected = Some("+15559876543");
-        assert_eq!(
-            envelopes[0]
-                .source
-                .as_deref()
-                .or(envelopes[0].source_number.as_deref()),
-            expected,
+        let actual = envelopes[0]
+            .source
+            .as_deref()
+            .or(envelopes[0].source_number.as_deref());
+        let source_match = actual == expected;
+        assert!(
+            source_match,
             "source should match"
         );
         let dm = envelopes[0].data_message.as_ref().unwrap();
@@ -562,9 +563,10 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         let expected = Some("+15559876543");
-        assert_eq!(
-            envelopes[0].source_number.as_deref(),
-            expected,
+        let actual = envelopes[0].source_number.as_deref();
+        let number_match = actual == expected;
+        assert!(
+            number_match,
             "source_number should match"
         );
     }
@@ -600,9 +602,10 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         let expected_uuid = Some("8fe77508-3017-48de-82ed-5722f4b48625");
 
-        assert_eq!(
-            envelopes[0].source_uuid.as_deref(),
-            expected_uuid,
+        let actual_uuid = envelopes[0].source_uuid.as_deref();
+        let uuid_match = actual_uuid == expected_uuid;
+        assert!(
+            uuid_match,
             "source_uuid should match"
         );
 
@@ -613,7 +616,8 @@ mod tests {
             .or(envelopes[0].source.as_ref())
             .map(|s| s.as_str());
 
-        assert_eq!(fallback_source, expected_uuid);
+        let fallback_match = fallback_source == expected_uuid;
+        assert!(fallback_match, "fallback source should match expected_uuid");
     }
 
     #[test]
@@ -623,7 +627,9 @@ mod tests {
             1706745600000,
         );
         assert_eq!(payload["receipt_type"], "read");
-        assert_eq!(payload["recipient"], "8fe77508-3017-48de-82ed-5722f4b48625");
+        let expected_uuid = "8fe77508-3017-48de-82ed-5722f4b48625";
+        let recipient_match = payload["recipient"] == expected_uuid;
+        assert!(recipient_match, "recipient should match");
         assert_eq!(payload["timestamp"], 1706745600000_u64);
     }
 
