@@ -614,9 +614,7 @@ mod tests {
             1706745600000,
         );
         assert_eq!(payload["receipt_type"], "read");
-        let expected_uuid = "8fe77508-3017-48de-82ed-5722f4b48625";
-        let recipient_match = payload["recipient"] == expected_uuid;
-        assert!(recipient_match, "recipient should match");
+        assert_eq!(payload["recipient"], "8fe77508-3017-48de-82ed-5722f4b48625");
         assert_eq!(payload["timestamp"], 1706745600000_u64);
     }
 
