@@ -558,6 +558,7 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         let actual = envelopes[0].source_number.as_deref();
+        let expected = Some("+15559876543");
         assert_eq!(actual, expected, "source_number should match");
     }
 
