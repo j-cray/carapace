@@ -604,8 +604,7 @@ mod tests {
             .or(envelopes[0].source.as_ref())
             .map(|s| s.as_str());
 
-        let fallback_match = fallback_source == expected_uuid;
-        assert!(fallback_match, "fallback source should match expected_uuid");
+        assert_eq!(fallback_source, expected_uuid, "fallback source should match expected_uuid");
     }
 
     #[test]
