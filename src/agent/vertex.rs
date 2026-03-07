@@ -1058,6 +1058,141 @@ pub async fn list_models(
 mod tests {
     use super::*;
     use serde_json::json;
+    use crate::agent::provider::{CompletionRequest, LlmMessage, LlmRole, ContentBlock, ToolDefinition};
+
+    #[test]
+    fn test_model_utilities() {
+        assert_eq!(strip_vertex_prefix("vertex/gemini-1.5-pro"), "gemini-1.5-pro");
+        assert_eq!(strip_vertex_prefix("vertex:gemini-1.5-pro"), "gemini-1.5-pro");
+        assert_eq!(strip_vertex_prefix("gemini-1.5-pro"), "gemini-1.5-pro");
+
+        assert!(is_vertex_model("vertex/gemini-1.5-pro"));
+        assert!(is_vertex_model("vertex:gemini-1.5-pro"));
+        assert!(!is_vertex_model("gemini-1.5-pro"));
+    }
+
+    #[test]
+    fn test_gemini_adapter_build_body() {
+        let adapter = GeminiAdapter;
+        let request = CompletionRequest {
+            model: "vertex/gemini-1.5-pro".to_string(),
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text { text: "Hello".to_string() }],
+                }
+            ],
+            system: Some("You are a helpful assistant.".to_string()),
+            temperature: Some(0.7),
+            max_tokens: 100,
+            tools: vec![
+                ToolDefinition {
+                    name: "get_weather".to_string(),
+                    description: "Get weather".to_string(),
+                    input_schema: json!({ "type": "object", "properties": {} }),
+                }
+            ],
+            extra: None,
+        };
+
+        let body = adapter.build_body(&request);
+
+        assert_eq!(body["system_instruction"]["parts"][0]["text"], "You are a helpful assistant.");
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "Hello");
+        assert_eq!(body["generationConfig"]["temperature"], 0.7);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 100);
+        assert_eq!(body["tools"][0]["function_declarations"][0]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_anthropic_adapter_build_body() {
+        let adapter = AnthropicAdapter;
+        let request = CompletionRequest {
+            model: "vertex/anthropic/claude-3-5-sonnet".to_string(),
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text { text: "Hi Claude".to_string() }],
+                }
+            ],
+            system: Some("You are Claude.".to_string()),
+            temperature: Some(0.5),
+            max_tokens: 200,
+            tools: vec![],
+            extra: None,
+        };
+
+        let body = adapter.build_body(&request);
+
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        assert_eq!(body["system"], "You are Claude.");
+        assert_eq!(body["max_tokens"], 200);
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Hi Claude");
+    }
+
+    #[test]
+    fn test_openai_adapter_build_body() {
+        let adapter = OpenAiAdapter;
+        let request = CompletionRequest {
+            model: "vertex/meta/llama3-405b".to_string(),
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text { text: "Hello Llama".to_string() }],
+                }
+            ],
+            system: Some("You are Llama.".to_string()),
+            temperature: None,
+            max_tokens: 300,
+            tools: vec![],
+            extra: None,
+        };
+
+        let body = adapter.build_body(&request);
+
+        assert_eq!(body["model"], "vertex/meta/llama3-405b");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 300);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "You are Llama.");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "Hello Llama");
+    }
+
+    #[test]
+    fn test_resolve_request_config() {
+        let provider = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), Some("gemini-1.5-flash".to_string()));
+
+        // Gemini generic fallback
+        let (_adapter, url) = provider.resolve_request_config("vertex/default");
+        assert!(url.contains("publishers/google/models/gemini-1.5-flash"));
+        assert!(url.contains("us-central1"));
+
+        // Gemini 1.5 specific
+        let (_adapter, url) = provider.resolve_request_config("vertex/gemini-1.5-pro");
+        assert!(url.contains("publishers/google/models/gemini-1.5-pro"));
+        assert!(url.contains("us-central1"));
+
+        // Anthropic specific
+        let (adapter, url) = provider.resolve_request_config("vertex/anthropic/claude-3-opus");
+        assert!(url.contains("publishers/anthropic/models/claude-3-opus"));
+        assert_eq!(adapter.api_method(), "streamRawPredict");
+
+        // Meta specific
+        let (adapter, url) = provider.resolve_request_config("vertex/meta/llama3-405b");
+        assert!(url.contains("publishers/meta/models/llama3-405b"));
+        assert_eq!(adapter.api_method(), "streamRawPredict");
+
+        // Gemini 3 (Global endpoint fallback test)
+        let (_adapter, url) = provider.resolve_request_config("vertex/gemini-3.0-flash");
+        assert!(url.contains("locations/global"));
+        assert!(url.contains("publishers/google/models/gemini-3.0-flash"));
+    }
 
     #[test]
     fn test_gemini_adapter_parsing() {
@@ -1127,6 +1262,44 @@ mod tests {
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
         assert_eq!(usage.output_tokens, 15);
+    }
+
+    #[test]
+    fn test_openai_adapter_parsing() {
+        let adapter = OpenAiAdapter;
+        let mut usage = TokenUsage::default();
+
+        // DONE string
+        let events = adapter.parse_chunk("[DONE]", &mut usage).unwrap();
+        assert!(events.is_empty());
+
+        // Text chunk
+        let data = json!({
+            "choices": [{
+                "delta": { "content": "Hi OpenAi" }
+            }]
+        }).to_string();
+        let events = adapter.parse_chunk(&data, &mut usage).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::TextDelta { text } => assert_eq!(text, "Hi OpenAi"),
+            _ => panic!("Expected TextDelta"),
+        }
+
+        // Stop chunk with usage
+        let data = json!({
+            "choices": [{
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 8
+            }
+        }).to_string();
+        let events = adapter.parse_chunk(&data, &mut usage).unwrap();
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, 8);
     }
 }
 
