@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::env;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,9 @@ struct ConfigWithDefaults {
 
     #[serde(default)]
     messages: MessagesDefaults,
+
+    #[serde(default)]
+    vertex: VertexDefaults,
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +490,40 @@ fn default_ack_reaction_scope() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Vertex defaults
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VertexDefaults {
+    #[serde(
+        default = "default_vertex_project_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    project_id: Option<String>,
+
+    #[serde(default = "default_vertex_location")]
+    location: String,
+}
+
+impl Default for VertexDefaults {
+    fn default() -> Self {
+        Self {
+            project_id: default_vertex_project_id(),
+            location: default_vertex_location(),
+        }
+    }
+}
+
+fn default_vertex_project_id() -> Option<String> {
+    env::var("VERTEX_PROJECT_ID").ok()
+}
+
+fn default_vertex_location() -> String {
+    env::var("VERTEX_LOCATION").unwrap_or_else(|_| "us-central1".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -516,6 +554,7 @@ pub fn apply_defaults(config: &mut Value) {
                 logging: LoggingDefaults::default(),
                 cron: CronDefaults::default(),
                 messages: MessagesDefaults::default(),
+                vertex: VertexDefaults::default(),
             }
         }
     };
@@ -567,6 +606,30 @@ fn merge_defaults(target: &mut Value, defaults: Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn unset_env_var_scoped(key: &'static str) -> EnvVarGuard {
+        let previous = env::var_os(key);
+        env::remove_var(key);
+        EnvVarGuard { key, previous }
+    }
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
@@ -757,6 +820,21 @@ mod tests {
             config["agents"]["defaults"]["maxConcurrent"],
             DEFAULT_AGENT_MAX_CONCURRENT
         );
+    }
+
+    #[test]
+    fn test_vertex_project_id_omitted_when_missing() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _guard = unset_env_var_scoped("VERTEX_PROJECT_ID");
+
+        let mut config = json!({});
+        apply_defaults(&mut config);
+
+        // Should be absent, NOT null
+        assert!(config["vertex"].get("projectId").is_none());
+
+        // Location should still be present (default us-central1)
+        assert_eq!(config["vertex"]["location"], "us-central1");
     }
 
     #[test]
