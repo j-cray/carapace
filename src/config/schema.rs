@@ -71,6 +71,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "slack",
     "classifier",
     "vertex",
+    "filesystem",
 ];
 
 /// Validate a config value against the full schema.
@@ -118,6 +119,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_session_integrity(obj, &mut issues);
     validate_usage(obj, &mut issues);
     validate_vertex(obj, &mut issues);
+    validate_filesystem(obj, &mut issues);
 
     // Run agent config lint if prompt guard config lint is enabled
     if let Some(agents) = obj.get("agents") {
@@ -969,9 +971,206 @@ fn validate_vertex(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     }
 }
 
+fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let filesystem = match obj.get("filesystem") {
+        Some(value) => value,
+        None => return,
+    };
+    let fs_cfg = match filesystem.as_object() {
+        Some(f) => f,
+        None => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem".to_string(),
+                message: format!(
+                    "filesystem configuration must be an object, got {}",
+                    json_type_label(filesystem)
+                ),
+            });
+            return;
+        }
+    };
+
+    let enabled = match fs_cfg.get("enabled") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(other) => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.enabled".to_string(),
+                message: format!(
+                    "filesystem enabled must be a boolean, got {}",
+                    json_type_label(other)
+                ),
+            });
+            false
+        }
+        None => false,
+    };
+
+    // Known keys inside filesystem block
+    let known_keys = [
+        "enabled",
+        "roots",
+        "writeAccess",
+        "maxReadBytes",
+        "excludePatterns",
+    ];
+    for key in fs_cfg.keys() {
+        if !known_keys.contains(&key.as_str()) {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".filesystem.{}", key),
+                message: format!("Unknown filesystem configuration key: {}", key),
+            });
+        }
+    }
+
+    if let Some(write_access) = fs_cfg.get("writeAccess") {
+        if !write_access.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.writeAccess".to_string(),
+                message: format!(
+                    "filesystem writeAccess must be a boolean, got {}",
+                    json_type_label(write_access)
+                ),
+            });
+        }
+    }
+
+    if let Some(max_read_bytes) = fs_cfg.get("maxReadBytes") {
+        if !max_read_bytes.is_u64() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.maxReadBytes".to_string(),
+                message: format!(
+                    "filesystem maxReadBytes must be a non-negative integer, got {}",
+                    json_type_label(max_read_bytes)
+                ),
+            });
+        }
+    }
+
+    // Skip deeper validation if disabled
+    if !enabled {
+        return;
+    }
+
+    let roots = match fs_cfg.get("roots") {
+        Some(value) if !value.is_array() => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.roots".to_string(),
+                message: format!(
+                    "filesystem roots must be an array, got {}",
+                    json_type_label(value)
+                ),
+            });
+            None
+        }
+        Some(value) => value.as_array(),
+        None => None,
+    };
+
+    let is_empty = roots.is_none_or(|a| a.is_empty());
+    if is_empty {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".filesystem.roots".to_string(),
+            message: "filesystem is enabled but roots is empty; all paths will be denied"
+                .to_string(),
+        });
+    }
+
+    if let Some(arr) = roots {
+        for (i, root) in arr.iter().enumerate() {
+            if let Some(s) = root.as_str() {
+                let path = std::path::Path::new(s);
+                if !path.is_absolute() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".filesystem.roots[{}]", i),
+                        message: format!("filesystem root must be an absolute path, got \"{}\"", s),
+                    });
+                } else if !path.exists() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".filesystem.roots[{}]", i),
+                        message: format!("filesystem root does not exist: \"{}\"", s),
+                    });
+                }
+            } else {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".filesystem.roots[{}]", i),
+                    message: format!(
+                        "filesystem root must be a string, got {}",
+                        json_type_label(root)
+                    ),
+                });
+            }
+        }
+    }
+
+    // Validate excludePatterns syntax
+    let patterns = match fs_cfg.get("excludePatterns") {
+        Some(value) if !value.is_array() => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.excludePatterns".to_string(),
+                message: format!(
+                    "filesystem excludePatterns must be an array, got {}",
+                    json_type_label(value)
+                ),
+            });
+            None
+        }
+        Some(value) => value.as_array(),
+        None => None,
+    };
+    if let Some(patterns) = patterns {
+        for (i, pat) in patterns.iter().enumerate() {
+            if let Some(s) = pat.as_str() {
+                if glob::Pattern::new(s).is_err() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".filesystem.excludePatterns[{}]", i),
+                        message: format!(
+                            "invalid glob pattern \"{}\"; fix or remove it (invalid \
+                             patterns cause startup failure to prevent silent access widening)",
+                            s
+                        ),
+                    });
+                }
+            } else {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".filesystem.excludePatterns[{}]", i),
+                    message: format!(
+                        "exclude pattern must be a string, got {}",
+                        json_type_label(pat)
+                    ),
+                });
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Return a human-readable label for a JSON value's type.
+fn json_type_label(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
 
 /// Check that a value is a positive integer (> 0).
 fn check_positive_integer(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
@@ -1587,6 +1786,264 @@ mod tests {
         let cfg = json!({ "gateway": { "ws": { "messageRate": -1 } } });
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|i| i.path.contains("messageRate")));
+    }
+
+    // ===== Filesystem validation =====
+
+    fn test_filesystem_root() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    fn nonexistent_filesystem_root() -> String {
+        loop {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().to_path_buf();
+            drop(dir);
+            if !path.exists() {
+                return path.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    #[test]
+    fn test_filesystem_valid_config() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "writeAccess": false
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(
+            !issues.iter().any(|i| i.severity == Severity::Error),
+            "unexpected errors: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_filesystem_enabled_no_roots_warns() {
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": []
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| i.severity == Severity::Warning
+            && i.path.contains("filesystem")
+            && i.message.contains("roots")));
+    }
+
+    #[test]
+    fn test_filesystem_relative_path_is_error() {
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": ["relative/path"]
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| i.severity == Severity::Error
+            && i.path.contains("roots")
+            && i.message.contains("absolute")));
+    }
+
+    #[test]
+    fn test_filesystem_nonexistent_path_is_error() {
+        let missing_root = nonexistent_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [missing_root]
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues
+            .iter()
+            .any(|i| i.severity == Severity::Error && i.message.contains("does not exist")));
+    }
+
+    #[test]
+    fn test_filesystem_unknown_key_warns() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "unknownSetting": true
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues
+            .iter()
+            .any(|i| i.severity == Severity::Warning && i.message.contains("unknownSetting")));
+    }
+
+    #[test]
+    fn test_filesystem_invalid_exclude_pattern_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "excludePatterns": ["[invalid"]
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| i.severity == Severity::Error
+            && i.path.contains("excludePatterns")
+            && i.message.contains("invalid glob pattern")));
+    }
+
+    #[test]
+    fn test_filesystem_disabled_skips_validation() {
+        let config = json!({
+            "filesystem": {
+                "enabled": false,
+                "roots": ["not-absolute"]
+            }
+        });
+        let issues = validate_schema(&config);
+        // Should not produce errors when disabled
+        assert!(!issues.iter().any(|i| i.severity == Severity::Error));
+    }
+
+    #[test]
+    fn test_filesystem_non_string_root_is_error() {
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [42, true]
+            }
+        });
+        let issues = validate_schema(&config);
+        let errors: Vec<_> = issues
+            .iter()
+            .filter(|i| i.severity == Severity::Error && i.path.contains("roots"))
+            .collect();
+        assert_eq!(errors.len(), 2, "should flag both non-string roots");
+        assert!(errors[0].message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_filesystem_non_string_exclude_pattern_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "excludePatterns": ["*.log", 123]
+            }
+        });
+        let issues = validate_schema(&config);
+        let errors: Vec<_> = issues
+            .iter()
+            .filter(|i| i.severity == Severity::Error && i.path.contains("excludePatterns"))
+            .collect();
+        assert_eq!(errors.len(), 1, "should flag the non-string pattern");
+        assert!(errors[0].message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_filesystem_invalid_enabled_type_is_error() {
+        let config = json!({
+            "filesystem": {
+                "enabled": "yes",
+                "roots": []
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.enabled"
+                && i.message.contains("must be a boolean")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_invalid_write_access_type_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "writeAccess": "yes"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.writeAccess"
+                && i.message.contains("must be a boolean")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_invalid_max_read_bytes_type_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "maxReadBytes": "lots"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.maxReadBytes"
+                && i.message.contains("must be a non-negative integer")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_roots_non_array_is_error() {
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": "/tmp"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.roots"
+                && i.message.contains("must be an array")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_exclude_patterns_non_array_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "excludePatterns": "*.log"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.excludePatterns"
+                && i.message.contains("must be an array")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_non_object_is_error() {
+        let config = json!({
+            "filesystem": true
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem"
+                && i.message.contains("must be an object")
+        }));
     }
 
     // --- is_plausible_cron ---
