@@ -12,12 +12,68 @@ mod golden_trace {
     use crate::server::ws::*;
     use serde_json::{json, Value};
     use std::sync::Arc;
-
     // ───────────────────────── helpers ─────────────────────────
 
-    /// Create a default test server state (in-memory, no persistence).
-    fn test_state() -> Arc<WsServerState> {
-        Arc::new(WsServerState::new(WsServerConfig::default()))
+    struct EnvGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+        prev_state: Option<std::ffi::OsString>,
+        prev_config: Option<std::ffi::OsString>,
+        prev_cache_disable: Option<std::ffi::OsString>,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(val) = &self.prev_state {
+                std::env::set_var("CARAPACE_STATE_DIR", val);
+            } else {
+                std::env::remove_var("CARAPACE_STATE_DIR");
+            }
+            if let Some(val) = &self.prev_config {
+                std::env::set_var("CARAPACE_CONFIG_PATH", val);
+            } else {
+                std::env::remove_var("CARAPACE_CONFIG_PATH");
+            }
+            if let Some(val) = &self.prev_cache_disable {
+                std::env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", val);
+            } else {
+                std::env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
+            }
+        }
+    }
+
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    fn init_test_env() -> EnvGuard {
+        let lock = TEST_LOCK.lock();
+        let prev_state = std::env::var_os("CARAPACE_STATE_DIR");
+        let prev_config = std::env::var_os("CARAPACE_CONFIG_PATH");
+        let prev_cache_disable = std::env::var_os("CARAPACE_DISABLE_CONFIG_CACHE");
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("carapace.json5");
+        std::fs::write(&config_path, "{}").unwrap();
+
+        std::env::set_var("CARAPACE_STATE_DIR", temp_dir.path());
+        std::env::set_var("CARAPACE_CONFIG_PATH", config_path);
+        std::env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+
+        EnvGuard {
+            _lock: lock,
+            prev_state,
+            prev_config,
+            prev_cache_disable,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    /// Create a default test server state (in-memory, no persistence), returning the guard to hold the mocked env vars.
+    fn test_state() -> (EnvGuard, Arc<WsServerState>) {
+        let guard = init_test_env();
+        (
+            guard,
+            Arc::new(WsServerState::new(WsServerConfig::default())),
+        )
     }
 
     /// Create an admin connection context.
@@ -385,7 +441,7 @@ mod golden_trace {
         ($name:ident, $method:expr, $params:expr) => {
             #[tokio::test]
             async fn $name() {
-                let state = test_state();
+                let (_guard, state) = test_state();
                 let conn = admin_conn();
                 register_conn(&state, &conn);
                 let params_val: Value = $params;
@@ -398,7 +454,7 @@ mod golden_trace {
         ($name:ident, $method:expr) => {
             #[tokio::test]
             async fn $name() {
-                let state = test_state();
+                let (_guard, state) = test_state();
                 let conn = admin_conn();
                 register_conn(&state, &conn);
                 let result = dispatch_method($method, None, &state, &conn).await;
@@ -428,7 +484,7 @@ mod golden_trace {
 
     #[tokio::test]
     async fn golden_sessions_list_after_create() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn();
         register_conn(&state, &conn);
 
@@ -492,7 +548,7 @@ mod golden_trace {
     /// `skills.bins` is a node-only method; use a node connection.
     #[tokio::test]
     async fn golden_skills_bins() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = node_conn();
         register_conn(&state, &conn);
         let result = dispatch_method("skills.bins", Some(&json!({})), &state, &conn).await;
@@ -517,7 +573,7 @@ mod golden_trace {
     /// Unknown method returns UNAVAILABLE error.
     #[tokio::test]
     async fn golden_unknown_method() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn();
         register_conn(&state, &conn);
         let result = dispatch_method("nonexistent.method", Some(&json!({})), &state, &conn).await;
@@ -528,7 +584,7 @@ mod golden_trace {
     /// Method called with wrong param type to trigger validation error.
     #[tokio::test]
     async fn golden_invalid_params() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn();
         register_conn(&state, &conn);
         // cron.add requires a name string; passing a number should fail.
@@ -541,7 +597,7 @@ mod golden_trace {
     /// Calling a node-only method with a non-node role returns an error.
     #[tokio::test]
     async fn golden_node_only_method_forbidden() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn(); // admin, not node
         register_conn(&state, &conn);
         let result = dispatch_method("skills.bins", Some(&json!({})), &state, &conn).await;
@@ -552,7 +608,7 @@ mod golden_trace {
     /// Read role calling a write method results in authorization error.
     #[tokio::test]
     async fn golden_write_method_read_role() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = read_conn();
         register_conn(&state, &conn);
         let result = dispatch_method("config.set", Some(&json!({})), &state, &conn).await;
@@ -564,7 +620,7 @@ mod golden_trace {
 
     #[tokio::test]
     async fn golden_cron_lifecycle() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn();
         register_conn(&state, &conn);
 
@@ -603,7 +659,7 @@ mod golden_trace {
 
     #[tokio::test]
     async fn golden_session_lifecycle() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn();
         register_conn(&state, &conn);
 
@@ -663,7 +719,7 @@ mod golden_trace {
 
     #[tokio::test]
     async fn golden_config_lifecycle() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn();
         register_conn(&state, &conn);
 
@@ -693,7 +749,7 @@ mod golden_trace {
 
     #[tokio::test]
     async fn golden_tts_lifecycle() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn();
         register_conn(&state, &conn);
 
@@ -727,7 +783,7 @@ mod golden_trace {
 
     #[tokio::test]
     async fn golden_logs_tail() {
-        let state = test_state();
+        let (_guard, state) = test_state();
         let conn = admin_conn();
         register_conn(&state, &conn);
 
