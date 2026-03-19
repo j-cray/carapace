@@ -27,6 +27,8 @@ For what is already shipped and verified, see:
 - Gemini onboarding — Google sign-in or API-key setup via `cara setup` and the
   Control UI, backed by shared onboarding flow state and `google.authProfile`
   runtime support.
+- Codex onboarding — OpenAI subscription-login setup via `cara setup` and the
+  Control UI, backed by `codex.authProfile` runtime support.
 - Filesystem tools — guarded local workspace read/search/stat/list plus opt-in
   write/move within explicit roots, with config-gated registration and
   fail-closed validation.
@@ -39,8 +41,9 @@ For what is already shipped and verified, see:
 
 - Test-infra hardening for env-sensitive flows — reduce order-dependent flake in
   config/setup/WebSocket test coverage before expanding onboarding further.
-- Subscription onboarding expansion — add Codex/OpenAI and Anthropic
-  subscription-oriented flows while keeping provider/auth boundaries explicit.
+- Subscription onboarding expansion — add Anthropic subscription-oriented
+  flows and shared verification/remediation improvements while keeping
+  provider/auth boundaries explicit.
 - Guided provider onboarding and migration paths — strengthen setup
   verification/remediation, add Bedrock and Vertex guided onboarding, and make
   migration/import easier for users coming from adjacent assistants.

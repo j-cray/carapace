@@ -2,13 +2,13 @@
 
 > **Stable release available.** Carapace is ready for real use on its verified stable paths; partial and in-progress areas are called out explicitly in the docs.
 
-A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Ollama, Gemini, Vertex AI, Bedrock, and Venice AI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
+A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Codex, Ollama, Gemini, Vertex AI, Bedrock, and Venice AI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
 
 A hardened alternative to openclaw / clawdbot — for when your assistant needs a hard shell.
 
 ## Features
 
-- **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, Vertex AI, AWS Bedrock, and Venice AI with streaming, tool dispatch, and cancellation
+- **Multi-provider LLM engine** — Anthropic, OpenAI API key, Codex subscription login, Ollama, Google Gemini, Vertex AI, AWS Bedrock, and Venice AI with streaming, tool dispatch, and cancellation
 - **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks
 - **Tooling and local workspace access** — built-in agent tools, guarded filesystem tools for explicit roots, and channel-specific tool schemas
 - **Signed plugin runtime** — plugins are signature-verified and run with strict permissions and resource limits
@@ -70,10 +70,11 @@ Use `/help` in chat for REPL commands (`/new`, `/exit`, `/quit`).
 
 If you use cloud models, finish one provider onboarding path before launching:
 set one provider key (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`GOOGLE_API_KEY`, or `VENICE_API_KEY`) or use Gemini Google sign-in through
-`cara setup --provider gemini --auth-mode oauth` or the Control UI. Gemini
-Google sign-in also requires `CARAPACE_CONFIG_PASSWORD` so the stored auth
-profile stays encrypted at rest.
+`GOOGLE_API_KEY`, or `VENICE_API_KEY`), use Codex sign-in through
+`cara setup --provider codex` or the Control UI, or use Gemini Google sign-in
+through `cara setup --provider gemini --auth-mode oauth` or the Control UI.
+Codex and Gemini Google sign-in both require `CARAPACE_CONFIG_PASSWORD` so the
+stored auth profile stays encrypted at rest.
 If you are not sure where to start, choose `local-chat` as your first outcome,
 start with one provider, and add channels only after `cara verify --outcome auto`
 passes.
@@ -88,8 +89,8 @@ routine use, while partial and in-progress areas remain explicitly documented.
 
 - Working now: setup wizard, local chat (`cara chat`), token auth enforcement,
   health/control endpoints (including durable task controls), control UI
-  frontend foundation (status/channels/redacted config editor), and
-  OpenAI-compatible HTTP endpoints.
+  frontend foundation (status/channels/redacted config editor), Codex
+  subscription onboarding, and OpenAI-compatible HTTP endpoints.
 - In progress: advanced Control UI flows (pairing/workflow UX), broader
   channel smoke evidence, and hardened internet-facing deployment guidance.
 
@@ -100,12 +101,13 @@ of truth.
 ## Roadmap
 
 - [Roadmap](docs/roadmap.md) — what we're building now, next, and later
-- Up next: broader provider onboarding, advanced Control UI flows, and docs
-  architecture polish
+- Up next: Anthropic subscription onboarding, guided Bedrock/Vertex onboarding,
+  provider migration/import paths, and advanced Control UI flows
 - Recently shipped: first stable release, long-running assistant MVP (durable
   queue + autonomy verify), cross-platform subprocess sandboxing, guided setup
   (`cara setup`), first-run verifier (`cara verify`), Gemini onboarding
-  (Google sign-in or API key via CLI and Control UI), Vertex AI provider
+  (Google sign-in or API key via CLI and Control UI), Codex onboarding
+  (OpenAI subscription login via CLI and Control UI), Vertex AI provider
   support, and guarded filesystem tools for explicit workspace roots
 
 ## Docs

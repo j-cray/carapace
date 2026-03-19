@@ -18,7 +18,7 @@ Current status: Carapace ships a stable release line, beginning with `v0.1.0`.
 Stable-release compatibility policy is active:
 
 - Compatibility target is **N-1 -> N** for stable releases only.
-  - Example: `v0.2.0` must support data/config from `v0.1.x` stable releases.
+  - Example: `v0.3.0` must support data/config from `v0.2.x` stable releases.
   - Preview tags are explicitly out of contract.
 - Every stable release note must include migration + rollback sections.
 - Any incompatible change must be explicitly called out in `Breaking Changes`.

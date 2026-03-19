@@ -2,7 +2,7 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-03-12"
+updated_at: "2026-03-19"
 
 features:
   - feature: "filesystem tools"
@@ -1512,6 +1512,8 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/cli/mod.rs::handle_setup (provider/auth/bind prompts + first-run outcome wiring for local chat/Discord/Telegram/hooks + optional hooks/control UI config)"
+      - "src/cli/mod.rs::configure_codex_provider_interactive (Codex OpenAI subscription-login onboarding)"
+      - "src/onboarding/codex.rs (shared Codex onboarding backend for CLI + Control UI)"
       - "src/cli/mod.rs::configure_gemini_provider_interactive (Gemini API-key vs Google sign-in onboarding)"
       - "src/onboarding/gemini.rs (shared Gemini onboarding backend for CLI + Control UI)"
       - "src/cli/mod.rs::validate_provider_credentials_interactive"
@@ -1521,8 +1523,10 @@ features:
       - "src/cli/mod.rs::test_handle_setup_*"
       - "src/cli/mod.rs::test_parse_setup_outcome_aliases"
       - "src/cli/mod.rs::test_parse_setup_outcome_invalid"
+      - "src/cli/mod.rs::test_handle_setup_noninteractive_codex_errors"
       - "src/cli/mod.rs::test_handle_setup_interactive_selects_gemini_api_key_mode"
       - "src/cli/mod.rs::test_handle_setup_noninteractive_gemini_oauth_requires_interactive"
+      - "src/onboarding/codex.rs::test_persist_cli_openai_oauth_stores_profile_and_updates_config"
       - "src/onboarding/gemini.rs::test_persist_cli_google_oauth_stores_profile_and_updates_config"
 
   - feature: "wizard"
@@ -1902,6 +1906,20 @@ features:
       - "src/agent/openai.rs::process_sse_stream (stream parsing)"
     tests:
       - "src/agent/openai.rs::test_complete_text_stream"
+
+  - feature: "codex provider"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/codex.rs::complete (OpenAI-compatible streaming with stored OpenAI auth-profile tokens)"
+      - "src/agent/codex.rs::with_oauth_profile (OpenAI auth-profile runtime auth)"
+      - "src/agent/provider.rs (explicit codex: / codex/ routing + prefix stripping)"
+      - "src/agent/factory.rs (Codex auth-profile resolution + MultiProvider wiring)"
+    tests:
+      - "src/agent/codex.rs::test_is_codex_model"
+      - "src/agent/codex.rs::test_codex_provider_updates_last_used_after_access"
+      - "src/agent/factory.rs::test_fingerprint_with_codex_auth_profile"
+      - "src/agent/factory.rs::test_build_providers_with_codex_auth_profile"
+      - "src/agent/provider.rs::test_multi_provider_select_codex_model"
 
   - feature: "ollama provider"
     status: "verified_done"
