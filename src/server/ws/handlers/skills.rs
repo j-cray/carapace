@@ -1,7 +1,8 @@
 //! Skills handlers.
 
 use serde_json::{json, Value};
-use std::io::Write;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,10 +14,8 @@ use hickory_resolver::TokioResolver;
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::plugins::capabilities::SsrfProtection;
+use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError};
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
-
-/// WASM binary magic bytes: `\0asm`
-const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
 
 /// Maximum download size for a skill WASM binary (50 MB).
 const MAX_SKILL_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
@@ -58,51 +57,6 @@ fn ensure_object(value: &mut Value) -> Result<&mut serde_json::Map<String, Value
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "expected JSON object value", None))
 }
 
-fn resolve_workspace_dir(cfg: &Value) -> PathBuf {
-    if let Ok(dir) = env::var("CARAPACE_WORKSPACE_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    if let Some(workspace) = cfg
-        .get("agents")
-        .and_then(|v| v.get("defaults"))
-        .and_then(|v| v.get("workspace"))
-        .and_then(|v| v.as_str())
-    {
-        if !workspace.trim().is_empty() {
-            return PathBuf::from(workspace);
-        }
-    }
-    if let Some(list) = cfg
-        .get("agents")
-        .and_then(|v| v.get("list"))
-        .and_then(|v| v.as_array())
-    {
-        for entry in list {
-            if entry
-                .get("default")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                if let Some(workspace) = entry.get("workspace").and_then(|v| v.as_str()) {
-                    if !workspace.trim().is_empty() {
-                        return PathBuf::from(workspace);
-                    }
-                }
-            }
-        }
-        if let Some(first) = list.first() {
-            if let Some(workspace) = first.get("workspace").and_then(|v| v.as_str()) {
-                if !workspace.trim().is_empty() {
-                    return PathBuf::from(workspace);
-                }
-            }
-        }
-    }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
 /// Resolve the managed skills directory under the state dir.
 fn resolve_skills_dir() -> PathBuf {
     resolve_state_dir().join("skills")
@@ -135,6 +89,37 @@ fn validate_skill_name(name: &str) -> Result<(), ErrorShape> {
             None,
         ));
     }
+    Ok(())
+}
+
+fn validate_skill_wasm_bytes(bytes: &[u8], source: &str) -> Result<(), ErrorShape> {
+    validate_skill_wasm_size(bytes.len() as u64, source)?;
+    validate_plugin_component_bytes(source, bytes).map_err(|error| match error {
+        LoaderError::WasmCompileError { message, .. } => error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("{source} is not a valid WASM plugin component: {message}"),
+            None,
+        ),
+        other => error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to validate {source}: {other}"),
+            None,
+        ),
+    })
+}
+
+fn validate_skill_wasm_size(size_bytes: u64, source: &str) -> Result<(), ErrorShape> {
+    if size_bytes > MAX_SKILL_DOWNLOAD_BYTES as u64 {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "{source} exceeds maximum size ({} bytes > {} bytes)",
+                size_bytes, MAX_SKILL_DOWNLOAD_BYTES
+            ),
+            None,
+        ));
+    }
+
     Ok(())
 }
 
@@ -333,7 +318,7 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
 }
 
 /// Build an HTTP client pinned to the validated IP (if any) and download the WASM
-/// binary.  Validates response status, size limit, and WASM magic bytes.
+/// binary. Validates response status, size limit, and component compatibility.
 fn download_with_pinned_ip(
     url: &url::Url,
     host: &str,
@@ -388,26 +373,7 @@ fn download_with_pinned_ip(
         )
     })?;
 
-    if bytes.len() > MAX_SKILL_DOWNLOAD_BYTES {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            &format!(
-                "downloaded skill exceeds maximum size ({} bytes > {} bytes)",
-                bytes.len(),
-                MAX_SKILL_DOWNLOAD_BYTES
-            ),
-            None,
-        ));
-    }
-
-    // Validate WASM magic bytes
-    if bytes.len() < 4 || bytes[..4] != WASM_MAGIC {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "downloaded file is not a valid WASM module (bad magic bytes)",
-            None,
-        ));
-    }
+    validate_skill_wasm_bytes(&bytes, "downloaded skill")?;
 
     Ok(bytes)
 }
@@ -479,16 +445,46 @@ fn download_skill_wasm(
     Ok((dest_path, bytes.to_vec()))
 }
 
-pub(super) fn handle_skills_status() -> Result<Value, ErrorShape> {
+pub(super) fn handle_skills_status(state: &WsServerState) -> Result<Value, ErrorShape> {
     let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
-    let workspace_dir = resolve_workspace_dir(&cfg);
-    let managed_skills_dir = workspace_dir.join("skills");
-
-    let skills_arr = build_skills_array(&cfg);
+    let (
+        plugins_enabled,
+        configured_path_count,
+        activation_error_count,
+        skills_arr,
+        restart_required,
+    ) = if let Some(report) = state.plugin_activation_report() {
+        let failed_skill_count = report
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.state == crate::server::plugin_bootstrap::PluginActivationState::Failed
+            })
+            .count();
+        (
+            report.enabled,
+            report.configured_paths.len(),
+            report.errors.len() + failed_skill_count,
+            build_skills_array_from_report_and_config(report, &cfg),
+            report.restart_required_for_changes,
+        )
+    } else {
+        (
+            cfg.pointer("/plugins/enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            crate::server::plugin_bootstrap::configured_plugin_paths(&cfg).len(),
+            0usize,
+            build_skills_array(&cfg),
+            true,
+        )
+    };
 
     Ok(json!({
-        "workspaceDir": workspace_dir.to_string_lossy(),
-        "managedSkillsDir": managed_skills_dir.to_string_lossy(),
+        "pluginsEnabled": plugins_enabled,
+        "configuredPluginPathCount": configured_path_count,
+        "restartRequiredForChanges": restart_required,
+        "activationErrorCount": activation_error_count,
         "skills": skills_arr
     }))
 }
@@ -517,10 +513,242 @@ fn build_skills_array(cfg: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn token_looks_like_filesystem_path(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+        || (token.len() > 2
+            && token.as_bytes()[1] == b':'
+            && matches!(token.as_bytes()[2], b'\\' | b'/'))
+        || (token.contains('\\') && !token.contains(':'))
+}
+
+fn sanitize_activation_reason(reason: &str) -> String {
+    if reason.starts_with("failed to read configured plugin path ") {
+        return "configured plugin directory is unreadable".to_string();
+    }
+    if reason.starts_with("failed to resolve managed skills directory ") {
+        return "failed to resolve managed skills directory".to_string();
+    }
+    if reason.starts_with("failed to resolve ") {
+        return "failed to resolve plugin artifact path".to_string();
+    }
+    if reason.starts_with("Failed to read WASM file ") {
+        return "failed to read WASM plugin artifact".to_string();
+    }
+    if reason.starts_with("Failed to compile WASM component ") {
+        return "failed to compile WASM plugin component".to_string();
+    }
+    if reason
+        .split_whitespace()
+        .any(token_looks_like_filesystem_path)
+    {
+        return "plugin activation failed; see server logs for details".to_string();
+    }
+    reason.to_string()
+}
+
+fn build_skills_array_from_report(
+    report: &crate::server::plugin_bootstrap::PluginActivationReport,
+) -> Vec<Value> {
+    report
+        .entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "name": entry.name,
+                "pluginId": entry.plugin_id,
+                "enabled": entry.enabled,
+                "installId": entry.install_id.clone().unwrap_or(Value::Null),
+                "requestedAt": entry.requested_at.map(Value::from).unwrap_or(Value::Null),
+                "source": entry.source.label(),
+                "state": entry.state.label(),
+                "reason": entry.reason.as_deref().map(sanitize_activation_reason),
+            })
+        })
+        .collect()
+}
+
+fn pending_skill_value(skill: &Value) -> Value {
+    let enabled = skill
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    json!({
+        "name": skill.get("name").cloned().unwrap_or(Value::Null),
+        "pluginId": Value::Null,
+        "enabled": enabled,
+        "installId": skill.get("installId").cloned().unwrap_or(Value::Null),
+        "requestedAt": skill.get("requestedAt").cloned().unwrap_or(Value::Null),
+        "source": crate::server::plugin_bootstrap::PluginActivationSource::Managed.label(),
+        "state": if enabled {
+            crate::server::plugin_bootstrap::PluginActivationState::Ignored.label()
+        } else {
+            crate::server::plugin_bootstrap::PluginActivationState::Disabled.label()
+        },
+        "reason": if enabled {
+            Value::String("skill is configured and will activate after restart".to_string())
+        } else {
+            Value::String("managed skill is disabled in skills.entries".to_string())
+        },
+    })
+}
+
+fn merge_managed_skill_config(existing: &mut Value, skill: &Value) {
+    // The activation report is a startup-time snapshot. `skills.status` refreshes
+    // these config-owned fields so post-startup installs/enables show the current
+    // desired state even though activation itself still requires restart.
+    let enabled = skill
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let previous_enabled = existing
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let previous_state = existing
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    existing["enabled"] = Value::Bool(enabled);
+    existing["installId"] = skill.get("installId").cloned().unwrap_or(Value::Null);
+    existing["requestedAt"] = skill.get("requestedAt").cloned().unwrap_or(Value::Null);
+
+    if enabled == previous_enabled {
+        return;
+    }
+
+    if enabled {
+        let pending = pending_skill_value(skill);
+        existing["state"] = pending["state"].clone();
+        existing["reason"] = pending["reason"].clone();
+        return;
+    }
+
+    existing["state"] = Value::String(
+        crate::server::plugin_bootstrap::PluginActivationState::Disabled
+            .label()
+            .to_string(),
+    );
+    existing["reason"] = Value::String(
+        if previous_state == crate::server::plugin_bootstrap::PluginActivationState::Active.label()
+        {
+            "managed skill is currently active and will be disabled after restart".to_string()
+        } else {
+            "managed skill is disabled in skills.entries".to_string()
+        },
+    );
+}
+
+fn mark_removed_managed_skill(existing: &mut Value) {
+    let previous_state = existing
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    existing["enabled"] = Value::Bool(false);
+    existing["installId"] = Value::Null;
+    existing["requestedAt"] = Value::Null;
+    existing["state"] = Value::String(
+        crate::server::plugin_bootstrap::PluginActivationState::Disabled
+            .label()
+            .to_string(),
+    );
+    existing["reason"] = Value::String(
+        if previous_state == crate::server::plugin_bootstrap::PluginActivationState::Active.label()
+        {
+            "managed skill is currently active and will be removed after restart".to_string()
+        } else {
+            "managed skill has been removed from skills.entries and will stay inactive after restart"
+                .to_string()
+        },
+    );
+}
+
+fn is_stray_managed_skill(existing: &Value) -> bool {
+    existing.get("source").and_then(Value::as_str)
+        == Some(crate::server::plugin_bootstrap::PluginActivationSource::Managed.label())
+        && existing.get("enabled").and_then(Value::as_bool) == Some(false)
+        && (existing.get("pluginId").is_none()
+            || existing.get("pluginId").is_some_and(Value::is_null))
+        && existing.get("state").and_then(Value::as_str)
+            == Some(crate::server::plugin_bootstrap::PluginActivationState::Ignored.label())
+        && (existing.get("installId").is_none()
+            || existing.get("installId").is_some_and(Value::is_null))
+        && (existing.get("requestedAt").is_none()
+            || existing.get("requestedAt").is_some_and(Value::is_null))
+}
+
+fn build_skills_array_from_report_and_config(
+    report: &crate::server::plugin_bootstrap::PluginActivationReport,
+    cfg: &Value,
+) -> Vec<Value> {
+    let mut by_name: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for skill in build_skills_array_from_report(report) {
+        let Some(name) = skill.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        by_name.entry(name.to_string()).or_default().push(skill);
+    }
+
+    let config_skills = build_skills_array(cfg);
+    let configured_names = config_skills
+        .iter()
+        .filter_map(|skill| skill.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
+
+    for skill in config_skills {
+        let Some(name) = skill.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(existing_skills) = by_name.get_mut(name) {
+            if let Some(existing) = existing_skills.iter_mut().find(|entry| {
+                // Config-backed merge only targets the managed entry for a skill name.
+                // Config-path rows are runtime observations/conflicts and stay separate.
+                // There should be at most one managed row per skill name because startup
+                // only emits one managed activation entry per configured skill.
+                entry.get("source").and_then(Value::as_str)
+                    == Some(
+                        crate::server::plugin_bootstrap::PluginActivationSource::Managed.label(),
+                    )
+            }) {
+                merge_managed_skill_config(existing, &skill);
+            } else {
+                existing_skills.push(pending_skill_value(&skill));
+            }
+        } else {
+            by_name.insert(name.to_string(), vec![pending_skill_value(&skill)]);
+        }
+    }
+
+    for (name, skills) in &mut by_name {
+        if configured_names.contains(name) {
+            continue;
+        }
+        for existing in skills.iter_mut().filter(|entry| {
+            entry.get("source").and_then(Value::as_str)
+                == Some(crate::server::plugin_bootstrap::PluginActivationSource::Managed.label())
+        }) {
+            if is_stray_managed_skill(existing) {
+                continue;
+            }
+            mark_removed_managed_skill(existing);
+        }
+    }
+
+    by_name
+        .into_values()
+        .flat_map(|skills| skills.into_iter())
+        .collect()
+}
+
 pub(super) fn handle_skills_bins() -> Result<Value, ErrorShape> {
-    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
-    let workspace_dir = resolve_workspace_dir(&cfg);
-    let managed_skills_dir = workspace_dir.join("skills");
+    let managed_skills_dir = resolve_skills_dir();
 
     let bins = scan_skills_bins(&managed_skills_dir);
 
@@ -594,17 +822,76 @@ fn handle_skills_install_inner(
         .filter(|s| !s.is_empty());
 
     let wasm_file_name = format!("{}.wasm", name);
+    let local_wasm_path = skills_dir.join(&wasm_file_name);
     let installed_at = now_ms();
 
-    // If URL is provided, download and validate the WASM binary
-    let mut wasm_path: Option<PathBuf> = None;
-    let mut wasm_hash: Option<String> = None;
-    if let Some(raw_url) = url_str {
+    // Either download the managed skill artifact or adopt an existing local one.
+    let (wasm_path, wasm_hash) = if let Some(raw_url) = url_str {
         let parsed_url = validate_url(raw_url)?;
         let (dest, wasm_bytes) = download_skill_wasm(&parsed_url, skills_dir, &wasm_file_name)?;
-        wasm_hash = Some(compute_sha256_hex(&wasm_bytes));
-        wasm_path = Some(dest);
-    }
+        (Some(dest), Some(compute_sha256_hex(&wasm_bytes)))
+    } else {
+        let mut local_wasm = match std::fs::File::open(&local_wasm_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "url is required unless a matching local WASM already exists in the managed skills directory",
+                    None,
+                ));
+            }
+            Err(error) => {
+                return Err(error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!(
+                        "failed to open existing skill binary at '{}': {}",
+                        local_wasm_path.display(),
+                        error
+                    ),
+                    None,
+                ));
+            }
+        };
+        let wasm_metadata = local_wasm.metadata().map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!(
+                    "failed to stat existing skill binary at '{}': {}",
+                    local_wasm_path.display(),
+                    e
+                ),
+                None,
+            )
+        })?;
+        if !wasm_metadata.is_file() {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                &format!(
+                    "existing skill binary at '{}' is not a regular file",
+                    local_wasm_path.display()
+                ),
+                None,
+            ));
+        }
+        validate_skill_wasm_size(wasm_metadata.len(), "existing managed skill binary")?;
+        let mut wasm_bytes = Vec::new();
+        local_wasm.read_to_end(&mut wasm_bytes).map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!(
+                    "failed to read existing skill binary at '{}': {}",
+                    local_wasm_path.display(),
+                    e
+                ),
+                None,
+            )
+        })?;
+        validate_skill_wasm_bytes(&wasm_bytes, "existing managed skill binary")?;
+        (
+            Some(local_wasm_path.clone()),
+            Some(compute_sha256_hex(&wasm_bytes)),
+        )
+    };
 
     // Record metadata in the skills manifest
     let mut manifest = read_skills_manifest(skills_dir);
@@ -678,6 +965,10 @@ fn handle_skills_install_inner(
         "skills_dir": skills_dir.to_string_lossy(),
         "publisher_key": publisher_key,
         "signature": signature,
+        "activation": {
+            "state": "restart-required",
+            "message": "restart Carapace to activate the installed skill"
+        }
     }))
 }
 
@@ -792,13 +1083,18 @@ fn handle_skills_update_inner(
         "skills_dir": skills_dir.to_string_lossy(),
         "publisher_key": publisher_key,
         "signature": signature,
+        "activation": {
+            "state": "restart-required",
+            "message": "restart Carapace to activate the updated skill"
+        }
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::env::ScopedEnv;
+    use crate::server::ws::{WsServerConfig, WsServerState};
+    use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
     use tempfile::TempDir;
 
     struct TestConfigEnv {
@@ -905,6 +1201,537 @@ mod tests {
         let cfg = json!({ "skills": { "entries": [1, 2, 3] } });
         let result = build_skills_array(&cfg);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_handle_skills_status_uses_plugin_activation_report() {
+        let env_state_dir = TempDir::new().unwrap();
+        let report_state_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "skills": {
+                    "entries": {
+                        "weather": {
+                            "enabled": true,
+                            "installId": "install-weather",
+                            "requestedAt": 1700000000000u64
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", env_state_dir.path().as_os_str())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![report_state_dir.path().join("dev-plugins")],
+                restart_required_for_changes: true,
+                errors: vec!["failed to read configured plugin path".to_string()],
+                entries: vec![crate::server::plugin_bootstrap::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: Some("weather".to_string()),
+                    source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                    enabled: true,
+                    path: Some(report_state_dir.path().join("skills/weather.wasm")),
+                    requested_at: Some(1700000000000u64),
+                    install_id: Some(json!("install-weather")),
+                    state: crate::server::plugin_bootstrap::PluginActivationState::Active,
+                    reason: None,
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        assert_eq!(result["pluginsEnabled"], true);
+        assert_eq!(result["configuredPluginPathCount"], 1);
+        assert_eq!(result["restartRequiredForChanges"], true);
+        assert_eq!(result["activationErrorCount"], 1);
+        assert_eq!(result["skills"].as_array().unwrap().len(), 1);
+        let entry = &result["skills"][0];
+        assert_eq!(entry["name"], "weather");
+        assert_eq!(entry["pluginId"], "weather");
+        assert_eq!(entry["source"], "managed");
+        assert_eq!(entry["state"], "active");
+        assert_eq!(entry["enabled"], true);
+        assert!(entry.get("path").is_none());
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_merges_pending_configured_skills_into_report() {
+        let env_state_dir = TempDir::new().unwrap();
+        let report_state_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "skills": {
+                    "entries": {
+                        "weather": {
+                            "enabled": true,
+                            "installId": "install-weather-new",
+                            "requestedAt": 1700000001000u64
+                        },
+                        "calendar": {
+                            "enabled": true,
+                            "installId": "install-calendar",
+                            "requestedAt": 1700000002000u64
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", env_state_dir.path().as_os_str())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![crate::server::plugin_bootstrap::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: Some("weather".to_string()),
+                    source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                    enabled: true,
+                    path: Some(report_state_dir.path().join("skills/weather.wasm")),
+                    requested_at: Some(1700000000000u64),
+                    install_id: Some(json!("install-weather")),
+                    state: crate::server::plugin_bootstrap::PluginActivationState::Active,
+                    reason: None,
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        assert_eq!(result["skills"].as_array().unwrap().len(), 2);
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["state"], "active");
+        assert_eq!(weather["installId"], "install-weather-new");
+        assert_eq!(weather["requestedAt"], 1700000001000u64);
+        let calendar = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "calendar")
+            .unwrap();
+        assert_eq!(calendar["state"], "ignored");
+        assert_eq!(calendar["source"], "managed");
+        assert_eq!(
+            calendar["reason"],
+            "skill is configured and will activate after restart"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_without_report_counts_configured_plugin_paths() {
+        let env_state_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "plugins": {
+                    "load": {
+                        "paths": [
+                            "  /tmp/plugins-a  ",
+                            "",
+                            "/tmp/plugins-a",
+                            "/tmp/plugins-b"
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", env_state_dir.path().as_os_str())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default());
+        let result = handle_skills_status(&state).unwrap();
+        assert_eq!(result["configuredPluginPathCount"], 2);
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_preserves_duplicate_name_report_entries() {
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "skills": {
+                    "entries": {
+                        "weather": {
+                            "enabled": true,
+                            "installId": "install-weather",
+                            "requestedAt": 1700000003000u64
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![PathBuf::from("/plugins-dev")],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![
+                    crate::server::plugin_bootstrap::PluginActivationEntry {
+                        name: "weather".to_string(),
+                        plugin_id: Some("weather".to_string()),
+                        source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                        enabled: true,
+                        path: Some(PathBuf::from("/managed/weather.wasm")),
+                        requested_at: Some(1700000000000u64),
+                        install_id: Some(json!("install-weather-old")),
+                        state: crate::server::plugin_bootstrap::PluginActivationState::Active,
+                        reason: None,
+                    },
+                    crate::server::plugin_bootstrap::PluginActivationEntry {
+                        name: "weather".to_string(),
+                        plugin_id: Some("weather".to_string()),
+                        source: crate::server::plugin_bootstrap::PluginActivationSource::ConfigPath,
+                        enabled: true,
+                        path: Some(PathBuf::from("/plugins-dev/weather.wasm")),
+                        requested_at: None,
+                        install_id: None,
+                        state: crate::server::plugin_bootstrap::PluginActivationState::Failed,
+                        reason: Some(
+                            "plugin ID conflict with an earlier activation source: weather"
+                                .to_string(),
+                        ),
+                    },
+                ],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        let weather_entries = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["name"] == "weather")
+            .collect::<Vec<_>>();
+        assert_eq!(weather_entries.len(), 2);
+        let managed_entry = weather_entries
+            .iter()
+            .find(|entry| entry["source"] == "managed")
+            .unwrap();
+        assert_eq!(managed_entry["installId"], "install-weather");
+        assert_eq!(managed_entry["requestedAt"], 1700000003000u64);
+        let config_entry = weather_entries
+            .iter()
+            .find(|entry| entry["source"] == "config")
+            .unwrap();
+        assert_eq!(config_entry["state"], "failed");
+        assert_eq!(
+            config_entry["reason"],
+            "plugin ID conflict with an earlier activation source: weather"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_sanitizes_path_bearing_reasons() {
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![PathBuf::from("/plugins-dev")],
+                restart_required_for_changes: true,
+                errors: vec![
+                    "failed to read configured plugin path /plugins-dev: denied".to_string()
+                ],
+                entries: vec![crate::server::plugin_bootstrap::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: None,
+                    source: crate::server::plugin_bootstrap::PluginActivationSource::ConfigPath,
+                    enabled: true,
+                    path: Some(PathBuf::from("/plugins-dev/weather.wasm")),
+                    requested_at: None,
+                    install_id: None,
+                    state: crate::server::plugin_bootstrap::PluginActivationState::Failed,
+                    reason: Some(
+                        "Failed to compile WASM component /plugins-dev/weather.wasm: bad module"
+                            .to_string(),
+                    ),
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        assert_eq!(result["activationErrorCount"], 2);
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["reason"], "failed to compile WASM plugin component");
+        assert!(weather.get("path").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_activation_reason_preserves_namespaced_identifiers() {
+        assert_eq!(
+            sanitize_activation_reason("unknown import: carapace:plugin/host@1.0.0"),
+            "unknown import: carapace:plugin/host@1.0.0"
+        );
+    }
+
+    #[test]
+    fn test_handle_skills_status_recomputes_pending_enable_after_config_change() {
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "skills": {
+                    "entries": {
+                        "weather": {
+                            "enabled": true,
+                            "installId": "install-weather",
+                            "requestedAt": 1700000003000u64
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![crate::server::plugin_bootstrap::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: None,
+                    source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                    enabled: false,
+                    path: Some(PathBuf::from("/managed/weather.wasm")),
+                    requested_at: Some(1700000000000u64),
+                    install_id: Some(json!("install-weather-old")),
+                    state: crate::server::plugin_bootstrap::PluginActivationState::Disabled,
+                    reason: Some("managed skill is disabled in skills.entries".to_string()),
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["enabled"], true);
+        assert_eq!(weather["state"], "ignored");
+        assert_eq!(
+            weather["reason"],
+            "skill is configured and will activate after restart"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_marks_disable_after_config_change_as_pending_restart() {
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "skills": {
+                    "entries": {
+                        "weather": {
+                            "enabled": false,
+                            "installId": "install-weather",
+                            "requestedAt": 1700000003000u64
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![crate::server::plugin_bootstrap::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: Some("weather".to_string()),
+                    source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                    enabled: true,
+                    path: Some(PathBuf::from("/managed/weather.wasm")),
+                    requested_at: Some(1700000000000u64),
+                    install_id: Some(json!("install-weather-old")),
+                    state: crate::server::plugin_bootstrap::PluginActivationState::Active,
+                    reason: None,
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["enabled"], false);
+        assert_eq!(weather["state"], "disabled");
+        assert_eq!(
+            weather["reason"],
+            "managed skill is currently active and will be disabled after restart"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_marks_removed_managed_skill_as_pending_restart() {
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({ "skills": { "entries": {} } }).to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![crate::server::plugin_bootstrap::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: Some("weather".to_string()),
+                    source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                    enabled: true,
+                    path: Some(PathBuf::from("/managed/weather.wasm")),
+                    requested_at: Some(1700000000000u64),
+                    install_id: Some(json!("install-weather-old")),
+                    state: crate::server::plugin_bootstrap::PluginActivationState::Active,
+                    reason: None,
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["enabled"], false);
+        assert_eq!(weather["installId"], Value::Null);
+        assert_eq!(weather["requestedAt"], Value::Null);
+        assert_eq!(weather["state"], "disabled");
+        assert_eq!(
+            weather["reason"],
+            "managed skill is currently active and will be removed after restart"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_preserves_stray_managed_skill_reason() {
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![crate::server::plugin_bootstrap::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: None,
+                    source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                    enabled: false,
+                    path: Some(PathBuf::from("/managed/weather.wasm")),
+                    requested_at: None,
+                    install_id: None,
+                    state: crate::server::plugin_bootstrap::PluginActivationState::Ignored,
+                    reason: Some(
+                        "WASM file is present in the managed skills directory but not declared in skills.entries"
+                            .to_string(),
+                    ),
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["state"], "ignored");
+        assert_eq!(
+            weather["reason"],
+            "WASM file is present in the managed skills directory but not declared in skills.entries"
+        );
     }
 
     #[test]
@@ -1156,14 +1983,17 @@ mod tests {
         assert_eq!(manifest, json!({}));
     }
 
-    // ---- WASM magic validation test ----
-
     #[test]
-    fn test_wasm_magic_bytes() {
-        // Verify the constant matches the WASM spec
-        assert_eq!(WASM_MAGIC, [0x00, 0x61, 0x73, 0x6D]);
-        // "\0asm" in ASCII
-        assert_eq!(&WASM_MAGIC[1..], b"asm");
+    fn test_validate_skill_wasm_bytes_rejects_invalid_component() {
+        let err = validate_skill_wasm_bytes(
+            &[0x00, 0x61, 0x73, 0x6D, 0x02, 0x00, 0x00, 0x00],
+            "test skill",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err
+            .message
+            .contains("test skill is not a valid WASM plugin component"));
     }
 
     // ---- Install handler tests ----
@@ -1219,21 +2049,85 @@ mod tests {
     }
 
     #[test]
-    fn test_install_no_url_writes_manifest_only() {
+    fn test_install_no_url_requires_existing_local_wasm() {
         let dir = TempDir::new().unwrap();
         let skills_dir = dir.path().join("skills");
         let params = json!({ "name": "my-skill", "version": "2.0.0" });
 
         let _env = TestConfigEnv::new();
 
-        // Isolate config writes to a temp path so this test doesn't touch user config.
-        let _ = handle_skills_install_inner(Some(&params), &skills_dir);
+        let err = handle_skills_install_inner(Some(&params), &skills_dir).unwrap_err();
+        assert!(err
+            .message
+            .contains("url is required unless a matching local WASM already exists"));
+    }
 
-        // Check that the manifest was created
+    #[test]
+    fn test_install_no_url_adopts_existing_local_wasm() {
+        let dir = TempDir::new().unwrap();
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let wasm_bytes = tool_plugin_component_bytes();
+        let wasm_path = skills_dir.join("my-skill.wasm");
+        std::fs::write(&wasm_path, &wasm_bytes).unwrap();
+        let params = json!({ "name": "my-skill", "version": "2.0.0" });
+
+        let _env = TestConfigEnv::new();
+        let result = handle_skills_install_inner(Some(&params), &skills_dir).unwrap();
+
         let manifest = read_skills_manifest(&skills_dir);
         assert_eq!(manifest["my-skill"]["name"], "my-skill");
         assert_eq!(manifest["my-skill"]["version"], "2.0.0");
-        assert!(manifest["my-skill"]["installed_at"].is_number());
+        assert_eq!(
+            manifest["my-skill"]["path"],
+            wasm_path.to_string_lossy().to_string()
+        );
+        assert_eq!(
+            manifest["my-skill"]["sha256"],
+            compute_sha256_hex(&wasm_bytes)
+        );
+        assert_eq!(result["activation"]["state"], "restart-required");
+    }
+
+    #[test]
+    fn test_install_no_url_rejects_oversized_existing_local_wasm_before_read() {
+        let dir = TempDir::new().unwrap();
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let wasm_path = skills_dir.join("my-skill.wasm");
+        let wasm_file = std::fs::File::create(&wasm_path).unwrap();
+        wasm_file
+            .set_len((MAX_SKILL_DOWNLOAD_BYTES as u64) + 1)
+            .unwrap();
+        let params = json!({ "name": "my-skill", "version": "2.0.0" });
+
+        let _env = TestConfigEnv::new();
+        let err = handle_skills_install_inner(Some(&params), &skills_dir).unwrap_err();
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err
+            .message
+            .contains("existing managed skill binary exceeds maximum size"));
+    }
+
+    #[test]
+    fn test_install_reports_restart_required_activation() {
+        let dir = TempDir::new().unwrap();
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(skills_dir.join("my-skill.wasm"), wasm_bytes).unwrap();
+        let params = json!({ "name": "my-skill", "version": "2.0.0" });
+
+        let _env = TestConfigEnv::new();
+        let result = handle_skills_install_inner(Some(&params), &skills_dir).unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["activation"]["state"], "restart-required");
+        assert_eq!(
+            result["activation"]["message"],
+            "restart Carapace to activate the installed skill"
+        );
     }
 
     // ---- Update handler tests ----
@@ -1302,9 +2196,8 @@ mod tests {
     fn test_update_skill_found_by_wasm_file() {
         // Even if the manifest doesn't have the entry, a .wasm file on disk counts
         let dir = TempDir::new().unwrap();
-        // Create the wasm file (with valid magic bytes)
-        let mut wasm_bytes = WASM_MAGIC.to_vec();
-        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version 1
+        // Create a valid plugin component file on disk.
+        let wasm_bytes = tool_plugin_component_bytes();
         std::fs::write(dir.path().join("disk-skill.wasm"), &wasm_bytes).unwrap();
 
         // No URL provided, so it should fail with "no update source" (not "not installed")
@@ -1408,16 +2301,13 @@ mod tests {
 
     #[test]
     fn test_skill_hash_computed_on_install() {
-        // Simulate an install without a URL (no download) but manually write a WASM
-        // file and manifest entry with a hash, then verify the hash is present.
+        // Simulate an install without a URL (no download) but manually write a plugin
+        // component file and manifest entry with a hash, then verify the hash is present.
         let dir = TempDir::new().unwrap();
         let skills_dir = dir.path().join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
 
-        // Create a fake WASM binary with valid magic bytes
-        let mut wasm_bytes = WASM_MAGIC.to_vec();
-        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version 1
-        wasm_bytes.extend_from_slice(b"test payload for hashing");
+        let wasm_bytes = tool_plugin_component_bytes();
 
         // Compute expected hash
         let expected_hash = compute_sha256_hex(&wasm_bytes);

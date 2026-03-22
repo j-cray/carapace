@@ -5,6 +5,7 @@
 //! its HTTP and WebSocket endpoints, and shut it down cleanly.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,8 +22,8 @@ use crate::cron;
 use crate::hooks::registry::HookRegistry;
 use crate::messages;
 use crate::plugins::tools::ToolsRegistry;
-use crate::plugins::PluginRegistry;
 use crate::server::http::{HttpConfig, MiddlewareConfig};
+use crate::server::plugin_bootstrap::{bootstrap_plugin_runtime, stop_plugin_services};
 use crate::server::ws::WsServerState;
 use crate::sessions;
 use crate::tasks::{DurableTask, TaskBlockedReason, TaskExecutionOutcome, TaskExecutor};
@@ -199,8 +200,8 @@ impl ServerConfig {
 /// registry wiring.
 pub async fn build_ws_state_with_runtime_dependencies(
     cfg: &Value,
+    state_dir: &Path,
     tools_registry: Arc<ToolsRegistry>,
-    plugin_registry: Arc<PluginRegistry>,
 ) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
     let ws_state = crate::server::ws::build_ws_state_owned_from_value(cfg).await?;
     let ws_state = match crate::agent::factory::build_providers(cfg)? {
@@ -213,11 +214,14 @@ pub async fn build_ws_state_with_runtime_dependencies(
         }
     };
 
-    tools_registry.set_plugin_registry(plugin_registry.clone());
+    let plugin_bootstrap = bootstrap_plugin_runtime(cfg, state_dir).await;
+    tools_registry.set_plugin_registry(plugin_bootstrap.registry.clone());
     Ok(Arc::new(
         ws_state
             .with_tools_registry(tools_registry)
-            .with_plugin_registry(plugin_registry),
+            .with_plugin_registry(plugin_bootstrap.registry)
+            .with_plugin_runtime_opt(plugin_bootstrap.runtime)
+            .with_plugin_activation_report(plugin_bootstrap.activation_report),
     ))
 }
 
@@ -289,6 +293,8 @@ impl ServerHandle {
         if let Err(e) = self.ws_state.session_store().flush_all() {
             error!("Failed to flush session store during shutdown: {}", e);
         }
+
+        stop_plugin_services(&self.ws_state);
 
         // Brief grace period for in-flight operations
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -635,8 +641,23 @@ pub async fn run_server_with_config(
 mod tests {
     use super::*;
     use crate::cron::CronPayload;
+    use crate::plugins::signature::sign_wasm_bytes;
+    use crate::plugins::tools::ToolsRegistry;
+    use crate::plugins::{BindingError, PluginKind, PluginRegistry, ServicePluginInstance};
+    use crate::server::plugin_bootstrap::{
+        bootstrap_plugin_runtime, load_plugin_candidate, start_plugin_services,
+        stop_plugin_services, PluginActivationEntry, PluginActivationReport,
+        PluginActivationSource, PluginActivationState,
+    };
     use crate::server::ws::WsServerConfig;
+    use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
+    use ed25519_dalek::SigningKey;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
     use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex, MutexGuard};
 
     static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -711,6 +732,80 @@ mod tests {
         let mut task = durable_task_with_payload(payload, attempts);
         task.policy = policy;
         task
+    }
+
+    fn minimal_wasm_bytes() -> Vec<u8> {
+        vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    fn test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn write_wasm_bytes(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(format!("{name}.wasm"));
+        std::fs::create_dir_all(dir).expect("create wasm dir");
+        std::fs::write(&path, bytes).expect("write wasm");
+        path
+    }
+
+    fn write_minimal_wasm(dir: &Path, name: &str) -> PathBuf {
+        write_wasm_bytes(dir, name, &minimal_wasm_bytes())
+    }
+
+    struct MockServicePlugin {
+        stop_calls: AtomicUsize,
+        fail_stop: bool,
+    }
+
+    impl MockServicePlugin {
+        fn new(fail_stop: bool) -> Self {
+            Self {
+                stop_calls: AtomicUsize::new(0),
+                fail_stop,
+            }
+        }
+    }
+
+    impl ServicePluginInstance for MockServicePlugin {
+        fn start(&self) -> Result<(), BindingError> {
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), BindingError> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_stop {
+                Err(BindingError::CallError("stop failed".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn health(&self) -> Result<bool, BindingError> {
+            Ok(true)
+        }
+    }
+
+    struct MockFailingStartServicePlugin;
+
+    impl ServicePluginInstance for MockFailingStartServicePlugin {
+        fn start(&self) -> Result<(), BindingError> {
+            Err(BindingError::CallError("start failed".to_string()))
+        }
+
+        fn stop(&self) -> Result<(), BindingError> {
+            Ok(())
+        }
+
+        fn health(&self) -> Result<bool, BindingError> {
+            Ok(true)
+        }
     }
 
     #[tokio::test]
@@ -943,6 +1038,691 @@ mod tests {
                     NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS
                 ),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_respects_plugins_enabled_false() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cfg = json!({
+            "plugins": { "enabled": false, "load": { "paths": [temp.path().join("dev").to_string_lossy()] } },
+            "skills": {
+                "entries": {
+                    "alpha": {
+                        "enabled": true,
+                        "installId": "install-alpha",
+                        "requestedAt": 1700000000000u64
+                    },
+                    "beta": {
+                        "enabled": false
+                    }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(!report.enabled);
+        assert_eq!(report.entries.len(), 2);
+        let alpha = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == "alpha")
+            .expect("alpha entry");
+        assert_eq!(alpha.source, PluginActivationSource::Managed);
+        assert_eq!(alpha.state, PluginActivationState::Ignored);
+        assert_eq!(
+            alpha.reason.as_deref(),
+            Some("plugin loading is disabled by plugins.enabled=false")
+        );
+
+        let beta = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == "beta")
+            .expect("beta entry");
+        assert_eq!(beta.state, PluginActivationState::Disabled);
+        assert_eq!(
+            beta.reason.as_deref(),
+            Some("plugin loading is disabled by plugins.enabled=false")
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_reports_missing_manifest_for_managed_skill() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cfg = json!({
+            "skills": {
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert_eq!(report.entries.len(), 1);
+        let alpha = &report.entries[0];
+        assert_eq!(alpha.name, "alpha");
+        assert_eq!(alpha.state, PluginActivationState::Failed);
+        assert_eq!(
+            alpha.reason.as_deref(),
+            Some("missing manifest entry in skills-manifest.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_reports_invalid_manifest_parse_error() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        std::fs::create_dir_all(&managed_dir).expect("create managed dir");
+        std::fs::write(managed_dir.join("skills-manifest.json"), "{invalid-json").unwrap();
+        let cfg = json!({
+            "skills": {
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("failed to parse"));
+        let alpha = &report.entries[0];
+        assert_eq!(alpha.state, PluginActivationState::Failed);
+        assert_eq!(
+            alpha.reason.as_deref(),
+            Some("managed skills manifest is invalid; fix skills-manifest.json and restart")
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_ignores_stray_managed_wasm_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_minimal_wasm(&temp.path().join("skills"), "rogue");
+
+        let result = bootstrap_plugin_runtime(&json!({}), temp.path()).await;
+        let report = result.activation_report;
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "rogue");
+        assert_eq!(entry.source, PluginActivationSource::Managed);
+        assert_eq!(entry.state, PluginActivationState::Ignored);
+        assert!(entry
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not declared in skills.entries")));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_reports_config_path_read_errors() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing = temp.path().join("missing-plugins");
+        let cfg = json!({
+            "plugins": {
+                "load": {
+                    "paths": [missing.to_string_lossy().to_string()]
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert_eq!(report.entries.len(), 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("failed to read configured plugin path"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_skips_unpinned_managed_manifest_entries() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        write_minimal_wasm(&managed_dir, "alpha");
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": managed_dir.join("alpha.wasm").to_string_lossy().to_string()
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let cfg = json!({
+            "skills": {
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.state, PluginActivationState::Failed);
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some("managed skill is missing a pinned sha256 in skills-manifest.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_rejects_managed_paths_outside_managed_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let outside_dir = temp.path().join("outside");
+        let outside_path = write_minimal_wasm(&outside_dir, "alpha");
+        std::fs::create_dir_all(&managed_dir).expect("create managed dir");
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": outside_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(&minimal_wasm_bytes())
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let cfg = json!({
+            "skills": {
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.state, PluginActivationState::Failed);
+        assert!(entry
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("escapes")));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_resolves_relative_manifest_paths_under_managed_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": "alpha.wasm",
+                    "sha256": sha256_hex(&component_bytes)
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let cfg = json!({
+            "skills": {
+                "signature": {
+                    "enabled": false,
+                    "requireSignature": false
+                },
+                "sandbox": { "enabled": false },
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+        let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.state, PluginActivationState::Active);
+        assert_eq!(
+            entry
+                .path
+                .as_ref()
+                .map(|path| std::fs::canonicalize(path).expect("canonicalize report path"))
+                .as_deref(),
+            Some(expected_path.as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_activates_valid_managed_tool_component() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        let signing_key = test_signing_key();
+        let signature = sign_wasm_bytes(&component_bytes, &signing_key);
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": wasm_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(&component_bytes),
+                    "publisher_key": hex::encode(signing_key.verifying_key().as_bytes()),
+                    "signature": hex::encode(signature.to_bytes())
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let loader = crate::plugins::PluginLoader::with_signature_config(
+            managed_dir.clone(),
+            crate::plugins::signature::SignatureConfig::default(),
+        )
+        .expect("create plugin loader");
+        let plugin_id = loader
+            .load_plugin(&wasm_path)
+            .expect("load signed component");
+        let loaded = loader
+            .get_plugin(&plugin_id)
+            .expect("retrieve loaded signed component");
+        assert_eq!(loaded.manifest.kind, PluginKind::Tool);
+
+        let cfg = json!({
+            "skills": {
+                "sandbox": { "enabled": false },
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+        let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        let tools = result.registry.get_tools();
+        assert_eq!(tools.len(), 1, "activation report: {report:#?}");
+        assert_eq!(tools[0].0, "alpha");
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.plugin_id.as_deref(), Some("alpha"));
+        assert_eq!(entry.source, PluginActivationSource::Managed);
+        assert_eq!(entry.state, PluginActivationState::Active);
+        assert_eq!(
+            entry
+                .path
+                .as_ref()
+                .map(|path| std::fs::canonicalize(path).expect("canonicalize report path"))
+                .as_deref(),
+            Some(expected_path.as_path())
+        );
+        assert_eq!(entry.reason, None);
+
+        let runtime = result.runtime.expect("runtime retained");
+        runtime.unload_plugin("alpha").expect("unload plugin");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_reports_managed_sha256_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": wasm_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(b"wrong-bytes")
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "skills": {
+                "sandbox": { "enabled": false },
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(
+            result.runtime.is_none(),
+            "runtime should not be created when no plugins load: {report:#?}"
+        );
+        assert!(
+            result.registry.get_tools().is_empty(),
+            "activation report: {report:#?}"
+        );
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.source, PluginActivationSource::Managed);
+        assert_eq!(entry.state, PluginActivationState::Failed);
+        assert!(entry
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Skill hash verification failed")));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_activates_valid_config_path_tool_component() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("config-plugins");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&config_dir, "alpha", &component_bytes);
+        let cfg = json!({
+            "plugins": {
+                "load": {
+                    "paths": [config_dir.to_string_lossy().to_string()]
+                }
+            },
+            "skills": {
+                "signature": {
+                    "enabled": false,
+                    "requireSignature": false
+                },
+                "sandbox": { "enabled": false }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+        let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        let tools = result.registry.get_tools();
+        assert_eq!(tools.len(), 1, "activation report: {report:#?}");
+        assert_eq!(tools[0].0, "alpha");
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.plugin_id.as_deref(), Some("alpha"));
+        assert_eq!(entry.source, PluginActivationSource::ConfigPath);
+        assert_eq!(entry.state, PluginActivationState::Active);
+        assert_eq!(
+            entry
+                .path
+                .as_ref()
+                .map(|path| std::fs::canonicalize(path).expect("canonicalize report path"))
+                .as_deref(),
+            Some(expected_path.as_path())
+        );
+        assert_eq!(entry.reason, None);
+
+        let runtime = result.runtime.expect("runtime retained");
+        runtime.unload_plugin("alpha").expect("unload plugin");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_ignores_wasm_named_directories_in_config_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("config-plugins");
+        let component_bytes = tool_plugin_component_bytes();
+        write_wasm_bytes(&config_dir, "alpha", &component_bytes);
+        std::fs::create_dir_all(config_dir.join("fake.wasm")).expect("create fake wasm directory");
+        let cfg = json!({
+            "plugins": {
+                "load": {
+                    "paths": [config_dir.to_string_lossy().to_string()]
+                }
+            },
+            "skills": {
+                "signature": {
+                    "enabled": false,
+                    "requireSignature": false
+                },
+                "sandbox": { "enabled": false }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        assert_eq!(
+            result.registry.get_tools().len(),
+            1,
+            "activation report: {report:#?}"
+        );
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].name, "alpha");
+        assert_eq!(report.entries[0].state, PluginActivationState::Active);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_ignores_wasm_named_directories_in_managed_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        std::fs::create_dir_all(managed_dir.join("fake.wasm")).expect("create fake wasm directory");
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": wasm_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(&component_bytes)
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let cfg = json!({
+            "skills": {
+                "signature": {
+                    "enabled": false,
+                    "requireSignature": false
+                },
+                "sandbox": { "enabled": false },
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].name, "alpha");
+        assert_eq!(report.entries[0].state, PluginActivationState::Active);
+    }
+
+    #[test]
+    fn load_plugin_candidate_reports_duplicate_plugin_ids_across_sources() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let config_dir = temp.path().join("config-plugins");
+        let managed_bytes = tool_plugin_component_bytes();
+        let managed_path = write_wasm_bytes(&managed_dir, "alpha", &managed_bytes);
+        let config_path = write_wasm_bytes(&config_dir, "alpha", &managed_bytes);
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": managed_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(&managed_bytes)
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let loader = crate::plugins::PluginLoader::with_signature_config(
+            managed_dir.clone(),
+            crate::plugins::signature::SignatureConfig {
+                enabled: false,
+                require_signature: false,
+                trusted_publishers: Vec::new(),
+            },
+        )
+        .expect("create plugin loader");
+        let mut report = PluginActivationReport::empty(vec![config_dir], true);
+        let mut report_index_by_plugin_id = HashMap::new();
+
+        load_plugin_candidate(
+            &loader,
+            &mut report,
+            PluginActivationEntry {
+                name: "alpha".to_string(),
+                plugin_id: None,
+                source: PluginActivationSource::Managed,
+                enabled: true,
+                path: None,
+                requested_at: None,
+                install_id: None,
+                state: PluginActivationState::Ignored,
+                reason: None,
+            },
+            &managed_path,
+            &mut report_index_by_plugin_id,
+        );
+        load_plugin_candidate(
+            &loader,
+            &mut report,
+            PluginActivationEntry {
+                name: "alpha".to_string(),
+                plugin_id: None,
+                source: PluginActivationSource::ConfigPath,
+                enabled: true,
+                path: None,
+                requested_at: None,
+                install_id: None,
+                state: PluginActivationState::Ignored,
+                reason: None,
+            },
+            &config_path,
+            &mut report_index_by_plugin_id,
+        );
+
+        let duplicate = report
+            .entries
+            .iter()
+            .find(|entry| entry.source == PluginActivationSource::ConfigPath)
+            .expect("config-path entry");
+        assert_eq!(duplicate.name, "alpha");
+        assert_eq!(duplicate.plugin_id.as_deref(), Some("alpha"));
+        assert_eq!(duplicate.state, PluginActivationState::Failed);
+        assert!(duplicate
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("plugin ID conflict")));
+    }
+
+    #[test]
+    fn configured_plugin_paths_normalizes_equivalent_paths() {
+        let cfg = json!({
+            "plugins": {
+                "load": {
+                    "paths": [
+                        "plugins/tooling",
+                        "plugins/./tooling",
+                        "plugins//tooling"
+                    ]
+                }
+            }
+        });
+
+        let paths = crate::server::plugin_bootstrap::configured_plugin_paths(&cfg);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], PathBuf::from("plugins/tooling"));
+    }
+
+    #[tokio::test]
+    async fn build_ws_state_with_runtime_dependencies_attaches_plugin_activation_report() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let config_path = temp.path().join("carapace.json5");
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", state_dir.as_os_str())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let tools_registry = Arc::new(ToolsRegistry::new());
+        let ws_state =
+            build_ws_state_with_runtime_dependencies(&json!({}), &state_dir, tools_registry)
+                .await
+                .expect("build ws state");
+
+        let report = ws_state
+            .plugin_activation_report()
+            .expect("plugin activation report");
+        assert!(report.entries.is_empty());
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn stop_plugin_services_stops_all_services_and_ignores_stop_errors() {
+        let ok_service = Arc::new(MockServicePlugin::new(false));
+        let failing_service = Arc::new(MockServicePlugin::new(true));
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register_service("ok".to_string(), ok_service.clone());
+        registry.register_service("failing".to_string(), failing_service.clone());
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_registry(registry);
+
+        stop_plugin_services(&state);
+
+        assert_eq!(ok_service.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_service.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn start_plugin_services_marks_failures_for_unload() {
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register_service(
+            "weather".to_string(),
+            Arc::new(MockFailingStartServicePlugin),
+        );
+        let mut report = PluginActivationReport::empty(vec![], true);
+        report.entries.push(PluginActivationEntry {
+            name: "weather".to_string(),
+            plugin_id: Some("weather".to_string()),
+            source: PluginActivationSource::Managed,
+            enabled: true,
+            path: Some(PathBuf::from("/managed/weather.wasm")),
+            requested_at: None,
+            install_id: None,
+            state: PluginActivationState::Active,
+            reason: None,
+        });
+        let report_index_by_plugin_id = HashMap::from([(String::from("weather"), 0usize)]);
+
+        let unload_ids = start_plugin_services(
+            &registry,
+            &[String::from("weather")],
+            &mut report,
+            &report_index_by_plugin_id,
+        );
+
+        assert_eq!(unload_ids, vec![String::from("weather")]);
+        assert_eq!(report.entries[0].state, PluginActivationState::Failed);
+        assert_eq!(
+            report.entries[0].reason.as_deref(),
+            Some("service plugin failed to start: Function call error: start failed")
         );
     }
 }

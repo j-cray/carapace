@@ -268,10 +268,16 @@ Compatibility aliases:
 ### Models & Skills
 - `models.list` - List available models
 - `agents.list` - List available agents
-- `skills.status` - Get skills status
+- `skills.status` - Get skills status, activation state, restart requirements, and sanitized activation issue counts
 - `skills.bins` - List skill binaries
 - `skills.install` - Install a skill
 - `skills.update` - Update skills
+
+`skills.status` intentionally avoids returning raw plugin filesystem paths and
+verbatim startup I/O errors. It reports activation state, restart requirements,
+sanitized per-skill reasons, and aggregate counts instead. `activationErrorCount`
+includes both bootstrap-level activation errors and per-skill entries whose
+state is `failed`. Use server logs for detailed local filesystem diagnostics.
 
 ### Updates
 - `update.run` - Run Carapace update

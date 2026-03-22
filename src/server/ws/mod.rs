@@ -23,6 +23,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::plugins::PluginRuntime;
+use crate::server::plugin_bootstrap::PluginActivationReport;
 use crate::{
     agent, auth, channels, config, credentials, cron, devices, exec, messages, nodes, plugins,
     sessions, tasks,
@@ -467,6 +469,10 @@ pub struct WsServerState {
     tools_registry: Option<Arc<plugins::ToolsRegistry>>,
     /// Plugin registry for channel/tool/webhook plugins
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
+    /// Retained plugin runtime for instantiated plugin lifetimes and epoch ticker.
+    plugin_runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
+    /// Startup-time plugin activation report
+    plugin_activation_report: Option<PluginActivationReport>,
     /// WebSocket connection limiter
     pub(crate) connection_tracker: limits::ConnectionTracker,
 }
@@ -487,6 +493,14 @@ impl std::fmt::Debug for WsServerState {
             .field(
                 "plugin_registry",
                 &self.plugin_registry.as_ref().map(|_| ".."),
+            )
+            .field(
+                "plugin_runtime",
+                &self.plugin_runtime.as_ref().map(|_| ".."),
+            )
+            .field(
+                "plugin_activation_report",
+                &self.plugin_activation_report.as_ref().map(|_| ".."),
             )
             .finish_non_exhaustive()
     }
@@ -535,6 +549,8 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
+            plugin_runtime: None,
+            plugin_activation_report: None,
             connection_tracker,
         }
     }
@@ -592,6 +608,8 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
+            plugin_runtime: None,
+            plugin_activation_report: None,
             connection_tracker,
         })
     }
@@ -676,6 +694,19 @@ impl WsServerState {
         self
     }
 
+    pub(crate) fn with_plugin_runtime_opt(
+        mut self,
+        runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
+    ) -> Self {
+        self.plugin_runtime = runtime;
+        self
+    }
+
+    pub(crate) fn with_plugin_activation_report(mut self, report: PluginActivationReport) -> Self {
+        self.plugin_activation_report = Some(report);
+        self
+    }
+
     /// Get the session store.
     pub fn session_store(&self) -> &Arc<sessions::SessionStore> {
         &self.session_store
@@ -735,6 +766,16 @@ impl WsServerState {
     /// Get the plugin registry, if configured.
     pub fn plugin_registry(&self) -> Option<&Arc<plugins::PluginRegistry>> {
         self.plugin_registry.as_ref()
+    }
+
+    pub(crate) fn plugin_runtime(
+        &self,
+    ) -> Option<&Arc<PluginRuntime<credentials::DefaultCredentialBackend>>> {
+        self.plugin_runtime.as_ref()
+    }
+
+    pub(crate) fn plugin_activation_report(&self) -> Option<&PluginActivationReport> {
+        self.plugin_activation_report.as_ref()
     }
 
     /// Get the outbound message pipeline.

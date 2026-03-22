@@ -171,14 +171,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let gateway_config = gateway::build_gateway_config(&cfg);
 
     let resolved = resolve_bind_config(&cfg)?;
-    let plugin_registry = Arc::new(plugins::PluginRegistry::new());
     let tools_registry = Arc::new(plugins::tools::ToolsRegistry::with_config(&cfg));
     let hook_registry = Arc::new(hooks::registry::HookRegistry::new());
 
     let ws_state = server::startup::build_ws_state_with_runtime_dependencies(
         &cfg,
+        &state_dir,
         tools_registry.clone(),
-        plugin_registry.clone(),
     )
     .await?;
     let ws_state = register_console_channel(ws_state)?;
@@ -216,7 +215,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     } else {
         launch_non_tls_server(
-            ws_state,
+            ws_state.clone(),
             http_config,
             cfg,
             resolved.address,
@@ -988,6 +987,8 @@ async fn shutdown_signal(
     if let Err(e) = ws_state.session_store().flush_all() {
         error!("Failed to flush session store during shutdown: {}", e);
     }
+
+    server::plugin_bootstrap::stop_plugin_services(&ws_state);
 
     // Brief grace period for in-flight operations to complete
     tokio::time::sleep(Duration::from_millis(250)).await;

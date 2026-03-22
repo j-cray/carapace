@@ -1,16 +1,17 @@
-//! Plugin loader (discover + instantiate WASM modules)
+//! Plugin loader (discover + validate WASM plugin components)
 //!
 //! Loads WASM plugins from the plugins directory, validates their manifests,
 //! and prepares them for instantiation with wasmtime.
 //!
 //! # Metadata Extraction
 //!
-//! The loader derives manifest metadata from WASM modules using a layered
+//! The loader derives manifest metadata from WASM plugin components using a layered
 //! approach (highest priority first):
 //!
-//! 1. **Custom section**: A `plugin-manifest` custom section containing JSON
-//! 2. **Export inspection**: Determines [`PluginKind`] from which WIT interfaces the
-//!    module exports (e.g., `send-text` implies a channel plugin)
+//! 1. **Custom section**: A `plugin-manifest` custom section in the raw core
+//!    module bytes containing JSON
+//! 2. **Component export inspection**: Determines [`PluginKind`] from which WIT
+//!    interfaces the component exports (for example `tool` implies a tool plugin)
 //! 3. **File path**: Plugin name derived from the filename, version from modification time
 
 use parking_lot::RwLock;
@@ -19,10 +20,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 use thiserror::Error;
-use wasmtime::{Config, Engine, Module};
+use wasmtime::component::Component as WasmComponent;
+use wasmtime::{Config, Engine};
 
 /// Plugin loading errors
 #[non_exhaustive]
@@ -34,7 +36,7 @@ pub enum LoaderError {
     #[error("Failed to read WASM file {path}: {message}")]
     WasmReadError { path: String, message: String },
 
-    #[error("Failed to compile WASM module {path}: {message}")]
+    #[error("Failed to compile WASM component {path}: {message}")]
     WasmCompileError { path: String, message: String },
 
     #[error("Invalid plugin manifest for {plugin_id}: {message}")]
@@ -51,6 +53,9 @@ pub enum LoaderError {
 
     #[error("Wasmtime engine error: {0}")]
     EngineError(String),
+
+    #[error("Failed to load skills manifest: {0}")]
+    SkillsManifestError(String),
 
     #[error(
         "Skill hash verification failed for '{skill_name}': expected {expected}, got {actual}"
@@ -167,11 +172,9 @@ pub struct LoadedPlugin {
     pub manifest: PluginManifest,
     /// Path to the WASM file
     pub wasm_path: PathBuf,
-    /// Compiled WASM module (can be instantiated multiple times)
-    pub module: Module,
     /// Raw WASM bytes (for component instantiation)
     pub wasm_bytes: Vec<u8>,
-    /// Discovered WASM capabilities (from import enumeration).
+    /// Discovered WASM capabilities (from component import enumeration).
     pub discovered_capabilities: Option<super::sandbox::DiscoveredCapabilities>,
 }
 
@@ -190,6 +193,32 @@ impl std::fmt::Debug for LoadedPlugin {
 
 /// WASM binary magic bytes (\0asm)
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
+
+fn component_engine() -> Result<Engine, LoaderError> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    Engine::new(&config).map_err(|e| LoaderError::EngineError(e.to_string()))
+}
+
+fn shared_component_validation_engine() -> Result<&'static Engine, LoaderError> {
+    static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+    match ENGINE.get_or_init(|| component_engine().map_err(|error| error.to_string())) {
+        Ok(engine) => Ok(engine),
+        Err(message) => Err(LoaderError::EngineError(message.clone())),
+    }
+}
+
+pub(crate) fn validate_plugin_component_bytes(
+    source: &str,
+    wasm_bytes: &[u8],
+) -> Result<(), LoaderError> {
+    let engine = shared_component_validation_engine()?;
+    WasmComponent::new(engine, wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
+        path: source.to_string(),
+        message: e.to_string(),
+    })?;
+    Ok(())
+}
 
 /// WASM custom section ID
 const WASM_SECTION_CUSTOM: u8 = 0;
@@ -216,7 +245,7 @@ impl WasmModuleMetadata {
         let mut meta = WasmModuleMetadata::default();
 
         // Validate magic + version header (8 bytes)
-        if bytes.len() < 8 || bytes[..4] != WASM_MAGIC {
+        if bytes.len() < 8 || bytes[..4] != WASM_MAGIC || bytes[4..8] != [0x01, 0x00, 0x00, 0x00] {
             return meta;
         }
 
@@ -351,6 +380,17 @@ fn parse_name_section_module_name(data: &[u8]) -> Option<String> {
     None
 }
 
+fn export_matches_name(export_name: &str, expected: &str) -> bool {
+    let export_name = export_name.split('@').next().unwrap_or(export_name);
+    export_name == expected
+        || export_name
+            .rsplit_once('/')
+            .is_some_and(|(_, suffix)| suffix == expected)
+        || export_name
+            .rsplit_once(':')
+            .is_some_and(|(_, suffix)| suffix == expected)
+}
+
 /// Determine [`PluginKind`] by inspecting which WIT interface exports a WASM module provides.
 ///
 /// Export name matching uses the WIT interface export naming conventions from
@@ -363,22 +403,30 @@ fn parse_name_section_module_name(data: &[u8]) -> Option<String> {
 /// 5. Provider: exports containing `complete` or `list-models`
 /// 6. Hook: exports containing `get-hooks`
 /// 7. Default: [`PluginKind::Tool`]
-fn derive_plugin_kind_from_exports(module: &Module) -> PluginKind {
-    let export_names: Vec<&str> = module.exports().map(|e| e.name()).collect();
+fn derive_plugin_kind_from_exports(engine: &Engine, component: &WasmComponent) -> PluginKind {
+    let component_type = component.component_type();
+    let export_names: Vec<&str> = component_type
+        .exports(engine)
+        .map(|(name, _)| name)
+        .collect();
 
-    let has = |needle: &str| export_names.iter().any(|name| name.contains(needle));
+    let has = |needle: &str| {
+        export_names
+            .iter()
+            .any(|name| export_matches_name(name, needle))
+    };
 
-    if has("send-text") || has("channel-adapter") || has("channel-meta") {
+    if has("channel-adapter") || has("channel-meta") {
         PluginKind::Channel
-    } else if has("get-definitions") || has("execute-tool") {
+    } else if has("tool") || has("get-definitions") || has("execute-tool") {
         PluginKind::Tool
-    } else if has("get-paths") || has("webhook") {
+    } else if has("webhook") || has("get-paths") {
         PluginKind::Webhook
-    } else if has("health") || has("service") {
+    } else if has("service") || has("health") {
         PluginKind::Service
-    } else if has("complete") || has("list-models") || has("provider") {
+    } else if has("provider") || has("complete") || has("list-models") {
         PluginKind::Provider
-    } else if has("get-hooks") || has("hooks") {
+    } else if has("hooks") || has("get-hooks") {
         PluginKind::Hook
     } else {
         // Default to Tool when exports are unrecognizable (matches prior behavior)
@@ -477,9 +525,12 @@ fn derive_manifest(
     plugin_id: &str,
     wasm_path: &Path,
     wasm_bytes: &[u8],
-    module: &Module,
+    component: &WasmComponent,
+    engine: &Engine,
 ) -> PluginManifest {
-    // Try to extract metadata from WASM binary custom sections
+    // Try to extract metadata from raw core-module custom sections first. When
+    // the input is a component binary, this parser intentionally returns no
+    // metadata and we fall back to component export introspection below.
     let wasm_meta = WasmModuleMetadata::from_wasm_bytes(wasm_bytes);
 
     // If we found a complete manifest in a custom section, use it directly
@@ -498,7 +549,7 @@ fn derive_manifest(
 
     let version = derive_version_from_file(wasm_path);
 
-    let kind = derive_plugin_kind_from_exports(module);
+    let kind = derive_plugin_kind_from_exports(engine, component);
 
     let description = format!(
         "{} plugin loaded from {}",
@@ -588,11 +639,17 @@ pub fn verify_skill_hash_on_load(
 
 /// Load the skills manifest from the given directory.
 /// Returns `None` if the manifest file does not exist.
-pub fn load_skills_manifest(skills_dir: &Path) -> Option<serde_json::Value> {
+pub fn load_skills_manifest(skills_dir: &Path) -> Result<Option<serde_json::Value>, String> {
     let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
     match fs::read_to_string(&manifest_path) {
-        Ok(contents) => Some(serde_json::from_str(&contents).unwrap_or_default()),
-        Err(_) => None,
+        Ok(contents) => serde_json::from_str(&contents)
+            .map(Some)
+            .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to read {}: {error}",
+            manifest_path.display()
+        )),
     }
 }
 
@@ -619,11 +676,7 @@ impl PluginLoader {
         plugins_dir: PathBuf,
         signature_config: super::signature::SignatureConfig,
     ) -> Result<Self, LoaderError> {
-        // Configure wasmtime engine
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-
-        let engine = Engine::new(&config).map_err(|e| LoaderError::EngineError(e.to_string()))?;
+        let engine = component_engine()?;
 
         Ok(Self {
             engine,
@@ -700,7 +753,12 @@ impl PluginLoader {
         })?;
 
         // Read manifest once
-        let manifest_json = wasm_path.parent().and_then(load_skills_manifest);
+        let manifest_json = match wasm_path.parent() {
+            Some(parent) => {
+                load_skills_manifest(parent).map_err(LoaderError::SkillsManifestError)?
+            }
+            None => None,
+        };
 
         // Verify SHA-256 hash against the skills manifest (if present)
         if let Some(ref manifest) = manifest_json {
@@ -721,14 +779,19 @@ impl PluginLoader {
             }
         }
 
-        // Compile the module
-        let module =
-            Module::new(&self.engine, &wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
+        // Validate and introspect the component bytes with the same binary format
+        // the runtime later instantiates.
+        let component = WasmComponent::new(&self.engine, &wasm_bytes).map_err(|e| {
+            LoaderError::WasmCompileError {
                 path: wasm_path.display().to_string(),
                 message: e.to_string(),
-            })?;
+            }
+        })?;
 
-        let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(&module));
+        let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(
+            &component,
+            &self.engine,
+        ));
 
         let plugin_id = wasm_path
             .file_stem()
@@ -740,12 +803,12 @@ impl PluginLoader {
             return Err(LoaderError::InvalidPluginId(plugin_id));
         }
 
-        let plugin_manifest = derive_manifest(&plugin_id, wasm_path, &wasm_bytes, &module);
+        let plugin_manifest =
+            derive_manifest(&plugin_id, wasm_path, &wasm_bytes, &component, &self.engine);
 
         let loaded = Arc::new(LoadedPlugin {
             manifest: plugin_manifest,
             wasm_path: wasm_path.to_path_buf(),
-            module,
             wasm_bytes,
             discovered_capabilities,
         });
@@ -792,15 +855,20 @@ impl PluginLoader {
             }
         }
 
-        // Compile the module
-        let module =
-            Module::new(&self.engine, wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
+        // Validate and introspect the component bytes with the same binary format
+        // the runtime later instantiates.
+        let component = WasmComponent::new(&self.engine, wasm_bytes).map_err(|e| {
+            LoaderError::WasmCompileError {
                 path: format!("<bytes:{}>", manifest.id),
                 message: e.to_string(),
-            })?;
+            }
+        })?;
 
         // Enumerate WASM capabilities for sandbox checking
-        let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(&module));
+        let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(
+            &component,
+            &self.engine,
+        ));
 
         let plugin_id = manifest.id.clone();
 
@@ -808,7 +876,6 @@ impl PluginLoader {
         let loaded = LoadedPlugin {
             manifest,
             wasm_path: PathBuf::new(), // No file path for byte-loaded plugins
-            module,
             wasm_bytes: wasm_bytes.to_vec(),
             discovered_capabilities,
         };
@@ -988,6 +1055,21 @@ mod tests {
         assert_eq!(PluginKind::Service.to_string(), "service");
         assert_eq!(PluginKind::Provider.to_string(), "provider");
         assert_eq!(PluginKind::Hook.to_string(), "hook");
+    }
+
+    #[test]
+    fn test_export_matches_name_requires_segment_match() {
+        assert!(export_matches_name("tool", "tool"));
+        assert!(export_matches_name("carapace:plugin/tool@1.0.0", "tool"));
+        assert!(export_matches_name(
+            "carapace:plugin/channel-adapter@1.0.0",
+            "channel-adapter"
+        ));
+        assert!(!export_matches_name(
+            "carapace:plugin/toolbox@1.0.0",
+            "tool"
+        ));
+        assert!(!export_matches_name("multi-tool-adapter", "tool"));
     }
 
     #[test]
