@@ -10,7 +10,7 @@ mod golden_trace {
     use crate::logging::buffer::{LogLevel, LOG_BUFFER};
     use crate::server::ws::handlers::dispatch_method;
     use crate::server::ws::*;
-    use crate::test_support::env::ScopedEnv;
+    use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
     use serde_json::{json, Value};
     use std::sync::Arc;
     // ───────────────────────── helpers ─────────────────────────
@@ -18,6 +18,12 @@ mod golden_trace {
     struct EnvGuard {
         _env: ScopedEnv,
         _temp_dir: tempfile::TempDir,
+    }
+
+    impl EnvGuard {
+        fn state_dir(&self) -> &std::path::Path {
+            self._temp_dir.path()
+        }
     }
 
     fn init_test_env() -> EnvGuard {
@@ -85,26 +91,6 @@ mod golden_trace {
                 instance_id: None,
             },
             device_id: None,
-        }
-    }
-
-    /// Create a node connection context for node-only methods.
-    fn node_conn() -> ConnectionContext {
-        ConnectionContext {
-            conn_id: "test-node-conn".to_string(),
-            role: "node".to_string(),
-            scopes: vec![],
-            client: ClientInfo {
-                id: "node-host".to_string(),
-                version: "1.0.0".to_string(),
-                platform: "test".to_string(),
-                mode: "node".to_string(),
-                display_name: None,
-                device_family: None,
-                model_identifier: None,
-                instance_id: None,
-            },
-            device_id: Some("node-test-1".to_string()),
         }
     }
 
@@ -509,15 +495,87 @@ mod golden_trace {
 
     golden_test!(golden_plugins_status, "plugins.status", json!({}));
 
-    /// `plugins.bins` is a node-only method; use a node connection.
     #[tokio::test]
     async fn golden_plugins_bins() {
         let (_guard, state) = test_state();
-        let conn = node_conn();
+        let conn = admin_conn();
         register_conn(&state, &conn);
         let result = dispatch_method("plugins.bins", Some(&json!({})), &state, &conn).await;
         let normalized = normalize_for_snapshot(&result);
         insta::assert_json_snapshot!("golden_plugins_bins", normalized);
+    }
+
+    #[tokio::test]
+    async fn plugins_install_dispatch_adopts_staged_local_artifact() {
+        let (guard, state) = test_state();
+        let managed_dir = guard.state_dir().join("plugins");
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        std::fs::write(
+            managed_dir.join("demo-plugin.wasm"),
+            tool_plugin_component_bytes(),
+        )
+        .unwrap();
+
+        let conn = admin_conn();
+        register_conn(&state, &conn);
+        let result = dispatch_method(
+            "plugins.install",
+            Some(&json!({
+                "name": "demo-plugin",
+                "version": "1.2.3"
+            })),
+            &state,
+            &conn,
+        )
+        .await
+        .expect("plugins.install should succeed");
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["name"], "demo-plugin");
+        assert_eq!(result["version"], "1.2.3");
+        assert_eq!(result["activation"]["state"], "restart-required");
+    }
+
+    #[tokio::test]
+    async fn plugins_update_dispatch_adopts_staged_local_artifact() {
+        let (guard, state) = test_state();
+        let managed_dir = guard.state_dir().join("plugins");
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        std::fs::write(
+            managed_dir.join("demo-plugin.wasm"),
+            tool_plugin_component_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            managed_dir.join("plugins-manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "demo-plugin": {
+                    "name": "demo-plugin",
+                    "installed_at": 1700000000000u64
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let conn = admin_conn();
+        register_conn(&state, &conn);
+        let result = dispatch_method(
+            "plugins.update",
+            Some(&json!({
+                "name": "demo-plugin",
+                "version": "2.0.0"
+            })),
+            &state,
+            &conn,
+        )
+        .await
+        .expect("plugins.update should succeed");
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["name"], "demo-plugin");
+        assert_eq!(result["version"], "2.0.0");
+        assert_eq!(result["activation"]["state"], "restart-required");
     }
 
     // ───────────────────────── Exec approvals ─────────────────────────
@@ -564,7 +622,7 @@ mod golden_trace {
         let (_guard, state) = test_state();
         let conn = admin_conn(); // admin, not node
         register_conn(&state, &conn);
-        let result = dispatch_method("plugins.bins", Some(&json!({})), &state, &conn).await;
+        let result = dispatch_method("node.event", Some(&json!({})), &state, &conn).await;
         let normalized = normalize_for_snapshot(&result);
         insta::assert_json_snapshot!("golden_node_only_method_forbidden", normalized);
     }
