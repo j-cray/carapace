@@ -1,8 +1,8 @@
-//! Skill signature verification using Ed25519.
+//! Plugin signature verification using Ed25519.
 //!
-//! Provides optional cryptographic verification of WASM skill binaries.
+//! Provides optional cryptographic verification of WASM plugin binaries.
 //! Publishers sign WASM bytes with Ed25519, and the signature + public key
-//! are stored in the skills manifest. On load, the signature is verified
+//! are stored in the plugins manifest. On load, the signature is verified
 //! before the module is instantiated.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -20,11 +20,11 @@ pub struct SignatureConfig {
     /// Master switch — when `false`, signature checks are skipped.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// When `true`, unsigned skills are rejected (otherwise just warned).
+    /// When `true`, unsigned plugins are rejected (otherwise just warned).
     #[serde(default = "default_true", alias = "requireSignature")]
     pub require_signature: bool,
     /// Hex-encoded Ed25519 public keys of trusted publishers.
-    /// If non-empty, the skill's publisher key must be in this list.
+    /// If non-empty, the plugin's publisher key must be in this list.
     #[serde(default, alias = "trustedPublishers")]
     pub trusted_publishers: Vec<String>,
 }
@@ -47,47 +47,32 @@ pub fn sign_wasm_bytes(wasm_bytes: &[u8], signing_key: &SigningKey) -> Signature
 }
 
 /// Parse a hex-encoded Ed25519 verifying key.
-pub fn parse_verifying_key(hex_key: &str) -> Result<VerifyingKey, LoaderError> {
-    let bytes = hex::decode(hex_key).map_err(|e| LoaderError::SignatureVerificationFailed {
-        skill_name: String::new(),
-        reason: format!("invalid hex public key: {e}"),
-    })?;
+pub fn parse_verifying_key(hex_key: &str) -> Result<VerifyingKey, String> {
+    let bytes = hex::decode(hex_key).map_err(|e| format!("invalid hex public key: {e}"))?;
 
     if bytes.len() != 32 {
-        return Err(LoaderError::SignatureVerificationFailed {
-            skill_name: String::new(),
-            reason: format!("public key must be 32 bytes, got {}", bytes.len()),
-        });
+        return Err(format!("public key must be 32 bytes, got {}", bytes.len()));
     }
 
     let key_bytes: [u8; 32] = bytes.try_into().unwrap();
-    VerifyingKey::from_bytes(&key_bytes).map_err(|e| LoaderError::SignatureVerificationFailed {
-        skill_name: String::new(),
-        reason: format!("invalid Ed25519 public key: {e}"),
-    })
+    VerifyingKey::from_bytes(&key_bytes).map_err(|e| format!("invalid Ed25519 public key: {e}"))
 }
 
 /// Parse a hex-encoded Ed25519 signature.
-fn parse_signature(hex_sig: &str) -> Result<Signature, LoaderError> {
-    let bytes = hex::decode(hex_sig).map_err(|e| LoaderError::SignatureVerificationFailed {
-        skill_name: String::new(),
-        reason: format!("invalid hex signature: {e}"),
-    })?;
+fn parse_signature(hex_sig: &str) -> Result<Signature, String> {
+    let bytes = hex::decode(hex_sig).map_err(|e| format!("invalid hex signature: {e}"))?;
 
     if bytes.len() != 64 {
-        return Err(LoaderError::SignatureVerificationFailed {
-            skill_name: String::new(),
-            reason: format!("signature must be 64 bytes, got {}", bytes.len()),
-        });
+        return Err(format!("signature must be 64 bytes, got {}", bytes.len()));
     }
 
     let sig_bytes: [u8; 64] = bytes.try_into().unwrap();
     Ok(Signature::from_bytes(&sig_bytes))
 }
 
-/// Verify the Ed25519 signature of a skill's WASM bytes.
+/// Verify the Ed25519 signature of a plugin's WASM bytes.
 ///
-/// Reads `publisher_key` and `signature` from the skills manifest and verifies
+/// Reads `publisher_key` and `signature` from the plugins manifest and verifies
 /// them against the raw WASM bytes.
 ///
 /// # Behavior
@@ -97,8 +82,8 @@ fn parse_signature(hex_sig: &str) -> Result<Signature, LoaderError> {
 /// - Missing signature with `require_signature: true` → returns error.
 /// - Invalid signature → returns error.
 /// - If `trusted_publishers` is non-empty, the publisher key must be in the list.
-pub fn verify_skill_signature(
-    skill_name: &str,
+pub fn verify_plugin_signature(
+    plugin_name: &str,
     wasm_bytes: &[u8],
     manifest: &serde_json::Value,
     config: &SignatureConfig,
@@ -107,18 +92,18 @@ pub fn verify_skill_signature(
         return Ok(());
     }
 
-    let entry = match manifest.get(skill_name) {
+    let entry = match manifest.get(plugin_name) {
         Some(e) => e,
         None => {
             if config.require_signature {
                 return Err(LoaderError::SignatureVerificationFailed {
-                    skill_name: skill_name.to_string(),
+                    plugin_name: plugin_name.to_string(),
                     reason: "no manifest entry and signatures are required".to_string(),
                 });
             }
             tracing::warn!(
-                skill = %skill_name,
-                "no manifest entry for skill, skipping signature verification"
+                plugin = %plugin_name,
+                "no manifest entry for plugin, skipping signature verification"
             );
             return Ok(());
         }
@@ -129,12 +114,12 @@ pub fn verify_skill_signature(
         None => {
             if config.require_signature {
                 return Err(LoaderError::SignatureVerificationFailed {
-                    skill_name: skill_name.to_string(),
+                    plugin_name: plugin_name.to_string(),
                     reason: "no publisher_key in manifest and signatures are required".to_string(),
                 });
             }
             tracing::warn!(
-                skill = %skill_name,
+                plugin = %plugin_name,
                 "no publisher_key in manifest, skipping signature verification"
             );
             return Ok(());
@@ -146,12 +131,12 @@ pub fn verify_skill_signature(
         None => {
             if config.require_signature {
                 return Err(LoaderError::SignatureVerificationFailed {
-                    skill_name: skill_name.to_string(),
+                    plugin_name: plugin_name.to_string(),
                     reason: "no signature in manifest and signatures are required".to_string(),
                 });
             }
             tracing::warn!(
-                skill = %skill_name,
+                plugin = %plugin_name,
                 "no signature in manifest, skipping signature verification"
             );
             return Ok(());
@@ -159,18 +144,19 @@ pub fn verify_skill_signature(
     };
 
     // Parse key and signature
-    let verifying_key = parse_verifying_key(publisher_key_hex).map_err(|e| {
+    let verifying_key = parse_verifying_key(publisher_key_hex).map_err(|reason| {
         LoaderError::SignatureVerificationFailed {
-            skill_name: skill_name.to_string(),
-            reason: format!("publisher key parse error: {e}"),
+            plugin_name: plugin_name.to_string(),
+            reason: format!("publisher key parse error: {reason}"),
         }
     })?;
 
-    let signature =
-        parse_signature(signature_hex).map_err(|e| LoaderError::SignatureVerificationFailed {
-            skill_name: skill_name.to_string(),
-            reason: format!("signature parse error: {e}"),
-        })?;
+    let signature = parse_signature(signature_hex).map_err(|reason| {
+        LoaderError::SignatureVerificationFailed {
+            plugin_name: plugin_name.to_string(),
+            reason: format!("signature parse error: {reason}"),
+        }
+    })?;
 
     // Check trusted publishers (case-insensitive hex comparison)
     let publisher_lower = publisher_key_hex.to_ascii_lowercase();
@@ -181,7 +167,7 @@ pub fn verify_skill_signature(
             .any(|tp| tp.to_ascii_lowercase() == publisher_lower)
     {
         return Err(LoaderError::SignatureVerificationFailed {
-            skill_name: skill_name.to_string(),
+            plugin_name: plugin_name.to_string(),
             reason: format!(
                 "publisher key {} is not in the trusted publishers list",
                 publisher_key_hex
@@ -192,15 +178,15 @@ pub fn verify_skill_signature(
     // Verify signature
     verifying_key.verify(wasm_bytes, &signature).map_err(|e| {
         LoaderError::SignatureVerificationFailed {
-            skill_name: skill_name.to_string(),
+            plugin_name: plugin_name.to_string(),
             reason: format!("Ed25519 signature verification failed: {e}"),
         }
     })?;
 
     tracing::debug!(
-        skill = %skill_name,
+        plugin = %plugin_name,
         publisher = %publisher_key_hex,
-        "skill signature verification passed"
+        "plugin signature verification passed"
     );
 
     Ok(())
@@ -222,16 +208,16 @@ mod tests {
         (signing_key, verifying_key)
     }
 
-    fn write_manifest(dir: &Path, skill_name: &str, pub_key_hex: &str, sig_hex: &str) {
+    fn write_manifest(dir: &Path, plugin_name: &str, pub_key_hex: &str, sig_hex: &str) {
         let manifest = serde_json::json!({
-            skill_name: {
+            plugin_name: {
                 "sha256": "dummy",
                 "publisher_key": pub_key_hex,
                 "signature": sig_hex
             }
         });
         fs::write(
-            dir.join("skills-manifest.json"),
+            dir.join("plugins-manifest.json"),
             serde_json::to_string(&manifest).unwrap(),
         )
         .unwrap();
@@ -293,7 +279,7 @@ mod tests {
     // ==================== Full Verification Flow ====================
 
     #[test]
-    fn test_verify_skill_signature_success() {
+    fn test_verify_plugin_signature_success() {
         let dir = TempDir::new().unwrap();
         let (signing_key, verifying_key) = generate_keypair();
         let wasm_bytes = b"test wasm content for signing";
@@ -302,8 +288,9 @@ mod tests {
         let pub_hex = hex::encode(verifying_key.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
 
-        write_manifest(dir.path(), "test-skill", &pub_hex, &sig_hex);
-        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        write_manifest(dir.path(), "test-plugin", &pub_hex, &sig_hex);
+        let manifest_content =
+            fs::read_to_string(dir.path().join("plugins-manifest.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         let config = SignatureConfig {
@@ -312,7 +299,7 @@ mod tests {
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("test-skill", wasm_bytes, &manifest, &config);
+        let result = verify_plugin_signature("test-plugin", wasm_bytes, &manifest, &config);
         assert!(
             result.is_ok(),
             "signature verification failed: {:?}",
@@ -321,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_skill_signature_tampered() {
+    fn test_verify_plugin_signature_tampered() {
         let dir = TempDir::new().unwrap();
         let (signing_key, verifying_key) = generate_keypair();
         let wasm_bytes = b"original content";
@@ -331,8 +318,9 @@ mod tests {
         let pub_hex = hex::encode(verifying_key.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
 
-        write_manifest(dir.path(), "test-skill", &pub_hex, &sig_hex);
-        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        write_manifest(dir.path(), "test-plugin", &pub_hex, &sig_hex);
+        let manifest_content =
+            fs::read_to_string(dir.path().join("plugins-manifest.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         let config = SignatureConfig {
@@ -341,7 +329,7 @@ mod tests {
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("test-skill", tampered, &manifest, &config);
+        let result = verify_plugin_signature("test-plugin", tampered, &manifest, &config);
         assert!(result.is_err());
     }
 
@@ -357,8 +345,9 @@ mod tests {
         let pub_hex = hex::encode(verifying_key.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
 
-        write_manifest(dir.path(), "my-skill", &pub_hex, &sig_hex);
-        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        write_manifest(dir.path(), "my-plugin", &pub_hex, &sig_hex);
+        let manifest_content =
+            fs::read_to_string(dir.path().join("plugins-manifest.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         let config = SignatureConfig {
@@ -367,7 +356,7 @@ mod tests {
             trusted_publishers: vec![pub_hex.clone()],
         };
 
-        let result = verify_skill_signature("my-skill", wasm_bytes, &manifest, &config);
+        let result = verify_plugin_signature("my-plugin", wasm_bytes, &manifest, &config);
         assert!(result.is_ok());
     }
 
@@ -383,8 +372,9 @@ mod tests {
         let sig_hex = hex::encode(signature.to_bytes());
         let other_hex = hex::encode(other_key.as_bytes());
 
-        write_manifest(dir.path(), "my-skill", &pub_hex, &sig_hex);
-        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        write_manifest(dir.path(), "my-plugin", &pub_hex, &sig_hex);
+        let manifest_content =
+            fs::read_to_string(dir.path().join("plugins-manifest.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         let config = SignatureConfig {
@@ -393,7 +383,7 @@ mod tests {
             trusted_publishers: vec![other_hex],
         };
 
-        let result = verify_skill_signature("my-skill", wasm_bytes, &manifest, &config);
+        let result = verify_plugin_signature("my-plugin", wasm_bytes, &manifest, &config);
         assert!(result.is_err());
     }
 
@@ -407,8 +397,9 @@ mod tests {
         let pub_hex = hex::encode(verifying_key.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
 
-        write_manifest(dir.path(), "my-skill", &pub_hex, &sig_hex);
-        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        write_manifest(dir.path(), "my-plugin", &pub_hex, &sig_hex);
+        let manifest_content =
+            fs::read_to_string(dir.path().join("plugins-manifest.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         // Use UPPERCASE in trusted_publishers, lowercase in manifest
@@ -418,7 +409,7 @@ mod tests {
             trusted_publishers: vec![pub_hex.to_ascii_uppercase()],
         };
 
-        let result = verify_skill_signature("my-skill", wasm_bytes, &manifest, &config);
+        let result = verify_plugin_signature("my-plugin", wasm_bytes, &manifest, &config);
         assert!(
             result.is_ok(),
             "case-insensitive comparison should pass: {:?}",
@@ -438,7 +429,7 @@ mod tests {
         };
 
         let result =
-            verify_skill_signature("some-skill", b"wasm", &serde_json::Value::Null, &config);
+            verify_plugin_signature("some-plugin", b"wasm", &serde_json::Value::Null, &config);
         assert!(result.is_ok());
     }
 
@@ -452,13 +443,13 @@ mod tests {
         };
 
         let result =
-            verify_skill_signature("some-skill", b"wasm", &serde_json::Value::Null, &config);
+            verify_plugin_signature("some-plugin", b"wasm", &serde_json::Value::Null, &config);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_missing_entry_require_false_ok() {
-        let manifest: serde_json::Value = serde_json::from_str(r#"{"other-skill": {}}"#).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(r#"{"other-plugin": {}}"#).unwrap();
 
         let config = SignatureConfig {
             enabled: true,
@@ -466,14 +457,14 @@ mod tests {
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("missing-skill", b"wasm", &manifest, &config);
+        let result = verify_plugin_signature("missing-plugin", b"wasm", &manifest, &config);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_missing_publisher_key_require_true_fails() {
         let manifest = serde_json::json!({
-            "my-skill": { "sha256": "dummy" }
+            "my-plugin": { "sha256": "dummy" }
         });
 
         let config = SignatureConfig {
@@ -482,7 +473,7 @@ mod tests {
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("my-skill", b"wasm", &manifest, &config);
+        let result = verify_plugin_signature("my-plugin", b"wasm", &manifest, &config);
         assert!(result.is_err());
     }
 
@@ -498,7 +489,7 @@ mod tests {
 
         // No manifest, but disabled — should pass
         let result =
-            verify_skill_signature("any-skill", b"wasm", &serde_json::Value::Null, &config);
+            verify_plugin_signature("any-plugin", b"wasm", &serde_json::Value::Null, &config);
         assert!(result.is_ok());
     }
 

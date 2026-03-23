@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
+
 /// Severity of a schema validation issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -56,7 +58,6 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "talk",
     "gateway",
     "usage",
-    "skills",
     "plugins",
     "anthropic",
     "sessions",
@@ -116,8 +117,8 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_cron(obj, &mut issues);
     validate_prompt_guard(obj, &mut issues);
     validate_output_sanitizer(obj, &mut issues);
-    validate_skills_signature(obj, &mut issues);
-    validate_skills_sandbox(obj, &mut issues);
+    validate_plugins_signature(obj, &mut issues);
+    validate_plugins_sandbox(obj, &mut issues);
     validate_plugins(obj, &mut issues);
     validate_session_integrity(obj, &mut issues);
     validate_usage(obj, &mut issues);
@@ -757,9 +758,9 @@ fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut 
     }
 }
 
-fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+fn validate_plugins_signature(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
     let sig = match obj
-        .get("skills")
+        .get("plugins")
         .and_then(|s| s.get("signature"))
         .and_then(|v| v.as_object())
     {
@@ -771,7 +772,7 @@ fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut 
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".skills.signature.enabled".to_string(),
+                path: ".plugins.signature.enabled".to_string(),
                 message: "enabled must be a boolean".to_string(),
             });
         }
@@ -781,7 +782,7 @@ fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut 
         if !require.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".skills.signature.requireSignature".to_string(),
+                path: ".plugins.signature.requireSignature".to_string(),
                 message: "requireSignature must be a boolean".to_string(),
             });
         }
@@ -791,16 +792,16 @@ fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut 
         if !publishers.is_array() {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
-                path: ".skills.signature.trustedPublishers".to_string(),
+                path: ".plugins.signature.trustedPublishers".to_string(),
                 message: "trustedPublishers must be an array".to_string(),
             });
         }
     }
 }
 
-fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
     let sandbox = match obj
-        .get("skills")
+        .get("plugins")
         .and_then(|s| s.get("sandbox"))
         .and_then(|v| v.as_object())
     {
@@ -812,7 +813,7 @@ fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Ve
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".skills.sandbox.enabled".to_string(),
+                path: ".plugins.sandbox.enabled".to_string(),
                 message: "enabled must be a boolean".to_string(),
             });
         }
@@ -824,7 +825,7 @@ fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Ve
                 if !val.is_boolean() {
                     issues.push(SchemaIssue {
                         severity: Severity::Error,
-                        path: format!(".skills.sandbox.defaults.{}", key),
+                        path: format!(".plugins.sandbox.defaults.{}", key),
                         message: format!("{} must be a boolean", key),
                     });
                 }
@@ -856,6 +857,53 @@ fn validate_plugins(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
                 path: ".plugins.enabled".to_string(),
                 message: "plugins.enabled must be a boolean".to_string(),
             });
+        }
+    }
+
+    if let Some(entries) = plugins.get("entries") {
+        let Some(entries_obj) = entries.as_object() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".plugins.entries".to_string(),
+                message: "plugins.entries must be an object".to_string(),
+            });
+            return;
+        };
+
+        for (name, entry) in entries_obj {
+            if is_reserved_plugin_id(name) {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".plugins.entries.{name}"),
+                    message: format!(
+                        "managed plugin name '{}' is reserved for plugin configuration",
+                        name
+                    ),
+                });
+            }
+
+            let Some(entry_obj) = entry.as_object() else {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".plugins.entries.{name}"),
+                    message: "managed plugin entry must be an object".to_string(),
+                });
+                continue;
+            };
+
+            for field in entry_obj.keys() {
+                if !matches!(field.as_str(), "enabled" | "installId" | "requestedAt") {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".plugins.entries.{name}.{field}"),
+                        message: format!(
+                            "unknown managed plugin field '{}'; plugin runtime config belongs under plugins.<plugin-id>.*, and reserved top-level plugin keys are {}",
+                            field,
+                            RESERVED_PLUGIN_CONFIG_KEYS.join(", ")
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -2246,6 +2294,45 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".plugins.load.paths"
                 && i.message.contains("entries must be strings")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_entries_must_be_managed_entry_objects() {
+        let config = json!({
+            "plugins": {
+                "entries": {
+                    "demo": {
+                        "apiKey": "${DEMO_API_KEY}"
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.entries.demo.apiKey"
+                && i.message
+                    .contains("plugin runtime config belongs under plugins.<plugin-id>.*")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_entries_reject_reserved_names() {
+        let config = json!({
+            "plugins": {
+                "entries": {
+                    "entries": {
+                        "enabled": true
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.entries.entries"
+                && i.message.contains("reserved for plugin configuration")
         }));
     }
 

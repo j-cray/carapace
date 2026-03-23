@@ -146,7 +146,7 @@ mod golden_trace {
             Value::Object(map) => {
                 normalize_session_fields(map);
                 normalize_config_fields(map);
-                normalize_skills_fields(map);
+                normalize_plugins_fields(map);
                 normalize_approvals_fields(map);
                 normalize_count_fields(map);
                 normalize_usage_fields(map);
@@ -215,10 +215,10 @@ mod golden_trace {
         }
     }
 
-    /// Normalize skills.status response fields.
-    fn normalize_skills_fields(map: &mut serde_json::Map<String, Value>) {
-        if let Some(Value::Array(_)) = map.get("skills") {
-            map.insert("skills".to_string(), json!([]));
+    /// Normalize plugins.status response fields.
+    fn normalize_plugins_fields(map: &mut serde_json::Map<String, Value>) {
+        if let Some(Value::Array(_)) = map.get("plugins") {
+            map.insert("plugins".to_string(), json!([]));
         }
     }
 
@@ -505,19 +505,19 @@ mod golden_trace {
     golden_test!(golden_node_pair_list, "node.pair.list", json!({}));
     golden_test!(golden_device_pair_list, "device.pair.list", json!({}));
 
-    // ───────────────────────── Skills ─────────────────────────
+    // ───────────────────────── Plugins ─────────────────────────
 
-    golden_test!(golden_skills_status, "skills.status", json!({}));
+    golden_test!(golden_plugins_status, "plugins.status", json!({}));
 
-    /// `skills.bins` is a node-only method; use a node connection.
+    /// `plugins.bins` is a node-only method; use a node connection.
     #[tokio::test]
-    async fn golden_skills_bins() {
+    async fn golden_plugins_bins() {
         let (_guard, state) = test_state();
         let conn = node_conn();
         register_conn(&state, &conn);
-        let result = dispatch_method("skills.bins", Some(&json!({})), &state, &conn).await;
+        let result = dispatch_method("plugins.bins", Some(&json!({})), &state, &conn).await;
         let normalized = normalize_for_snapshot(&result);
-        insta::assert_json_snapshot!("golden_skills_bins", normalized);
+        insta::assert_json_snapshot!("golden_plugins_bins", normalized);
     }
 
     // ───────────────────────── Exec approvals ─────────────────────────
@@ -564,7 +564,7 @@ mod golden_trace {
         let (_guard, state) = test_state();
         let conn = admin_conn(); // admin, not node
         register_conn(&state, &conn);
-        let result = dispatch_method("skills.bins", Some(&json!({})), &state, &conn).await;
+        let result = dispatch_method("plugins.bins", Some(&json!({})), &state, &conn).await;
         let normalized = normalize_for_snapshot(&result);
         insta::assert_json_snapshot!("golden_node_only_method_forbidden", normalized);
     }

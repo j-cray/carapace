@@ -26,6 +26,13 @@ use thiserror::Error;
 use wasmtime::component::Component as WasmComponent;
 use wasmtime::{Config, Engine};
 
+pub(crate) const RESERVED_PLUGIN_CONFIG_KEYS: &[&str] =
+    &["enabled", "entries", "load", "sandbox", "signature"];
+
+pub(crate) fn is_reserved_plugin_id(id: &str) -> bool {
+    RESERVED_PLUGIN_CONFIG_KEYS.contains(&id)
+}
+
 /// Plugin loading errors
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -54,20 +61,20 @@ pub enum LoaderError {
     #[error("Wasmtime engine error: {0}")]
     EngineError(String),
 
-    #[error("Failed to load skills manifest: {0}")]
-    SkillsManifestError(String),
+    #[error("Failed to load plugins manifest: {0}")]
+    PluginsManifestError(String),
 
     #[error(
-        "Skill hash verification failed for '{skill_name}': expected {expected}, got {actual}"
+        "Plugin hash verification failed for '{plugin_name}': expected {expected}, got {actual}"
     )]
     HashVerificationFailed {
-        skill_name: String,
+        plugin_name: String,
         expected: String,
         actual: String,
     },
 
-    #[error("Skill signature verification failed for '{skill_name}': {reason}")]
-    SignatureVerificationFailed { skill_name: String, reason: String },
+    #[error("Plugin signature verification failed for '{plugin_name}': {reason}")]
+    SignatureVerificationFailed { plugin_name: String, reason: String },
 }
 
 /// Plugin kinds supported by the gateway
@@ -135,6 +142,16 @@ impl PluginManifest {
             return Err(LoaderError::InvalidManifest {
                 plugin_id: self.id.clone(),
                 message: "ID must contain only lowercase alphanumeric and hyphens".to_string(),
+            });
+        }
+
+        if is_reserved_plugin_id(&self.id) {
+            return Err(LoaderError::InvalidManifest {
+                plugin_id: self.id.clone(),
+                message: format!(
+                    "ID '{}' is reserved for plugin configuration and cannot be used",
+                    self.id
+                ),
             });
         }
 
@@ -578,8 +595,8 @@ fn derive_manifest(
     }
 }
 
-/// Name of the skills manifest file stored alongside WASM binaries.
-const SKILLS_MANIFEST_FILE: &str = "skills-manifest.json";
+/// Name of the plugins manifest file stored alongside WASM binaries.
+pub(crate) const PLUGINS_MANIFEST_FILE: &str = "plugins-manifest.json";
 
 /// Compute the SHA-256 hash of the given bytes and return it as a lowercase hex string.
 fn compute_sha256_hex(data: &[u8]) -> String {
@@ -589,18 +606,18 @@ fn compute_sha256_hex(data: &[u8]) -> String {
     hex::encode(hash)
 }
 
-/// Verify that a skill's WASM bytes match the expected SHA-256 hash stored in the
-/// skills manifest.
+/// Verify that a plugin's WASM bytes match the expected SHA-256 hash stored in the
+/// plugins manifest.
 ///
-/// If no manifest entry or no `sha256` field exists for the skill (legacy entry),
+/// If no manifest entry or no `sha256` field exists for the plugin (legacy entry),
 /// verification is skipped with a warning log and `Ok(())` is returned.
-pub fn verify_skill_hash_on_load(
-    skill_name: &str,
+pub fn verify_plugin_hash_on_load(
+    plugin_name: &str,
     wasm_bytes: &[u8],
     manifest: &serde_json::Value,
 ) -> Result<(), LoaderError> {
     let expected_hash = manifest
-        .get(skill_name)
+        .get(plugin_name)
         .and_then(|entry| entry.get("sha256"))
         .and_then(|v| v.as_str());
 
@@ -609,38 +626,38 @@ pub fn verify_skill_hash_on_load(
             let actual = compute_sha256_hex(wasm_bytes);
             if actual != expected {
                 tracing::error!(
-                    skill = %skill_name,
+                    plugin = %plugin_name,
                     expected = %expected,
                     actual = %actual,
-                    "skill hash mismatch — possible tampering detected"
+                    "plugin hash mismatch — possible tampering detected"
                 );
                 return Err(LoaderError::HashVerificationFailed {
-                    skill_name: skill_name.to_string(),
+                    plugin_name: plugin_name.to_string(),
                     expected: expected.to_string(),
                     actual,
                 });
             }
             tracing::debug!(
-                skill = %skill_name,
+                plugin = %plugin_name,
                 sha256 = %actual,
-                "skill hash verification passed"
+                "plugin hash verification passed"
             );
             Ok(())
         }
         None => {
             tracing::warn!(
-                skill = %skill_name,
-                "no sha256 hash in manifest for skill, skipping verification (legacy entry)"
+                plugin = %plugin_name,
+                "no sha256 hash in manifest for plugin, skipping verification (legacy entry)"
             );
             Ok(())
         }
     }
 }
 
-/// Load the skills manifest from the given directory.
+/// Load the plugins manifest from the given directory.
 /// Returns `None` if the manifest file does not exist.
-pub fn load_skills_manifest(skills_dir: &Path) -> Result<Option<serde_json::Value>, String> {
-    let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
+pub fn load_plugins_manifest(plugins_dir: &Path) -> Result<Option<serde_json::Value>, String> {
+    let manifest_path = plugins_dir.join(PLUGINS_MANIFEST_FILE);
     match fs::read_to_string(&manifest_path) {
         Ok(contents) => serde_json::from_str(&contents)
             .map(Some)
@@ -755,22 +772,22 @@ impl PluginLoader {
         // Read manifest once
         let manifest_json = match wasm_path.parent() {
             Some(parent) => {
-                load_skills_manifest(parent).map_err(LoaderError::SkillsManifestError)?
+                load_plugins_manifest(parent).map_err(LoaderError::PluginsManifestError)?
             }
             None => None,
         };
 
-        // Verify SHA-256 hash against the skills manifest (if present)
+        // Verify SHA-256 hash against the plugins manifest (if present)
         if let Some(ref manifest) = manifest_json {
             if let Some(stem) = wasm_path.file_stem().and_then(|s| s.to_str()) {
-                verify_skill_hash_on_load(stem, &wasm_bytes, manifest)?;
+                verify_plugin_hash_on_load(stem, &wasm_bytes, manifest)?;
             }
         }
 
-        // Verify Ed25519 signature against the skills manifest (if present)
+        // Verify Ed25519 signature against the plugins manifest (if present)
         if let Some(ref manifest) = manifest_json {
             if let Some(stem) = wasm_path.file_stem().and_then(|s| s.to_str()) {
-                super::signature::verify_skill_signature(
+                super::signature::verify_plugin_signature(
                     stem,
                     &wasm_bytes,
                     manifest,
@@ -952,6 +969,7 @@ impl PluginLoader {
     fn is_valid_plugin_id(id: &str) -> bool {
         !id.is_empty()
             && id.len() <= 32
+            && !is_reserved_plugin_id(id)
             && id
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -1021,6 +1039,28 @@ mod tests {
         assert!(!PluginLoader::is_valid_plugin_id("My-Plugin")); // uppercase
         assert!(!PluginLoader::is_valid_plugin_id("plugin_name")); // underscore
         assert!(!PluginLoader::is_valid_plugin_id(&"x".repeat(33))); // too long
+        assert!(!PluginLoader::is_valid_plugin_id("entries")); // reserved config namespace
+        assert!(!PluginLoader::is_valid_plugin_id("load")); // reserved config namespace
+    }
+
+    #[test]
+    fn test_plugin_manifest_rejects_reserved_id() {
+        let manifest = PluginManifest {
+            id: "entries".to_string(),
+            name: "Reserved".to_string(),
+            description: "Reserved ID".to_string(),
+            version: "1.0.0".to_string(),
+            kind: PluginKind::Tool,
+            permissions: Default::default(),
+        };
+
+        let error = manifest
+            .validate()
+            .expect_err("reserved plugin IDs must fail");
+        assert!(matches!(
+            error,
+            LoaderError::InvalidManifest { plugin_id, .. } if plugin_id == "entries"
+        ));
     }
 
     #[test]
