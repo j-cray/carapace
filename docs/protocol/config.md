@@ -183,7 +183,7 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
 - `session`
   - `scope`, `dmScope`, `typingMode`, `typingIntervalSeconds`, `mainKey`
-  - `typingMode` / `typingIntervalSeconds` are legacy/global fallback for channel typing only; prefer `channels.defaults.features.typing` and `channels.<channel>.features.typing`
+  - `typingMode` / `typingIntervalSeconds` are legacy/global fallback for channel typing only when you explicitly set them in config; prefer `channels.defaults.features.typing` and `channels.<channel>.features.typing`
 - `channels`
   - `defaults.features.typing`, `defaults.features.readReceipts`
   - `<channel>.features.typing`, `<channel>.features.readReceipts`
@@ -353,8 +353,8 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `agents.defaults.compaction.mode`: `"safeguard"`
 - `session.scope`: `"per-sender"`
 - `session.dmScope`: `"main"`
-- `session.typingMode`: `"thinking"` (legacy/global typing fallback)
-- `session.typingIntervalSeconds`: `3` (legacy/global typing fallback)
+- `session.typingMode`: `"thinking"` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config)
+- `session.typingIntervalSeconds`: `3` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config)
 - `session.mainKey`: `"main"` (enforced even if another value is supplied)
 - `channels.defaults.features.typing.enabled`: `false`
 - `channels.defaults.features.typing.mode`: `"thinking"`

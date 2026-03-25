@@ -160,13 +160,12 @@ async fn process_channel_messages(
             &message.metadata,
             &message_id,
             result,
-        )
-        .await;
+        );
     }
 }
 
 /// Handle the result of a message delivery attempt.
-async fn handle_delivery_result(
+fn handle_delivery_result(
     pipeline: &MessagePipeline,
     plugin_registry: &Arc<PluginRegistry>,
     channel_id: &str,
@@ -178,19 +177,18 @@ async fn handle_delivery_result(
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
-                let cfg = crate::config::load_config_shared()
-                    .unwrap_or_else(|_| Arc::new(serde_json::json!({})));
-                let policy = crate::channels::activity::resolve_channel_activity_policy(
-                    cfg.as_ref(),
-                    channel_id,
-                );
-                crate::channels::activity::maybe_send_read_receipt(
-                    plugin_registry,
-                    channel_id,
-                    &policy,
-                    read_receipt,
-                )
-                .await;
+                let policy = crate::channels::activity::load_channel_activity_policy(channel_id);
+                let plugin_registry = Arc::clone(plugin_registry);
+                let channel_id = channel_id.to_string();
+                tokio::spawn(async move {
+                    crate::channels::activity::maybe_send_read_receipt(
+                        &plugin_registry,
+                        &channel_id,
+                        &policy,
+                        read_receipt,
+                    )
+                    .await;
+                });
             }
         }
         Ok(delivery) => {
@@ -325,8 +323,6 @@ mod tests {
         BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, OutboundContext,
         ReadReceiptContext,
     };
-    use std::env;
-    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -435,45 +431,6 @@ mod tests {
         fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
             self.mark_read_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
-        }
-    }
-
-    struct ScopedEnv {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl ScopedEnv {
-        fn set_os(key: &'static str, value: &OsStr) -> Self {
-            let previous = env::var_os(key);
-            // SAFETY: tests use scoped env guards to restore process env after each mutation.
-            unsafe {
-                env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-
-        fn set(key: &'static str, value: &str) -> Self {
-            Self::set_os(key, OsStr::new(value))
-        }
-    }
-
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => {
-                    // SAFETY: tests use scoped env guards to restore process env after each mutation.
-                    unsafe {
-                        env::set_var(self.key, value);
-                    }
-                }
-                None => {
-                    // SAFETY: tests use scoped env guards to restore process env after each mutation.
-                    unsafe {
-                        env::remove_var(self.key);
-                    }
-                }
-            }
         }
     }
 
@@ -761,7 +718,7 @@ mod tests {
             .expect("task should not panic");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_delivery_marks_read_after_success_when_enabled() {
         let mock = Arc::new(MockChannel::with_read_receipts());
         let (pipeline, plugin_reg, channel_reg) =
@@ -785,8 +742,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let _config_path_guard = ScopedEnv::set_os("CARAPACE_CONFIG_PATH", config_path.as_os_str());
-        let _cache_guard = ScopedEnv::set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {

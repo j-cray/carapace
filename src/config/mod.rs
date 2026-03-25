@@ -108,6 +108,8 @@ struct CachedConfig {
 
 /// Global config cache
 static CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> = LazyLock::new(|| RwLock::new(None));
+static RAW_CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 #[derive(Clone, Default)]
 struct InjectedConfigEnvState {
@@ -243,22 +245,58 @@ pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
     Ok(shared)
 }
 
+/// Load the explicit user config without applying defaults, returning a shared value.
+///
+/// The returned value still has includes resolved, env substitution applied,
+/// and encrypted secrets decrypted. Missing files return an empty object `{}`.
+pub(crate) fn load_raw_config_shared() -> Result<Arc<Value>, ConfigError> {
+    let path = get_config_path();
+
+    if let Some(ttl) = get_cache_ttl() {
+        let cache = RAW_CONFIG_CACHE.read();
+        if let Some(cached) = cache.as_ref() {
+            if cached.loaded_at.elapsed() < ttl {
+                return Ok(Arc::clone(&cached.value));
+            }
+        }
+    }
+
+    let config = load_raw_config_uncached(&path)?;
+    let shared = Arc::new(config);
+
+    if get_cache_ttl().is_some() {
+        let mut cache = RAW_CONFIG_CACHE.write();
+        *cache = Some(CachedConfig {
+            value: Arc::clone(&shared),
+            loaded_at: Instant::now(),
+        });
+    }
+
+    Ok(shared)
+}
+
 /// Load config without using the cache.
 ///
 /// After parsing, include resolution, and env var substitution, this applies
 /// config defaults so that missing sections/fields have sensible values.
 pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
-    // Return empty object with defaults if file doesn't exist
+    let mut value = load_raw_config_uncached(path)?;
+
+    // Apply config defaults so missing sections and fields get production-ready values.
+    defaults::apply_defaults(&mut value);
+
+    crate::usage::update_pricing_from_config(&value);
+
+    Ok(value)
+}
+
+fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
+    // Return empty object if file doesn't exist.
     if !path.exists() {
         let mut env_state = CONFIG_ENV_STATE.lock();
         let empty_env_state = InjectedConfigEnvState::default();
         restore_config_env_state(&empty_env_state, &mut env_state);
-        drop(env_state);
-
-        let mut empty = Value::Object(serde_json::Map::new());
-        defaults::apply_defaults(&mut empty);
-        crate::usage::update_pricing_from_config(&empty);
-        return Ok(empty);
+        return Ok(Value::Object(serde_json::Map::new()));
     }
 
     // Read and parse the config file
@@ -293,13 +331,8 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     }
     drop(env_state);
 
-    // Apply config defaults so missing sections and fields get production-ready values.
-    defaults::apply_defaults(&mut value);
-
     // Resolve encrypted secrets if configured.
     resolve_config_secrets(&mut value);
-
-    crate::usage::update_pricing_from_config(&value);
 
     Ok(value)
 }
@@ -761,6 +794,8 @@ where
 pub fn clear_cache() {
     let mut cache = CONFIG_CACHE.write();
     *cache = None;
+    let mut raw_cache = RAW_CONFIG_CACHE.write();
+    *raw_cache = None;
 }
 
 /// Atomically update the config cache with a pre-validated config value.
@@ -774,6 +809,8 @@ pub fn update_cache(value: Value) {
         value: Arc::new(value),
         loaded_at: Instant::now(),
     });
+    let mut raw_cache = RAW_CONFIG_CACHE.write();
+    *raw_cache = None;
 }
 
 /// Reload the config from disk, validate it, and update the cache atomically.

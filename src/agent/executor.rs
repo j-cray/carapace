@@ -1179,10 +1179,7 @@ pub async fn execute_run(
     let typing_handle = if let (Some(channel_id), Some(plugin_registry)) =
         (message_channel.as_deref(), state.plugin_registry())
     {
-        let cfg =
-            crate::config::load_config_shared().unwrap_or_else(|_| Arc::new(serde_json::json!({})));
-        let policy =
-            crate::channels::activity::resolve_channel_activity_policy(cfg.as_ref(), channel_id);
+        let policy = crate::channels::activity::load_channel_activity_policy(channel_id);
         let typing_context = {
             let registry = state.agent_run_registry.lock();
             registry

@@ -122,6 +122,22 @@ fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static s
     }
 }
 
+fn build_receive_url(
+    base_url: &str,
+    phone_number: &str,
+    disable_auto_read_receipts: bool,
+) -> String {
+    let encoded_phone_number = urlencoding::encode(phone_number);
+    if disable_auto_read_receipts {
+        format!(
+            "{}/v1/receive/{}?send_read_receipts=false",
+            base_url, encoded_phone_number
+        )
+    } else {
+        format!("{}/v1/receive/{}", base_url, encoded_phone_number)
+    }
+}
+
 fn record_signal_parse_failure<E: std::fmt::Display>(
     context: &str,
     err: E,
@@ -151,16 +167,7 @@ pub async fn signal_receive_loop(
         .timeout(RECEIVE_TIMEOUT)
         .build()
         .expect("failed to build Signal receive HTTP client");
-    let receive_url = format!(
-        "{}/v1/receive/{}?send_read_receipts=false",
-        base_url,
-        urlencoding::encode(&phone_number)
-    );
-
-    info!(
-        url = %receive_url,
-        "Signal receive loop started"
-    );
+    info!(phone_number = %phone_number, "Signal receive loop started");
 
     // Track consecutive transport and parse errors to avoid spamming logs.
     let mut consecutive_errors: u32 = 0;
@@ -172,6 +179,13 @@ pub async fn signal_receive_loop(
             info!("Signal receive loop shutting down");
             break;
         }
+
+        let activity_policy = crate::channels::activity::load_channel_activity_policy("signal");
+        let receive_url = build_receive_url(
+            &base_url,
+            &phone_number,
+            activity_policy.read_receipts.enabled,
+        );
 
         match client.get(&receive_url).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -522,6 +536,22 @@ mod tests {
             .and_then(|group| group.group_id.as_deref());
         assert_eq!(group, Some("dGVzdGdyb3VwaWQ="));
         assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
+    fn test_build_receive_url_preserves_signal_auto_receipts_by_default() {
+        assert_eq!(
+            build_receive_url("http://localhost:8080", "+15551234567", false),
+            "http://localhost:8080/v1/receive/%2B15551234567"
+        );
+    }
+
+    #[test]
+    fn test_build_receive_url_disables_signal_auto_receipts_when_feature_enabled() {
+        assert_eq!(
+            build_receive_url("http://localhost:8080", "+15551234567", true),
+            "http://localhost:8080/v1/receive/%2B15551234567?send_read_receipts=false"
+        );
     }
 
     #[test]

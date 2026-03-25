@@ -27,7 +27,8 @@ service HTTP port 18789. Adjust paths/ports for your deployment.
 - Channel activity features are configured under `channels.defaults.features.*`
   and `channels.<channel>.features.*`.
 - `session.typingMode` and `session.typingIntervalSeconds` remain as a
-  legacy/global fallback for typing only; prefer `channels.*.features.typing`.
+  legacy/global fallback for typing only when you explicitly set them in
+  config; prefer `channels.*.features.typing`.
 
 ## Signal (signal-cli-rest-api)
 
@@ -68,7 +69,8 @@ For non-loopback Signal deployments, set `signal.baseUrl` to `https://...`.
 Carapace rejects non-HTTPS non-loopback Signal URLs.
 When `channels.signal.features.readReceipts.enabled` is true, Carapace polls
 Signal with `send_read_receipts=false` and only sends a read receipt after a
-successful assistant response is delivered.
+successful assistant response is delivered. When the feature is disabled,
+Signal keeps its normal auto-read-receipt behavior.
 
 ## Telegram (Bot API + Webhook or Polling)
 

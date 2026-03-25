@@ -108,6 +108,12 @@ pub fn resolve_channel_activity_policy(config: &Value, channel: &str) -> Channel
     policy
 }
 
+pub fn load_channel_activity_policy(channel: &str) -> ChannelActivityPolicy {
+    let config =
+        crate::config::load_raw_config_shared().unwrap_or_else(|_| Arc::new(serde_json::json!({})));
+    resolve_channel_activity_policy(config.as_ref(), channel)
+}
+
 fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeaturePolicy) {
     let Some(session) = config.get("session") else {
         return;
@@ -122,12 +128,8 @@ fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeatu
         }
     }
 
-    if let Some(interval) = session
-        .get("typingIntervalSeconds")
-        .and_then(|value| value.as_u64())
-        .filter(|value| *value > 0)
-    {
-        policy.interval_seconds = interval.min(u32::MAX as u64) as u32;
+    if let Some(interval) = parse_positive_u32_from_value(session, "typingIntervalSeconds") {
+        policy.interval_seconds = interval;
     }
 }
 
@@ -136,21 +138,19 @@ fn apply_channel_activity_overrides(features: Option<&Value>, policy: &mut Chann
         return;
     };
 
-    if let Some(typing) = features.get("typing").and_then(|value| value.as_object()) {
-        if let Some(enabled) = typing.get("enabled").and_then(|value| value.as_bool()) {
-            policy.typing.enabled = enabled;
-        }
-        if let Some(mode) = typing.get("mode").and_then(|value| value.as_str()) {
-            if mode.eq_ignore_ascii_case("thinking") {
-                policy.typing.mode = TypingMode::Thinking;
+    if let Some(typing_value) = features.get("typing") {
+        if let Some(typing) = typing_value.as_object() {
+            if let Some(enabled) = typing.get("enabled").and_then(|value| value.as_bool()) {
+                policy.typing.enabled = enabled;
             }
-        }
-        if let Some(interval) = typing
-            .get("intervalSeconds")
-            .and_then(|value| value.as_u64())
-            .filter(|value| *value > 0)
-        {
-            policy.typing.interval_seconds = interval.min(u32::MAX as u64) as u32;
+            if let Some(mode) = typing.get("mode").and_then(|value| value.as_str()) {
+                if mode.eq_ignore_ascii_case("thinking") {
+                    policy.typing.mode = TypingMode::Thinking;
+                }
+            }
+            if let Some(interval) = parse_positive_u32_from_value(typing_value, "intervalSeconds") {
+                policy.typing.interval_seconds = interval;
+            }
         }
     }
 
@@ -167,6 +167,14 @@ fn apply_channel_activity_overrides(features: Option<&Value>, policy: &mut Chann
             }
         }
     }
+}
+
+fn parse_positive_u32_from_value(value: &Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(|entry| entry.as_u64())
+        .filter(|entry| *entry > 0)
+        .map(|entry| entry.min(u32::MAX as u64) as u32)
 }
 
 pub async fn maybe_start_typing_loop(
@@ -196,6 +204,7 @@ pub async fn maybe_start_typing_loop(
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds as u64));
+        interval.tick().await;
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => {
@@ -282,6 +291,7 @@ async fn invoke_mark_read(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
@@ -412,6 +422,26 @@ mod tests {
         assert!(!policy.typing.enabled);
         assert_eq!(policy.typing.interval_seconds, 11);
         assert!(policy.read_receipts.enabled);
+    }
+
+    #[test]
+    fn test_load_channel_activity_policy_ignores_defaulted_legacy_typing() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("carapace.json5");
+        fs::write(&config_path, "{}").unwrap();
+
+        crate::config::clear_cache();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+
+        let policy = load_channel_activity_policy("signal");
+        assert!(!policy.typing.enabled);
+        assert_eq!(
+            policy.typing.interval_seconds,
+            DEFAULT_TYPING_INTERVAL_SECONDS
+        );
     }
 
     #[tokio::test]
