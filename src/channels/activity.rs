@@ -75,13 +75,21 @@ pub struct ChannelActivityPolicy {
 #[derive(Debug)]
 pub struct TypingLoopHandle {
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl TypingLoopHandle {
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         self.cancel.cancel();
-        let _ = self.task.await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for TypingLoopHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -223,7 +231,10 @@ pub async fn maybe_start_typing_loop(
         }
     });
 
-    Some(TypingLoopHandle { cancel, task })
+    Some(TypingLoopHandle {
+        cancel,
+        task: Some(task),
+    })
 }
 
 pub async fn maybe_send_read_receipt(
@@ -475,6 +486,42 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         handle.stop().await;
+
+        assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
+        assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_start_typing_loop_drop_cancels_background_task() {
+        let plugin = Arc::new(MockChannel::new(ChannelCapabilities {
+            typing_indicators: true,
+            ..Default::default()
+        }));
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register_channel("signal".to_string(), plugin.clone());
+        let policy = ChannelActivityPolicy {
+            typing: TypingFeaturePolicy {
+                enabled: true,
+                interval_seconds: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let handle = maybe_start_typing_loop(
+            registry,
+            "signal",
+            &policy,
+            TypingContext {
+                to: "+15551234567".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("typing loop should start");
+
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);

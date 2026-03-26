@@ -325,6 +325,7 @@ mod tests {
     };
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::Notify;
 
     /// Mock channel plugin that records calls.
     struct MockChannel {
@@ -332,6 +333,7 @@ mod tests {
         send_text_count: AtomicU32,
         send_media_count: AtomicU32,
         mark_read_count: AtomicU32,
+        mark_read_notify: Option<Arc<Notify>>,
         fail: bool,
         retryable: bool,
     }
@@ -343,6 +345,7 @@ mod tests {
                 send_text_count: AtomicU32::new(0),
                 send_media_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
+                mark_read_notify: None,
                 fail: false,
                 retryable: false,
             }
@@ -354,6 +357,7 @@ mod tests {
                 send_text_count: AtomicU32::new(0),
                 send_media_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
+                mark_read_notify: None,
                 fail: true,
                 retryable,
             }
@@ -368,8 +372,16 @@ mod tests {
                 send_text_count: AtomicU32::new(0),
                 send_media_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
+                mark_read_notify: None,
                 fail: false,
                 retryable: false,
+            }
+        }
+
+        fn with_read_receipts_and_notify(notify: Arc<Notify>) -> Self {
+            Self {
+                mark_read_notify: Some(notify),
+                ..Self::with_read_receipts()
             }
         }
     }
@@ -430,6 +442,9 @@ mod tests {
 
         fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
             self.mark_read_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(notify) = &self.mark_read_notify {
+                notify.notify_one();
+            }
             Ok(())
         }
     }
@@ -720,7 +735,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_delivery_marks_read_after_success_when_enabled() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
+        let mark_read_notify = Arc::new(Notify::new());
+        let mock = Arc::new(MockChannel::with_read_receipts_and_notify(
+            mark_read_notify.clone(),
+        ));
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
 
@@ -771,7 +789,9 @@ mod tests {
             delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
+            .await
+            .expect("read receipt should be dispatched");
         let _ = shutdown_tx.send(true);
         pipeline.notifier().notify_one();
         let _ = handle.await;

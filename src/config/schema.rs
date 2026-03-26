@@ -2,6 +2,10 @@
 
 use serde_json::Value;
 
+const KNOWN_CHANNEL_CONFIG_KEYS: &[&str] = &[
+    "defaults", "console", "signal", "telegram", "discord", "slack", "webhook",
+];
+
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
 
 /// Severity of a schema validation issue.
@@ -302,6 +306,14 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
     };
 
     for (channel_name, entry) in channels {
+        if !KNOWN_CHANNEL_CONFIG_KEYS.contains(&channel_name.as_str()) {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.{}", channel_name),
+                message: format!("unknown channel config key '{}'", channel_name),
+            });
+        }
+
         let Some(entry_obj) = entry.as_object() else {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -2130,6 +2142,24 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.path == ".channels.signal.features.readReceipts.mode"));
+    }
+
+    #[test]
+    fn test_unknown_channel_config_key_warns() {
+        let cfg = json!({
+            "channels": {
+                "singal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| issue.path == ".channels.singal"
+            && issue.message.contains("unknown channel config key")));
     }
 
     #[test]
