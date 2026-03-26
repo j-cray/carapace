@@ -187,6 +187,10 @@ pub fn load_channel_activity_policy(channel: &str) -> ChannelActivityPolicy {
 }
 
 pub async fn load_channel_activity_policy_async(channel: &str) -> ChannelActivityPolicy {
+    if let Some(config) = crate::config::peek_raw_config_shared() {
+        return resolve_channel_activity_policy(config.as_ref(), channel);
+    }
+
     let channel = channel.to_string();
     let load_channel = channel.clone();
     match tokio::task::spawn_blocking(move || load_channel_activity_policy(&load_channel)).await {
@@ -552,6 +556,38 @@ mod tests {
             policy.typing.interval_seconds,
             DEFAULT_TYPING_INTERVAL_SECONDS
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_load_channel_activity_policy_async_uses_cached_snapshot_without_disk_reload() {
+        crate::config::clear_cache();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set(
+            "CARAPACE_CONFIG_PATH",
+            std::path::Path::new("/definitely/missing/carapace.json5").as_os_str(),
+        );
+
+        crate::config::update_cache(
+            serde_json::json!({
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": true,
+                                "intervalSeconds": 7
+                            }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({}),
+        );
+
+        let policy = load_channel_activity_policy_async("signal").await;
+        assert!(policy.typing.enabled);
+        assert_eq!(policy.typing.interval_seconds, 7);
+
+        crate::config::clear_cache();
     }
 
     #[tokio::test]

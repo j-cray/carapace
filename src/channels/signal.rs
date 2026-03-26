@@ -87,6 +87,24 @@ impl SignalChannel {
             tracing::warn!("signal channel base_url is invalid and will fail send-time validation");
         }
 
+        let typing_indicator_url = validate_signal_url(
+            &Self::typing_indicator_url_for(&base_url, &phone_number),
+            "signal typing indicator",
+            true,
+        );
+        if let Err(err) = &typing_indicator_url {
+            tracing::warn!(error = %err, "signal typing indicator URL is invalid");
+        }
+
+        let receipts_url = validate_signal_url(
+            &Self::receipts_url_for(&base_url, &phone_number),
+            "signal receipt",
+            true,
+        );
+        if let Err(err) = &receipts_url {
+            tracing::warn!(error = %err, "signal receipt URL is invalid");
+        }
+
         Self {
             client: reqwest::blocking::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(
@@ -95,16 +113,8 @@ impl SignalChannel {
                 .timeout(std::time::Duration::from_secs(SIGNAL_HTTP_TIMEOUT_SECS))
                 .build()
                 .expect("failed to build Signal HTTP client"),
-            typing_indicator_url: validate_signal_url(
-                &Self::typing_indicator_url_for(&base_url, &phone_number),
-                "signal typing indicator",
-                true,
-            ),
-            receipts_url: validate_signal_url(
-                &Self::receipts_url_for(&base_url, &phone_number),
-                "signal receipt",
-                true,
-            ),
+            typing_indicator_url,
+            receipts_url,
             base_url,
             phone_number,
         }
