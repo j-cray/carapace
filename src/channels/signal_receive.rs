@@ -180,6 +180,9 @@ pub async fn signal_receive_loop(
             break;
         }
 
+        // Re-read the activity policy each poll so config reloads can flip
+        // Signal read-receipt ownership promptly. With config caching enabled
+        // this stays cheap in normal runtime paths.
         let activity_policy = crate::channels::activity::load_channel_activity_policy("signal");
         let receive_url = build_receive_url(
             &base_url,

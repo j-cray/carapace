@@ -14,6 +14,8 @@ use crate::plugins::{
 
 /// Maximum media size to fetch and base64-encode (50 MB).
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
+const SIGNAL_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
+const SIGNAL_HTTP_TIMEOUT_SECS: u64 = 15;
 
 /// A channel plugin that delivers messages via the signal-cli REST API.
 pub struct SignalChannel {
@@ -48,7 +50,13 @@ impl SignalChannel {
         }
 
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(
+                    SIGNAL_HTTP_CONNECT_TIMEOUT_SECS,
+                ))
+                .timeout(std::time::Duration::from_secs(SIGNAL_HTTP_TIMEOUT_SECS))
+                .build()
+                .expect("failed to build Signal HTTP client"),
             base_url,
             phone_number,
         }

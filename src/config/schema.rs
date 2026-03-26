@@ -339,7 +339,44 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
 
     if let Some(typing) = features_obj.get("typing") {
         let typing_path = format!("{}.typing", path);
-        let Some(typing_obj) = typing.as_object() else {
+        if let Some(typing_obj) = typing.as_object() {
+            if let Some(enabled) = typing_obj.get("enabled") {
+                if !enabled.is_boolean() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.enabled", typing_path),
+                        message: "typing enabled must be a boolean".to_string(),
+                    });
+                }
+            }
+
+            if let Some(mode) = typing_obj.get("mode").and_then(|value| value.as_str()) {
+                if mode != "thinking" {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.mode", typing_path),
+                        message: format!("typing mode should be \"thinking\", got \"{}\"", mode),
+                    });
+                }
+            } else if let Some(mode) = typing_obj.get("mode") {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!("{}.mode", typing_path),
+                    message: format!(
+                        "typing mode must be a string, got {}",
+                        json_type_label(mode)
+                    ),
+                });
+            }
+
+            if let Some(interval) = typing_obj.get("intervalSeconds") {
+                check_positive_integer(
+                    interval,
+                    &format!("{}.intervalSeconds", typing_path),
+                    issues,
+                );
+            }
+        } else {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
                 path: typing_path,
@@ -348,44 +385,6 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
                     json_type_label(typing)
                 ),
             });
-            return;
-        };
-
-        if let Some(enabled) = typing_obj.get("enabled") {
-            if !enabled.is_boolean() {
-                issues.push(SchemaIssue {
-                    severity: Severity::Warning,
-                    path: format!("{}.enabled", typing_path),
-                    message: "typing enabled must be a boolean".to_string(),
-                });
-            }
-        }
-
-        if let Some(mode) = typing_obj.get("mode").and_then(|value| value.as_str()) {
-            if mode != "thinking" {
-                issues.push(SchemaIssue {
-                    severity: Severity::Warning,
-                    path: format!("{}.mode", typing_path),
-                    message: format!("typing mode should be \"thinking\", got \"{}\"", mode),
-                });
-            }
-        } else if let Some(mode) = typing_obj.get("mode") {
-            issues.push(SchemaIssue {
-                severity: Severity::Warning,
-                path: format!("{}.mode", typing_path),
-                message: format!(
-                    "typing mode must be a string, got {}",
-                    json_type_label(mode)
-                ),
-            });
-        }
-
-        if let Some(interval) = typing_obj.get("intervalSeconds") {
-            check_positive_integer(
-                interval,
-                &format!("{}.intervalSeconds", typing_path),
-                issues,
-            );
         }
     }
 
@@ -2126,6 +2125,33 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.path == ".channels.signal.features.typing.intervalSeconds"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.readReceipts.enabled"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.readReceipts.mode"));
+    }
+
+    #[test]
+    fn test_channels_features_invalid_typing_shape_still_validates_read_receipts() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": true,
+                        "readReceipts": {
+                            "enabled": "yes",
+                            "mode": "on-receive"
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.typing"));
         assert!(issues
             .iter()
             .any(|issue| issue.path == ".channels.signal.features.readReceipts.enabled"));
