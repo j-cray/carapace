@@ -16,7 +16,9 @@ use crate::plugins::{
 /// Maximum media size to fetch and base64-encode (50 MB).
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
 const SIGNAL_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
-const SIGNAL_HTTP_TIMEOUT_SECS: u64 = 15;
+const SIGNAL_HTTP_ACTIVITY_TIMEOUT_SECS: u64 = 5;
+const SIGNAL_HTTP_SEND_TIMEOUT_SECS: u64 = 15;
+const SIGNAL_HTTP_MEDIA_TIMEOUT_SECS: u64 = 120;
 
 fn is_loopback_host(parsed: &url::Url) -> bool {
     match parsed.host() {
@@ -111,7 +113,6 @@ impl SignalChannel {
                 .connect_timeout(std::time::Duration::from_secs(
                     SIGNAL_HTTP_CONNECT_TIMEOUT_SECS,
                 ))
-                .timeout(std::time::Duration::from_secs(SIGNAL_HTTP_TIMEOUT_SECS))
                 .build()
                 .expect("failed to build Signal HTTP client"),
             typing_indicator_url,
@@ -156,7 +157,13 @@ impl SignalChannel {
             self.client.delete(typing_url)
         };
 
-        match request.json(&body).send() {
+        match request
+            .timeout(std::time::Duration::from_secs(
+                SIGNAL_HTTP_ACTIVITY_TIMEOUT_SECS,
+            ))
+            .json(&body)
+            .send()
+        {
             Ok(resp) if resp.status().is_success() => Ok(()),
             Ok(resp) => Err(signal_http_call_error(
                 "signal typing indicator",
@@ -180,7 +187,15 @@ impl SignalChannel {
             "timestamp": timestamp,
         });
 
-        match self.client.post(receipts_url).json(&body).send() {
+        match self
+            .client
+            .post(receipts_url)
+            .timeout(std::time::Duration::from_secs(
+                SIGNAL_HTTP_ACTIVITY_TIMEOUT_SECS,
+            ))
+            .json(&body)
+            .send()
+        {
             Ok(resp) if resp.status().is_success() => Ok(()),
             Ok(resp) => Err(signal_http_call_error("signal read receipt", resp.status())),
             Err(err) => Err(BindingError::CallError(format!(
@@ -268,7 +283,14 @@ impl ChannelPluginInstance for SignalChannel {
             }
         };
 
-        let media_bytes = match self.client.get(media_request_url).send() {
+        let media_bytes = match self
+            .client
+            .get(media_request_url)
+            .timeout(std::time::Duration::from_secs(
+                SIGNAL_HTTP_MEDIA_TIMEOUT_SECS,
+            ))
+            .send()
+        {
             Ok(resp) if resp.status().is_success() => {
                 if let Some(len) = resp.content_length() {
                     if len > MAX_MEDIA_BYTES {
@@ -367,7 +389,15 @@ impl SignalChannel {
             }
         };
 
-        match self.client.post(send_url).json(body).send() {
+        match self
+            .client
+            .post(send_url)
+            .timeout(std::time::Duration::from_secs(
+                SIGNAL_HTTP_SEND_TIMEOUT_SECS,
+            ))
+            .json(body)
+            .send()
+        {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {

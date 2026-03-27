@@ -843,6 +843,62 @@ mod tests {
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_delivery_result_skips_read_receipt_when_policy_disabled() {
+        let mock = Arc::new(MockChannel::with_read_receipts());
+        let (pipeline, plugin_reg, _channel_reg) =
+            make_pipeline_and_registries("signal", Some(mock.clone()), true);
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("carapace.json5");
+        fs::write(&config_path, "{}").unwrap();
+        crate::config::clear_cache();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+
+        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+        let message = pipeline
+            .get_message(&queued.message_id)
+            .expect("queued message should be available");
+
+        handle_delivery_result(
+            &pipeline,
+            &plugin_reg,
+            "signal",
+            &message.message.metadata,
+            &queued.message_id,
+            Ok(plugins::DeliveryResult {
+                ok: true,
+                message_id: Some("sent-1".to_string()),
+                error: None,
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            pipeline.get_status(&queued.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Sent)
+        );
+        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn test_apply_message_hook_overrides_preserves_runtime_read_receipt() {
         let mut message = OutboundMessage::new("signal", MessageContent::text("hello"));

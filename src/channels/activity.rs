@@ -357,10 +357,20 @@ fn reserve_task_stop(stop_state: &AtomicU8) -> bool {
 }
 
 fn stop_fallback_needed(stop_state: &AtomicU8) -> bool {
-    matches!(
-        stop_state.swap(STOP_STATE_FALLBACK_RESERVED, Ordering::AcqRel),
-        STOP_STATE_NOT_REQUESTED | STOP_STATE_TASK_RESERVED
-    )
+    for expected in [STOP_STATE_NOT_REQUESTED, STOP_STATE_TASK_RESERVED] {
+        if stop_state
+            .compare_exchange(
+                expected,
+                STOP_STATE_FALLBACK_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn mark_stop_completed(stop_state: &AtomicU8) {
@@ -863,10 +873,14 @@ mod tests {
     fn test_stop_fallback_needed_skips_when_task_stop_worker_is_running() {
         let stop_state = AtomicU8::new(STOP_STATE_TASK_RUNNING);
         assert!(!stop_fallback_needed(&stop_state));
-        assert_eq!(
-            stop_state.load(Ordering::Acquire),
-            STOP_STATE_FALLBACK_RESERVED
-        );
+        assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_TASK_RUNNING);
+    }
+
+    #[test]
+    fn test_stop_fallback_needed_preserves_completed_state() {
+        let stop_state = AtomicU8::new(STOP_STATE_COMPLETED);
+        assert!(!stop_fallback_needed(&stop_state));
+        assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);
     }
 
     #[tokio::test]

@@ -1270,7 +1270,13 @@ pub async fn execute_run(
                         run.read_receipt_context.clone(),
                     )
                 })
-                .unwrap_or((None, None))
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        "agent run missing from registry before delivery finalization"
+                    );
+                    (None, None)
+                })
         };
 
         finalize_run(
