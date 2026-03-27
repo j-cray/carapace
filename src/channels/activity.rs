@@ -343,9 +343,6 @@ pub async fn maybe_start_typing_loop(
         }
 
         if reserve_task_stop(task_stop_state.as_ref()) {
-            if task_stop_state.load(Ordering::Acquire) != STOP_STATE_TASK_RESERVED {
-                return;
-            }
             if let Err(err) =
                 invoke_stop_typing_with_running_state(plugin, ctx, task_stop_state).await
             {
@@ -435,6 +432,38 @@ async fn invoke_stop_typing_with_running_state(
     result
 }
 
+pub async fn maybe_send_read_receipt_with_plugin(
+    plugin: Arc<dyn ChannelPluginInstance>,
+    channel_id: &str,
+    policy: &ChannelActivityPolicy,
+    supports_read_receipts: Option<bool>,
+    ctx: ReadReceiptContext,
+) {
+    if !policy.read_receipts.enabled || policy.read_receipts.mode != ReadReceiptMode::AfterResponse
+    {
+        return;
+    }
+
+    let supports_read_receipts = match supports_read_receipts {
+        Some(supported) => supported,
+        None => match get_capabilities(plugin.clone()).await {
+            Ok(capabilities) => capabilities.read_receipts,
+            Err(err) => {
+                tracing::warn!(channel = %channel_id, error = %err, "failed to fetch channel capabilities for read receipt");
+                return;
+            }
+        },
+    };
+
+    if !supports_read_receipts {
+        return;
+    }
+
+    if let Err(err) = invoke_mark_read(plugin, ctx).await {
+        tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
+    }
+}
+
 pub async fn maybe_send_read_receipt(
     plugin_registry: &Arc<PluginRegistry>,
     channel_id: &str,
@@ -450,17 +479,7 @@ pub async fn maybe_send_read_receipt(
         return;
     };
 
-    match get_capabilities(plugin.clone()).await {
-        Ok(capabilities) if capabilities.read_receipts => {
-            if let Err(err) = invoke_mark_read(plugin, ctx).await {
-                tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
-            }
-        }
-        Ok(_) => {}
-        Err(err) => {
-            tracing::warn!(channel = %channel_id, error = %err, "failed to fetch channel capabilities for read receipt");
-        }
-    }
+    maybe_send_read_receipt_with_plugin(plugin, channel_id, policy, None, ctx).await;
 }
 
 async fn get_capabilities(

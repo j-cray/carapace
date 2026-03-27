@@ -144,10 +144,10 @@ fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static s
 fn build_receive_url(
     base_url: &str,
     phone_number: &str,
-    disable_auto_read_receipts: bool,
+    carapace_manages_read_receipts: bool,
 ) -> String {
     let encoded_phone_number = urlencoding::encode(phone_number);
-    if disable_auto_read_receipts {
+    if carapace_manages_read_receipts {
         format!(
             "{}/v1/receive/{}?send_read_receipts=false",
             base_url, encoded_phone_number
@@ -300,7 +300,7 @@ pub async fn signal_receive_loop(
             changed = config_rx.changed() => {
                 if changed.is_err() {
                     warn!("Signal receive loop config subscription closed unexpectedly");
-                    break;
+                    continue;
                 }
                 activity_policy =
                     crate::channels::activity::load_channel_activity_policy_async("signal").await;

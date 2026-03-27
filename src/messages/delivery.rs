@@ -115,6 +115,30 @@ async fn process_channel_messages(
         };
 
         let metadata = &message.metadata;
+        let read_receipts_supported = if metadata.read_receipt.is_some() {
+            let capability_plugin = plugin.clone();
+            match tokio::task::spawn_blocking(move || capability_plugin.get_capabilities()).await {
+                Ok(Ok(capabilities)) => Some(capabilities.read_receipts),
+                Ok(Err(err)) => {
+                    warn!(
+                        channel = %channel_id,
+                        error = %err,
+                        "failed to fetch channel capabilities for read receipt"
+                    );
+                    None
+                }
+                Err(err) => {
+                    warn!(
+                        channel = %channel_id,
+                        error = %err,
+                        "read receipt capability worker failed"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let result = deliver_message(
             &plugin,
@@ -155,7 +179,8 @@ async fn process_channel_messages(
 
         handle_delivery_result(
             pipeline,
-            plugin_registry,
+            &plugin,
+            read_receipts_supported,
             channel_id,
             &message.metadata,
             &message_id,
@@ -168,7 +193,8 @@ async fn process_channel_messages(
 /// Handle the result of a message delivery attempt.
 async fn handle_delivery_result(
     pipeline: &MessagePipeline,
-    plugin_registry: &Arc<PluginRegistry>,
+    plugin: &Arc<dyn plugins::ChannelPluginInstance>,
+    read_receipts_supported: Option<bool>,
     channel_id: &str,
     metadata: &crate::messages::outbound::MessageMetadata,
     message_id: &crate::messages::outbound::MessageId,
@@ -183,10 +209,11 @@ async fn handle_delivery_result(
                 // impact stays bounded.
                 let policy =
                     crate::channels::activity::load_channel_activity_policy_async(channel_id).await;
-                crate::channels::activity::maybe_send_read_receipt(
-                    plugin_registry,
+                crate::channels::activity::maybe_send_read_receipt_with_plugin(
+                    plugin.clone(),
                     channel_id,
                     &policy,
+                    read_receipts_supported,
                     read_receipt,
                 )
                 .await;
@@ -731,7 +758,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_handle_delivery_result_marks_read_after_success_when_enabled() {
         let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, plugin_reg, _channel_reg) =
+        let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
 
         let temp = tempfile::tempdir().unwrap();
@@ -773,10 +800,12 @@ mod tests {
         let message = pipeline
             .get_message(&queued.message_id)
             .expect("queued message should be available");
+        let plugin: Arc<dyn ChannelPluginInstance> = mock.clone();
 
         handle_delivery_result(
             &pipeline,
-            &plugin_reg,
+            &plugin,
+            Some(true),
             "signal",
             &message.message.metadata,
             &queued.message_id,
@@ -861,7 +890,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_handle_delivery_result_skips_read_receipt_on_delivery_failure() {
         let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, plugin_reg, _channel_reg) =
+        let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
@@ -879,10 +908,12 @@ mod tests {
         let message = pipeline
             .get_message(&queued.message_id)
             .expect("queued message should be available");
+        let plugin: Arc<dyn ChannelPluginInstance> = mock.clone();
 
         handle_delivery_result(
             &pipeline,
-            &plugin_reg,
+            &plugin,
+            Some(true),
             "signal",
             &message.message.metadata,
             &queued.message_id,
@@ -908,7 +939,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_handle_delivery_result_skips_read_receipt_when_policy_disabled() {
         let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, plugin_reg, _channel_reg) =
+        let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
 
         let temp = tempfile::tempdir().unwrap();
@@ -935,10 +966,12 @@ mod tests {
         let message = pipeline
             .get_message(&queued.message_id)
             .expect("queued message should be available");
+        let plugin: Arc<dyn ChannelPluginInstance> = mock.clone();
 
         handle_delivery_result(
             &pipeline,
-            &plugin_reg,
+            &plugin,
+            Some(true),
             "signal",
             &message.message.metadata,
             &queued.message_id,
