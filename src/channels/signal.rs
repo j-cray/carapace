@@ -271,8 +271,7 @@ fn redact_sensitive_signal_token(token: &str) -> String {
         && trimmed
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '='))
-        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
-        && digit_count >= 4;
+        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic());
     let sensitive_numeric =
         (phone_like_numeric && digit_count >= 4) || (bare_numeric && digit_count >= 7);
     if sensitive_numeric || looks_like_uuid || looks_like_opaque_token {
@@ -663,6 +662,17 @@ mod tests {
         assert!(message.contains("[redacted]"));
         assert!(!message.contains("123e4567-e89b-12d3-a456-426614174000"));
         assert!(!message.contains("abcdefgh12345678ijklmnop87654321"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_low_digit_opaque_tokens() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "credential abcdefghijklmnopqrstuvwxYZAB",
+        );
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("abcdefghijklmnopqrstuvwxYZAB"));
     }
 
     #[test]

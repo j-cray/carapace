@@ -195,8 +195,17 @@ pub fn resolve_channel_activity_policy(config: &Value, channel: &str) -> Channel
 }
 
 pub fn load_channel_activity_policy(channel: &str) -> ChannelActivityPolicy {
-    let config =
-        crate::config::load_raw_config_shared().unwrap_or_else(|_| Arc::new(serde_json::json!({})));
+    let config = match crate::config::load_raw_config_shared() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(
+                channel = %channel,
+                error = %err,
+                "failed to load config for channel activity policy; using disabled defaults"
+            );
+            Arc::new(serde_json::json!({}))
+        }
+    };
     resolve_channel_activity_policy(config.as_ref(), channel)
 }
 
@@ -705,6 +714,26 @@ mod tests {
             policy.typing.interval_seconds,
             DEFAULT_TYPING_INTERVAL_SECONDS
         );
+    }
+
+    #[test]
+    fn test_load_channel_activity_policy_falls_back_to_defaults_on_load_error() {
+        crate::config::clear_cache();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard
+            .set(
+                "CARAPACE_CONFIG_PATH",
+                std::path::Path::new("/definitely/missing/carapace.json5").as_os_str(),
+            )
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+
+        let policy = load_channel_activity_policy("signal");
+        assert!(!policy.typing.enabled);
+        assert_eq!(
+            policy.typing.interval_seconds,
+            DEFAULT_TYPING_INTERVAL_SECONDS
+        );
+        assert!(!policy.read_receipts.enabled);
     }
 
     #[tokio::test(flavor = "current_thread")]
