@@ -256,14 +256,20 @@ pub(crate) fn load_raw_config_shared() -> Result<Arc<Value>, ConfigError> {
     Ok(shared)
 }
 
-/// Return the currently cached explicit user config without forcing a disk reload.
+/// Return the currently cached explicit user config if the cache entry is still fresh.
 ///
-/// Unlike `load_raw_config_shared`, this ignores cache TTL expiry. Callers that
-/// only need the latest already-loaded snapshot can use this to stay off hot
-/// async paths and rely on explicit config reloads to refresh the cache.
-pub(crate) fn peek_raw_config_shared() -> Option<Arc<Value>> {
+/// Unlike `load_raw_config_shared`, this never forces a disk reload. Callers can
+/// use it on hot async paths to avoid unnecessary blocking work, while still
+/// honoring the configured cache TTL.
+pub(crate) fn peek_fresh_raw_config_shared() -> Option<Arc<Value>> {
+    let ttl = get_cache_ttl()?;
     let cache = CONFIG_CACHE.read();
-    cache.as_ref().map(|cached| Arc::clone(&cached.raw_value))
+    let cached = cache.as_ref()?;
+    if cached.loaded_at.elapsed() < ttl {
+        Some(Arc::clone(&cached.raw_value))
+    } else {
+        None
+    }
 }
 
 /// Load config without using the cache.

@@ -187,7 +187,7 @@ pub fn load_channel_activity_policy(channel: &str) -> ChannelActivityPolicy {
 }
 
 pub async fn load_channel_activity_policy_async(channel: &str) -> ChannelActivityPolicy {
-    if let Some(config) = crate::config::peek_raw_config_shared() {
+    if let Some(config) = crate::config::peek_fresh_raw_config_shared() {
         return resolve_channel_activity_policy(config.as_ref(), channel);
     }
 
@@ -586,6 +586,56 @@ mod tests {
         let policy = load_channel_activity_policy_async("signal").await;
         assert!(policy.typing.enabled);
         assert_eq!(policy.typing.interval_seconds, 7);
+
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_load_channel_activity_policy_async_refreshes_stale_cache_from_disk() {
+        crate::config::clear_cache();
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("carapace.json5");
+        fs::write(
+            &config_path,
+            r#"{
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": false
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .unset("CARAPACE_DISABLE_CONFIG_CACHE")
+            .set("CARAPACE_CONFIG_CACHE_MS", "1");
+
+        crate::config::update_cache(
+            serde_json::json!({
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": true
+                            }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({}),
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let policy = load_channel_activity_policy_async("signal").await;
+        assert!(!policy.typing.enabled);
 
         crate::config::clear_cache();
     }

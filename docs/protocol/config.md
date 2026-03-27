@@ -356,11 +356,8 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `session.typingMode`: `"thinking"` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config)
 - `session.typingIntervalSeconds`: `3` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config)
 - `session.mainKey`: `"main"` (enforced even if another value is supplied)
-- `channels.defaults.features.typing.enabled`: `false`
-- `channels.defaults.features.typing.mode`: `"thinking"`
-- `channels.defaults.features.typing.intervalSeconds`: `3`
-- `channels.defaults.features.readReceipts.enabled`: `false`
-- `channels.defaults.features.readReceipts.mode`: `"after-response"`
+- Channel typing activity defaults: typing is disabled by default; when enabled by `channels.defaults.features.typing` or `channels.<channel>.features.typing`, the default mode is `"thinking"` with a `3`-second interval.
+- Channel read-receipt activity defaults: read receipts are disabled by default; when enabled by `channels.defaults.features.readReceipts` or `channels.<channel>.features.readReceipts`, the default mode is `"after-response"`.
 - `cron.maxConcurrentRuns`: `2`
 - `gateway.port`: `18789`
 - `gateway.bind`: `"loopback"`

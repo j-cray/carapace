@@ -116,9 +116,12 @@ fn build_signal_read_receipt_context(
     data_message: &SignalDataMessage,
     sender: &str,
 ) -> Option<ReadReceiptContext> {
-    envelope
+    // Signal read receipts identify the original message by its data-message
+    // timestamp. Fall back to the outer envelope timestamp only for message
+    // shapes where the data-message timestamp is absent.
+    data_message
         .timestamp
-        .or(data_message.timestamp)
+        .or(envelope.timestamp)
         .map(|timestamp| ReadReceiptContext {
             recipient: sender.to_string(),
             timestamp: Some(timestamp),
@@ -607,6 +610,28 @@ mod tests {
         )
         .expect("timestamp should produce read receipt context");
         assert_eq!(ctx.recipient, "+15559876543");
+        assert_eq!(ctx.timestamp, Some(1706745600000));
+    }
+
+    #[test]
+    fn test_build_signal_read_receipt_context_prefers_data_message_timestamp() {
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: Some(1706745600999),
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: Some(1706745600000),
+                group_info: None,
+            }),
+        };
+
+        let ctx = build_signal_read_receipt_context(
+            &envelope,
+            envelope.data_message.as_ref().unwrap(),
+            "+15559876543",
+        )
+        .expect("timestamp should produce read receipt context");
         assert_eq!(ctx.timestamp, Some(1706745600000));
     }
 
