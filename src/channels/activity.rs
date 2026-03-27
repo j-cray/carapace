@@ -20,8 +20,10 @@ use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
-const STOP_STATE_IN_PROGRESS: u8 = 1;
-const STOP_STATE_COMPLETED: u8 = 2;
+const STOP_STATE_TASK_RESERVED: u8 = 1;
+const STOP_STATE_TASK_RUNNING: u8 = 2;
+const STOP_STATE_FALLBACK_RESERVED: u8 = 3;
+const STOP_STATE_COMPLETED: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -321,11 +323,15 @@ pub async fn maybe_start_typing_loop(
             }
         }
 
-        if begin_task_stop(task_stop_state.as_ref()) {
-            if let Err(err) = invoke_stop_typing(plugin, ctx).await {
+        if reserve_task_stop(task_stop_state.as_ref()) {
+            if task_stop_state.load(Ordering::Acquire) != STOP_STATE_TASK_RESERVED {
+                return;
+            }
+            if let Err(err) =
+                invoke_stop_typing_with_running_state(plugin, ctx, task_stop_state).await
+            {
                 tracing::warn!(channel = %channel_id, error = %err, "failed to stop typing indicator");
             }
-            mark_stop_completed(task_stop_state.as_ref());
         }
     });
 
@@ -339,11 +345,11 @@ pub async fn maybe_start_typing_loop(
     })
 }
 
-fn begin_task_stop(stop_state: &AtomicU8) -> bool {
+fn reserve_task_stop(stop_state: &AtomicU8) -> bool {
     stop_state
         .compare_exchange(
             STOP_STATE_NOT_REQUESTED,
-            STOP_STATE_IN_PROGRESS,
+            STOP_STATE_TASK_RESERVED,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -351,11 +357,29 @@ fn begin_task_stop(stop_state: &AtomicU8) -> bool {
 }
 
 fn stop_fallback_needed(stop_state: &AtomicU8) -> bool {
-    stop_state.swap(STOP_STATE_IN_PROGRESS, Ordering::AcqRel) != STOP_STATE_COMPLETED
+    matches!(
+        stop_state.swap(STOP_STATE_FALLBACK_RESERVED, Ordering::AcqRel),
+        STOP_STATE_NOT_REQUESTED | STOP_STATE_TASK_RESERVED
+    )
 }
 
 fn mark_stop_completed(stop_state: &AtomicU8) {
     stop_state.store(STOP_STATE_COMPLETED, Ordering::Release);
+}
+
+async fn invoke_stop_typing_with_running_state(
+    plugin: Arc<dyn ChannelPluginInstance>,
+    ctx: TypingContext,
+    stop_state: Arc<AtomicU8>,
+) -> Result<(), BindingError> {
+    let stop_task = tokio::task::spawn_blocking(move || plugin.stop_typing(ctx));
+    stop_state.store(STOP_STATE_TASK_RUNNING, Ordering::Release);
+    let result = stop_task
+        .await
+        .map_err(|err| BindingError::CallError(err.to_string()))
+        .and_then(|result| result);
+    mark_stop_completed(stop_state.as_ref());
+    result
 }
 
 pub async fn maybe_send_read_receipt(
@@ -792,7 +816,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_maybe_start_typing_loop_drop_stops_when_cleanup_was_in_progress() {
+    async fn test_maybe_start_typing_loop_drop_stops_when_cleanup_was_only_reserved() {
         let stop_typing_notify = Arc::new(Notify::new());
         let plugin = Arc::new(MockChannel::with_stop_typing_notify(
             ChannelCapabilities {
@@ -826,13 +850,23 @@ mod tests {
 
         handle
             .stop_state
-            .store(STOP_STATE_IN_PROGRESS, Ordering::Release);
+            .store(STOP_STATE_TASK_RESERVED, Ordering::Release);
         drop(handle);
         tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
             .await
-            .expect("drop should still stop typing when prior cleanup was only in progress");
+            .expect("drop should still stop typing when task cleanup was only reserved");
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_stop_fallback_needed_skips_when_task_stop_worker_is_running() {
+        let stop_state = AtomicU8::new(STOP_STATE_TASK_RUNNING);
+        assert!(!stop_fallback_needed(&stop_state));
+        assert_eq!(
+            stop_state.load(Ordering::Acquire),
+            STOP_STATE_FALLBACK_RESERVED
+        );
     }
 
     #[tokio::test]

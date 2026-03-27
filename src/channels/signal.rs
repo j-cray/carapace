@@ -195,6 +195,21 @@ fn signal_http_call_error(operation: &str, status: StatusCode) -> BindingError {
     BindingError::CallError(format!("{operation} HTTP {status}"))
 }
 
+fn signal_http_error_message_with_body_prefix(
+    operation: &str,
+    status: StatusCode,
+    body_text: &str,
+) -> String {
+    let excerpt: String = body_text.trim().chars().take(256).collect();
+    if excerpt.is_empty() {
+        format!("{operation} HTTP {status}")
+    } else if body_text.chars().count() > 256 {
+        format!("{operation} HTTP {status}: {excerpt}...")
+    } else {
+        format!("{operation} HTTP {status}: {excerpt}")
+    }
+}
+
 impl ChannelPluginInstance for SignalChannel {
     fn get_info(&self) -> Result<ChannelInfo, BindingError> {
         Ok(ChannelInfo {
@@ -367,10 +382,15 @@ impl SignalChannel {
                     })
                 } else {
                     let retryable = status.is_server_error();
+                    let body_text = resp.text().unwrap_or_default();
                     Ok(DeliveryResult {
                         ok: false,
                         message_id: None,
-                        error: Some(format!("signal send HTTP {status}")),
+                        error: Some(signal_http_error_message_with_body_prefix(
+                            "signal send",
+                            status,
+                            &body_text,
+                        )),
                         retryable,
                         conversation_id: None,
                         to_jid: None,
@@ -484,6 +504,19 @@ mod tests {
         assert!(!result.ok);
         assert!(result.retryable, "connection failures should be retryable");
         assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn test_signal_http_error_message_with_body_prefix_truncates_body() {
+        let body = "x".repeat(300);
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            &body,
+        );
+        assert!(message.starts_with("signal send HTTP 400 Bad Request: "));
+        assert!(message.ends_with("..."));
+        assert!(message.len() < 320);
     }
 
     #[test]
