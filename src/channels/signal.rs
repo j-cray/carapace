@@ -251,7 +251,23 @@ fn redact_sensitive_signal_token(token: &str) -> String {
         .chars()
         .all(|ch| ch.is_ascii_digit());
     let digit_count = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
-    if numeric && digit_count >= 4 {
+    let looks_like_uuid = {
+        let parts: Vec<&str> = trimmed.split('-').collect();
+        parts.len() == 5
+            && [8, 4, 4, 4, 12]
+                .iter()
+                .zip(parts.iter())
+                .all(|(len, part)| {
+                    part.len() == *len && part.chars().all(|ch| ch.is_ascii_hexdigit())
+                })
+    };
+    let looks_like_opaque_token = trimmed.len() >= 24
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '='))
+        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
+        && digit_count >= 4;
+    if (numeric && digit_count >= 4) || looks_like_uuid || looks_like_opaque_token {
         "[redacted]".to_string()
     } else {
         token.to_string()
@@ -604,6 +620,18 @@ mod tests {
         );
         assert!(message.contains("2024-01-01"));
         assert!(message.contains("ref-1234"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_uuid_and_opaque_token_identifiers() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "device 123e4567-e89b-12d3-a456-426614174000 token abcdefgh12345678ijklmnop87654321",
+        );
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(!message.contains("abcdefgh12345678ijklmnop87654321"));
     }
 
     #[test]

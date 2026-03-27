@@ -1198,7 +1198,7 @@ pub async fn execute_run(
         }
     }
 
-    let typing_handle = if let (Some(channel_id), Some(plugin_registry)) =
+    let mut typing_handle = if let (Some(channel_id), Some(plugin_registry)) =
         (message_channel.as_deref(), state.plugin_registry())
     {
         let policy =
@@ -1297,6 +1297,10 @@ pub async fn execute_run(
             &config.output_sanitizer.csp_policy,
         );
 
+        if let Some(handle) = typing_handle.take() {
+            handle.stop().await;
+        }
+
         // 5. Deliver response to originating channel if requested
         if let Some(text) = delivery_text {
             if !text.is_empty() {
@@ -1384,11 +1388,18 @@ mod tests {
     use crate::agent::provider::{LlmProvider, StopReason, StreamEvent, TokenUsage};
     use crate::agent::vertex::build_gemini_body as build_vertex_gemini_body;
     use crate::agent::AgentConfig;
+    use crate::channels::activity::maybe_send_read_receipt;
+    use crate::plugins::{
+        BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, OutboundContext,
+        PluginRegistry, ReadReceiptContext, TypingContext,
+    };
     use crate::server::ws::{WsServerConfig, WsServerState};
     use crate::sessions;
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use std::sync::Arc;
     use tokio::sync::mpsc;
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     /// Mock LLM provider that returns canned responses.
@@ -1509,6 +1520,82 @@ mod tests {
                 }
             });
             Ok(rx)
+        }
+    }
+
+    struct ActivityRecordingChannel {
+        events: Mutex<Vec<&'static str>>,
+        mark_read_notify: Notify,
+    }
+
+    impl ActivityRecordingChannel {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                mark_read_notify: Notify::new(),
+            }
+        }
+
+        fn record(&self, event: &'static str) {
+            self.events.lock().push(event);
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().clone()
+        }
+    }
+
+    impl ChannelPluginInstance for ActivityRecordingChannel {
+        fn get_info(&self) -> Result<crate::plugins::ChannelInfo, BindingError> {
+            Ok(crate::plugins::ChannelInfo {
+                id: "signal".to_string(),
+                label: "Signal".to_string(),
+                selection_label: "Signal Channel".to_string(),
+                docs_path: "".to_string(),
+                blurb: "".to_string(),
+                order: 0,
+            })
+        }
+
+        fn get_capabilities(&self) -> Result<ChannelCapabilities, BindingError> {
+            Ok(ChannelCapabilities {
+                typing_indicators: true,
+                read_receipts: true,
+                ..Default::default()
+            })
+        }
+
+        fn send_text(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
+            self.record("send");
+            Ok(DeliveryResult {
+                ok: true,
+                message_id: Some("sent-1".to_string()),
+                error: None,
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            })
+        }
+
+        fn send_media(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
+            unreachable!("executor lifecycle test only sends text")
+        }
+
+        fn start_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
+            self.record("start");
+            Ok(())
+        }
+
+        fn stop_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
+            self.record("stop");
+            Ok(())
+        }
+
+        fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
+            self.record("read");
+            self.mark_read_notify.notify_one();
+            Ok(())
         }
     }
 
@@ -1821,6 +1908,19 @@ mod tests {
         (Arc::new(state), tmp)
     }
 
+    fn make_test_state_with_plugin_registry(
+        plugin_registry: Arc<PluginRegistry>,
+    ) -> (Arc<WsServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = WsServerState::new(WsServerConfig::default())
+            .with_session_store(store)
+            .with_plugin_registry(plugin_registry);
+        (Arc::new(state), tmp)
+    }
+
     /// Helper to set up a session and register an agent run.
     fn setup_session_and_run(
         state: &WsServerState,
@@ -1864,6 +1964,60 @@ mod tests {
         session
     }
 
+    fn setup_session_and_run_with_channel_activity(
+        state: &WsServerState,
+        session_key: &str,
+        run_id: &str,
+        channel: &str,
+        chat_id: &str,
+    ) -> sessions::Session {
+        let metadata = sessions::SessionMetadata {
+            channel: Some(channel.to_string()),
+            chat_id: Some(chat_id.to_string()),
+            ..Default::default()
+        };
+        let session = state
+            .session_store()
+            .get_or_create_session(session_key, metadata)
+            .unwrap();
+        state
+            .session_store()
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+        {
+            use crate::server::ws::{AgentRun, AgentRunStatus};
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(AgentRun {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                delivery_recipient_id: Some(chat_id.to_string()),
+                typing_context: Some(TypingContext {
+                    to: chat_id.to_string(),
+                    ..Default::default()
+                }),
+                read_receipt_context: Some(ReadReceiptContext {
+                    recipient: chat_id.to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                status: AgentRunStatus::Queued,
+                message: "Hello".to_string(),
+                response: String::new(),
+                error: None,
+                created_at: now,
+                started_at: None,
+                completed_at: None,
+                cancel_token: CancellationToken::new(),
+                waiters: Vec::new(),
+            });
+        }
+        session
+    }
+
     #[test]
     fn test_delivery_context_from_registry_returns_none_when_run_missing() {
         let (state, _tmp) = make_test_state();
@@ -1882,6 +2036,7 @@ mod tests {
         let provider = Arc::new(MockProvider::text("Hello world!"));
         let config = AgentConfig {
             max_turns: 5,
+            deliver: true,
             ..Default::default()
         };
 
@@ -1990,6 +2145,98 @@ mod tests {
         let run = registry.get(run_id).unwrap();
         assert_eq!(run.status, crate::server::ws::AgentRunStatus::Completed);
         assert_eq!(run.response, "The time is now.");
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_channel_activity_lifecycle_orders_stop_before_delivery_and_marks_read(
+    ) {
+        crate::config::clear_cache();
+        crate::config::update_cache(
+            serde_json::json!({
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": true,
+                                "intervalSeconds": 30
+                            },
+                            "readReceipts": {
+                                "enabled": true,
+                                "mode": "after-response"
+                            }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({}),
+        );
+
+        let plugin = Arc::new(ActivityRecordingChannel::new());
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin.clone());
+        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry.clone());
+
+        let run_id = "run-channel-activity";
+        let session_key = "test-channel-activity";
+        let chat_id = "+15551234567";
+        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
+
+        let provider = Arc::new(MockProvider::text("Hello world!"));
+        let config = AgentConfig {
+            max_turns: 5,
+            deliver: true,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let queued = state
+            .message_pipeline()
+            .next_for_channel("signal")
+            .expect("execute_run should queue a signal delivery");
+        assert_eq!(
+            queued.message.metadata.recipient_id.as_deref(),
+            Some(chat_id)
+        );
+        let read_receipt = queued
+            .message
+            .metadata
+            .read_receipt
+            .clone()
+            .expect("queued delivery should preserve read receipt metadata");
+
+        plugin
+            .send_text(OutboundContext {
+                to: chat_id.to_string(),
+                text: "Hello world!".to_string(),
+                media_url: None,
+                gif_playback: false,
+                reply_to_id: None,
+                thread_id: None,
+                account_id: None,
+            })
+            .expect("manual delivery should succeed");
+        let policy = crate::channels::activity::load_channel_activity_policy_async("signal").await;
+        maybe_send_read_receipt(&plugin_registry, "signal", &policy, read_receipt).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            plugin.mark_read_notify.notified(),
+        )
+        .await
+        .expect("delivery success should trigger a read receipt");
+
+        assert_eq!(plugin.events(), vec!["start", "stop", "send", "read"]);
+        crate::config::clear_cache();
     }
 
     #[tokio::test]
