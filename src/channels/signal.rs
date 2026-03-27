@@ -5,6 +5,7 @@
 //! methods are sync (called via `spawn_blocking` by the delivery loop).
 
 use base64::Engine;
+use reqwest::StatusCode;
 use uuid::Uuid;
 
 use crate::plugins::{
@@ -157,14 +158,10 @@ impl SignalChannel {
 
         match request.json(&body).send() {
             Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => {
-                let status = resp.status();
-                let body_text = resp.text().unwrap_or_default();
-                Err(BindingError::CallError(format!(
-                    "signal typing indicator HTTP {}: {}",
-                    status, body_text
-                )))
-            }
+            Ok(resp) => Err(signal_http_call_error(
+                "signal typing indicator",
+                resp.status(),
+            )),
             Err(err) => Err(BindingError::CallError(format!(
                 "failed to update signal typing indicator: {}",
                 err
@@ -185,20 +182,17 @@ impl SignalChannel {
 
         match self.client.post(receipts_url).json(&body).send() {
             Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => {
-                let status = resp.status();
-                let body_text = resp.text().unwrap_or_default();
-                Err(BindingError::CallError(format!(
-                    "signal read receipt HTTP {}: {}",
-                    status, body_text
-                )))
-            }
+            Ok(resp) => Err(signal_http_call_error("signal read receipt", resp.status())),
             Err(err) => Err(BindingError::CallError(format!(
                 "failed to send signal read receipt: {}",
                 err
             ))),
         }
     }
+}
+
+fn signal_http_call_error(operation: &str, status: StatusCode) -> BindingError {
+    BindingError::CallError(format!("{operation} HTTP {status}"))
 }
 
 impl ChannelPluginInstance for SignalChannel {
@@ -373,11 +367,10 @@ impl SignalChannel {
                     })
                 } else {
                     let retryable = status.is_server_error();
-                    let body_text = resp.text().unwrap_or_default();
                     Ok(DeliveryResult {
                         ok: false,
                         message_id: None,
-                        error: Some(format!("HTTP {}: {}", status, body_text)),
+                        error: Some(format!("signal send HTTP {status}")),
                         retryable,
                         conversation_id: None,
                         to_jid: None,

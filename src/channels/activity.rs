@@ -3,7 +3,7 @@
 //! This module handles per-channel activity policy (typing indicators and read
 //! receipts) and the runtime helpers that drive those side effects.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,9 +16,12 @@ use tokio_util::sync::CancellationToken;
 use crate::plugins::{
     BindingError, ChannelPluginInstance, PluginRegistry, ReadReceiptContext, TypingContext,
 };
-use crate::runtime_bridge::run_sync_blocking_send;
+use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
+const STOP_STATE_NOT_REQUESTED: u8 = 0;
+const STOP_STATE_IN_PROGRESS: u8 = 1;
+const STOP_STATE_COMPLETED: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -81,7 +84,7 @@ pub struct TypingLoopHandle {
     plugin: Arc<dyn ChannelPluginInstance>,
     ctx: TypingContext,
     channel_id: String,
-    stop_issued: Arc<AtomicBool>,
+    stop_state: Arc<AtomicU8>,
 }
 
 impl std::fmt::Debug for TypingLoopHandle {
@@ -113,18 +116,26 @@ impl Drop for TypingLoopHandle {
                     let plugin = self.plugin.clone();
                     let ctx = self.ctx.clone();
                     let channel_id = self.channel_id.clone();
+                    let stop_state = self.stop_state.clone();
                     if let Err(err) = run_sync_blocking_send(async move {
                         match task.await {
                             Ok(()) => Ok::<(), String>(()),
                             Err(join_err) => {
-                                invoke_stop_typing(plugin, ctx)
-                                    .await
-                                    .map_err(|err| format!(
-                                        "typing task ended unexpectedly ({join_err}); fallback stop_typing also failed: {err}"
-                                    ))?;
-                                Err(format!(
-                                    "typing task ended unexpectedly ({join_err}); sent fallback stop_typing"
-                                ))
+                                if stop_fallback_needed(stop_state.as_ref()) {
+                                    invoke_stop_typing(plugin, ctx)
+                                        .await
+                                        .map_err(|err| format!(
+                                            "typing task ended unexpectedly ({join_err}); fallback stop_typing also failed: {err}"
+                                        ))?;
+                                    mark_stop_completed(stop_state.as_ref());
+                                    Err(format!(
+                                        "typing task ended unexpectedly ({join_err}); sent fallback stop_typing"
+                                    ))
+                                } else {
+                                    Err(format!(
+                                        "typing task ended unexpectedly ({join_err}) after typing cleanup already completed"
+                                    ))
+                                }
                             }
                         }
                     }) {
@@ -140,7 +151,7 @@ impl Drop for TypingLoopHandle {
                 if let Some(task) = self.task.take() {
                     task.abort();
                 }
-                if !self.stop_issued.swap(true, Ordering::AcqRel) {
+                if stop_fallback_needed(self.stop_state.as_ref()) {
                     let plugin = self.plugin.clone();
                     let ctx = self.ctx.clone();
                     let channel_id = self.channel_id.clone();
@@ -155,6 +166,7 @@ impl Drop for TypingLoopHandle {
                             "failed to stop typing indicator after drop"
                         );
                     }
+                    mark_stop_completed(self.stop_state.as_ref());
                 }
             }
         }
@@ -196,18 +208,7 @@ pub async fn load_channel_activity_policy_async(channel: &str) -> ChannelActivit
     }
 
     let channel = channel.to_string();
-    let load_channel = channel.clone();
-    match tokio::task::spawn_blocking(move || load_channel_activity_policy(&load_channel)).await {
-        Ok(policy) => policy,
-        Err(err) => {
-            tracing::warn!(
-                channel = %channel,
-                error = %err,
-                "failed to load channel activity policy asynchronously; falling back to defaults"
-            );
-            ChannelActivityPolicy::default()
-        }
-    }
+    run_blocking_value(move || load_channel_activity_policy(&channel))
 }
 
 fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeaturePolicy) {
@@ -295,15 +296,15 @@ pub async fn maybe_start_typing_loop(
     }
 
     let cancel = CancellationToken::new();
-    let stop_issued = Arc::new(AtomicBool::new(false));
+    let stop_state = Arc::new(AtomicU8::new(STOP_STATE_NOT_REQUESTED));
     let interval_seconds = policy.typing.interval_seconds.max(1);
     let channel_id = channel_id.to_string();
     let handle_channel_id = channel_id.clone();
     let handle_plugin = plugin.clone();
     let handle_ctx = ctx.clone();
-    let handle_stop_issued = stop_issued.clone();
+    let handle_stop_state = stop_state.clone();
     let task_cancel = cancel.clone();
-    let task_stop_issued = stop_issued.clone();
+    let task_stop_state = stop_state.clone();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds as u64));
         interval.tick().await;
@@ -320,10 +321,11 @@ pub async fn maybe_start_typing_loop(
             }
         }
 
-        if !task_stop_issued.swap(true, Ordering::AcqRel) {
+        if begin_task_stop(task_stop_state.as_ref()) {
             if let Err(err) = invoke_stop_typing(plugin, ctx).await {
                 tracing::warn!(channel = %channel_id, error = %err, "failed to stop typing indicator");
             }
+            mark_stop_completed(task_stop_state.as_ref());
         }
     });
 
@@ -333,8 +335,27 @@ pub async fn maybe_start_typing_loop(
         plugin: handle_plugin,
         ctx: handle_ctx,
         channel_id: handle_channel_id,
-        stop_issued: handle_stop_issued,
+        stop_state: handle_stop_state,
     })
+}
+
+fn begin_task_stop(stop_state: &AtomicU8) -> bool {
+    stop_state
+        .compare_exchange(
+            STOP_STATE_NOT_REQUESTED,
+            STOP_STATE_IN_PROGRESS,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn stop_fallback_needed(stop_state: &AtomicU8) -> bool {
+    stop_state.swap(STOP_STATE_IN_PROGRESS, Ordering::AcqRel) != STOP_STATE_COMPLETED
+}
+
+fn mark_stop_completed(stop_state: &AtomicU8) {
+    stop_state.store(STOP_STATE_COMPLETED, Ordering::Release);
 }
 
 pub async fn maybe_send_read_receipt(
@@ -767,6 +788,50 @@ mod tests {
             .expect("drop should stop typing promptly on current-thread runtimes");
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
+        assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_maybe_start_typing_loop_drop_stops_when_cleanup_was_in_progress() {
+        let stop_typing_notify = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel::with_stop_typing_notify(
+            ChannelCapabilities {
+                typing_indicators: true,
+                ..Default::default()
+            },
+            Some(stop_typing_notify.clone()),
+        ));
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register_channel("signal".to_string(), plugin.clone());
+        let policy = ChannelActivityPolicy {
+            typing: TypingFeaturePolicy {
+                enabled: true,
+                interval_seconds: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let handle = maybe_start_typing_loop(
+            registry,
+            "signal",
+            &policy,
+            TypingContext {
+                to: "+15551234567".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("typing loop should start");
+
+        handle
+            .stop_state
+            .store(STOP_STATE_IN_PROGRESS, Ordering::Release);
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
+            .await
+            .expect("drop should still stop typing when prior cleanup was only in progress");
+
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
     }
 

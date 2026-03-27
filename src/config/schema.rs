@@ -349,6 +349,16 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
         return;
     };
 
+    for key in features_obj.keys() {
+        if !matches!(key.as_str(), "typing" | "readReceipts") {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.{}", path, key),
+                message: format!("unknown channel feature '{}'", key),
+            });
+        }
+    }
+
     if let Some(typing) = features_obj.get("typing") {
         let typing_path = format!("{}.typing", path);
         if let Some(typing_obj) = typing.as_object() {
@@ -2247,6 +2257,9 @@ mod tests {
             "channels": {
                 "signal": {
                     "features": {
+                        "readReceipt": {
+                            "enabled": true
+                        },
                         "typing": {
                             "enabled": true,
                             "intervalSecond": 5
@@ -2260,6 +2273,10 @@ mod tests {
             }
         });
         let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(
+            |issue| issue.path == ".channels.signal.features.readReceipt"
+                && issue.message.contains("unknown channel feature")
+        ));
         assert!(issues.iter().any(|issue| issue.path
             == ".channels.signal.features.typing.intervalSecond"
             && issue.message.contains("unknown typing feature key")));

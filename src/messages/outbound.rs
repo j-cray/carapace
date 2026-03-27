@@ -161,6 +161,14 @@ pub struct MessageMetadata {
     pub ttl_ms: u64,
 }
 
+impl MessageMetadata {
+    pub fn preserve_runtime_fields_from(&mut self, previous: &Self) {
+        if self.read_receipt.is_none() {
+            self.read_receipt = previous.read_receipt.clone();
+        }
+    }
+}
+
 /// An outbound message to be delivered
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundMessage {

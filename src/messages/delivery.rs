@@ -237,9 +237,10 @@ fn apply_message_hook_overrides(
     }
 
     if let Some(metadata) = obj.get("metadata") {
-        if let Ok(metadata) =
+        if let Ok(mut metadata) =
             serde_json::from_value::<crate::messages::outbound::MessageMetadata>(metadata.clone())
         {
+            metadata.preserve_runtime_fields_from(&message.metadata);
             message.metadata = metadata;
         }
     }
@@ -840,5 +841,43 @@ mod tests {
             Some(crate::messages::outbound::DeliveryStatus::Failed)
         );
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_apply_message_hook_overrides_preserves_runtime_read_receipt() {
+        let mut message = OutboundMessage::new("signal", MessageContent::text("hello"));
+        message.metadata = crate::messages::outbound::MessageMetadata {
+            recipient_id: Some("+15551234567".to_string()),
+            read_receipt: Some(ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        apply_message_hook_overrides(
+            &mut message,
+            &json!({
+                "metadata": {
+                    "recipient_id": "+15557654321",
+                    "priority": 2
+                }
+            }),
+        );
+
+        assert_eq!(
+            message.metadata.recipient_id.as_deref(),
+            Some("+15557654321")
+        );
+        assert_eq!(message.metadata.priority, 2);
+        assert_eq!(
+            message
+                .metadata
+                .read_receipt
+                .as_ref()
+                .and_then(|ctx| ctx.timestamp),
+            Some(123)
+        );
     }
 }
