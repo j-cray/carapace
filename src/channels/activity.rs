@@ -460,15 +460,9 @@ async fn invoke_stop_typing_with_running_state(
 pub async fn maybe_send_read_receipt_with_plugin(
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: &str,
-    policy: &ChannelActivityPolicy,
     supports_read_receipts: Option<bool>,
     ctx: ReadReceiptContext,
 ) {
-    if !policy.read_receipts.enabled || policy.read_receipts.mode != ReadReceiptMode::AfterResponse
-    {
-        return;
-    }
-
     let supports_read_receipts = match supports_read_receipts {
         Some(supported) => supported,
         None => match get_capabilities(plugin.clone()).await {
@@ -504,7 +498,7 @@ pub async fn maybe_send_read_receipt(
         return;
     };
 
-    maybe_send_read_receipt_with_plugin(plugin, channel_id, policy, None, ctx).await;
+    maybe_send_read_receipt_with_plugin(plugin, channel_id, None, ctx).await;
 }
 
 async fn get_capabilities(

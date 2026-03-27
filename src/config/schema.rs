@@ -76,6 +76,14 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "filesystem",
 ];
 
+/// Built-in channel IDs that currently accept `channels.<id>.features.*`.
+///
+/// Unknown channel IDs remain allowed for forward compatibility, but we use
+/// this set to catch obvious typos in built-in names.
+const BUILTIN_CHANNEL_CONFIG_IDS: &[&str] = &[
+    "console", "signal", "telegram", "discord", "slack", "webhook",
+];
+
 /// Validate a config value against the full schema.
 ///
 /// Returns a (possibly empty) list of issues. Callers should inspect each
@@ -314,6 +322,30 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
             continue;
         };
 
+        if let Some(suggested) = suggest_builtin_channel_id(channel_name) {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.{}", channel_name),
+                message: format!(
+                    "unknown built-in channel id '{}'; did you mean '{}'?",
+                    channel_name, suggested
+                ),
+            });
+        }
+
+        for key in entry_obj.keys() {
+            if key != "features" {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!(".channels.{}.{}", channel_name, key),
+                    message: format!(
+                        "unknown channel config key '{}'; channel activity settings belong under .channels.{}.features",
+                        key, channel_name
+                    ),
+                });
+            }
+        }
+
         if let Some(features) = entry_obj.get("features") {
             validate_channel_features(
                 features,
@@ -322,6 +354,42 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
             );
         }
     }
+}
+
+fn suggest_builtin_channel_id(channel_name: &str) -> Option<&'static str> {
+    BUILTIN_CHANNEL_CONFIG_IDS.iter().copied().find(|builtin| {
+        *builtin != channel_name && bounded_levenshtein(channel_name, builtin, 2) <= 2
+    })
+}
+
+fn bounded_levenshtein(a: &str, b: &str, max_distance: usize) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a == b {
+        return 0;
+    }
+    if a.len().abs_diff(b.len()) > max_distance {
+        return max_distance + 1;
+    }
+
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+
+    for (i, a_byte) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        let mut row_min = curr[0];
+        for (j, b_byte) in b.iter().enumerate() {
+            let cost = usize::from(a_byte != b_byte);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+            row_min = row_min.min(curr[j + 1]);
+        }
+        if row_min > max_distance {
+            return max_distance + 1;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b.len()]
 }
 
 fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
@@ -2184,7 +2252,7 @@ mod tests {
     fn test_unknown_channel_config_entry_is_accepted_for_forward_compatibility() {
         let cfg = json!({
             "channels": {
-                "singal": {
+                "matrix": {
                     "features": {
                         "typing": {
                             "enabled": true
@@ -2195,10 +2263,49 @@ mod tests {
         });
         let issues = validate_schema(&cfg);
         assert!(
-            !issues.iter().any(|issue| issue.path == ".channels.singal"),
+            !issues.iter().any(|issue| issue.path == ".channels.matrix"),
             "unexpected channel-id warning for forward-compatible entry: {:?}",
             issues
         );
+    }
+
+    #[test]
+    fn test_builtin_channel_typo_warns_with_suggestion() {
+        let cfg = json!({
+            "channels": {
+                "singal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.singal" && issue.message.contains("did you mean 'signal'?")
+        }));
+    }
+
+    #[test]
+    fn test_unknown_channel_entry_key_warns() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "feautres": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.signal.feautres"
+                && issue.message.contains("unknown channel config key")
+        }));
     }
 
     #[test]

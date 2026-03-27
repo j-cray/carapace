@@ -235,7 +235,12 @@ pub async fn signal_receive_loop(
                         for item in items {
                             match deserialize_signal_envelope_item(item) {
                                 Ok(envelope) => {
-                                    process_envelope(&envelope, &state).await;
+                                    process_envelope(
+                                        &envelope,
+                                        &state,
+                                        activity_policy.read_receipts.enabled,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     had_parse_error = true;
@@ -316,7 +321,11 @@ pub async fn signal_receive_loop(
 }
 
 /// Process a single inbound Signal envelope by routing it into the chat pipeline.
-async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
+async fn process_envelope(
+    envelope: &SignalEnvelope,
+    state: &Arc<WsServerState>,
+    carapace_manages_read_receipts: bool,
+) {
     let data_message = match &envelope.data_message {
         Some(dm) => dm,
         None => return, // Not a data message (e.g., receipt, typing indicator)
@@ -346,12 +355,20 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
         "Signal inbound message"
     );
 
+    let read_receipt_context = build_signal_read_receipt_context(envelope, data_message, &sender);
+    if carapace_manages_read_receipts && read_receipt_context.is_none() {
+        warn!(
+            sender = %sender,
+            "Signal read receipts are enabled but this message did not include a timestamp; Carapace cannot acknowledge it explicitly"
+        );
+    }
+
     let options = crate::channels::inbound::InboundDispatchOptions {
         typing_context: Some(TypingContext {
             to: peer_id.clone(),
             ..Default::default()
         }),
-        read_receipt_context: build_signal_read_receipt_context(envelope, data_message, &sender),
+        read_receipt_context,
         ..Default::default()
     };
 

@@ -1198,11 +1198,17 @@ pub async fn execute_run(
         }
     }
 
-    let mut typing_handle = if let (Some(channel_id), Some(plugin_registry)) =
-        (message_channel.as_deref(), state.plugin_registry())
-    {
-        let policy =
-            crate::channels::activity::load_channel_activity_policy_async(channel_id).await;
+    let channel_activity_policy = if let Some(channel_id) = message_channel.as_deref() {
+        Some(crate::channels::activity::load_channel_activity_policy_async(channel_id).await)
+    } else {
+        None
+    };
+
+    let mut typing_handle = if let (Some(channel_id), Some(plugin_registry), Some(policy)) = (
+        message_channel.as_deref(),
+        state.plugin_registry(),
+        channel_activity_policy.as_ref(),
+    ) {
         let typing_context = {
             let registry = state.agent_run_registry.lock();
             registry
@@ -1225,7 +1231,7 @@ pub async fn execute_run(
                 crate::channels::activity::maybe_start_typing_loop(
                     plugin_registry.clone(),
                     channel_id,
-                    &policy,
+                    policy,
                     ctx,
                 )
                 .await
@@ -1307,9 +1313,19 @@ pub async fn execute_run(
                 let recipient_id =
                     delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
                 if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
+                    let read_receipt = channel_activity_policy.as_ref().and_then(|policy| {
+                        if policy.read_receipts.enabled
+                            && policy.read_receipts.mode
+                                == crate::channels::activity::ReadReceiptMode::AfterResponse
+                        {
+                            read_receipt_context.clone()
+                        } else {
+                            None
+                        }
+                    });
                     let metadata = crate::messages::outbound::MessageMetadata {
                         recipient_id: Some(chat_id),
-                        read_receipt: read_receipt_context,
+                        read_receipt,
                         ..Default::default()
                     };
                     let outbound = crate::messages::outbound::OutboundMessage::new(
@@ -2221,6 +2237,55 @@ mod tests {
         .expect("delivery success should trigger a read receipt");
 
         assert_eq!(plugin.events(), vec!["start", "stop", "send", "read"]);
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_channel_activity_skips_queueing_read_receipt_when_policy_disabled() {
+        crate::config::clear_cache();
+        crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
+
+        let plugin = Arc::new(ActivityRecordingChannel::new());
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin);
+        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry);
+        state.channel_registry().register(
+            crate::channels::ChannelInfo::new("signal", "Signal")
+                .with_status(crate::channels::ChannelStatus::Connected),
+        );
+
+        let run_id = "run-channel-activity-disabled";
+        let session_key = "test-channel-activity-disabled";
+        let chat_id = "+15551234567";
+        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
+
+        let provider = Arc::new(MockProvider::text("Hello world!"));
+        let config = AgentConfig {
+            max_turns: 5,
+            deliver: true,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let queued = state
+            .message_pipeline()
+            .next_for_channel("signal")
+            .expect("execute_run should queue a signal delivery");
+        assert!(
+            queued.message.metadata.read_receipt.is_none(),
+            "read receipt metadata should only be queued when the channel activity policy enables it"
+        );
+
         crate::config::clear_cache();
     }
 

@@ -204,15 +204,12 @@ async fn handle_delivery_result(
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
-                // Keep read receipts ordered with delivery success and shutdown,
-                // but rely on short per-operation channel timeouts so the queue
-                // impact stays bounded.
-                let policy =
-                    crate::channels::activity::load_channel_activity_policy_async(channel_id).await;
+                // Keep read receipts ordered with delivery success and shutdown.
+                // Policy decisions are made before queueing so the delivery loop
+                // does not reload config on its hot path.
                 crate::channels::activity::maybe_send_read_receipt_with_plugin(
                     plugin.clone(),
                     channel_id,
-                    &policy,
                     read_receipts_supported,
                     read_receipt,
                 )
@@ -834,30 +831,6 @@ mod tests {
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
 
-        let temp = tempfile::tempdir().unwrap();
-        let config_path = temp.path().join("carapace.json5");
-        fs::write(
-            &config_path,
-            r#"{
-                channels: {
-                    signal: {
-                        features: {
-                            readReceipts: {
-                                enabled: true,
-                                mode: "after-response",
-                            },
-                        },
-                    },
-                },
-            }"#,
-        )
-        .unwrap();
-        crate::config::clear_cache();
-        let mut env_guard = crate::test_support::env::ScopedEnv::new();
-        env_guard
-            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
-            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
-
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
                 recipient_id: Some("+15551234567".to_string()),
@@ -937,28 +910,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_handle_delivery_result_skips_read_receipt_when_policy_disabled() {
+    async fn test_handle_delivery_result_skips_read_receipt_when_metadata_absent() {
         let mock = Arc::new(MockChannel::with_read_receipts());
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
 
-        let temp = tempfile::tempdir().unwrap();
-        let config_path = temp.path().join("carapace.json5");
-        fs::write(&config_path, "{}").unwrap();
-        crate::config::clear_cache();
-        let mut env_guard = crate::test_support::env::ScopedEnv::new();
-        env_guard
-            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
-            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
-
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
                 recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                }),
                 ..Default::default()
             },
         );
