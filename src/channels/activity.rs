@@ -3,6 +3,7 @@
 //! This module handles per-channel activity policy (typing indicators and read
 //! receipts) and the runtime helpers that drive those side effects.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,6 +81,7 @@ pub struct TypingLoopHandle {
     plugin: Arc<dyn ChannelPluginInstance>,
     ctx: TypingContext,
     channel_id: String,
+    stop_issued: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for TypingLoopHandle {
@@ -138,19 +140,21 @@ impl Drop for TypingLoopHandle {
                 if let Some(task) = self.task.take() {
                     task.abort();
                 }
-                let plugin = self.plugin.clone();
-                let ctx = self.ctx.clone();
-                let channel_id = self.channel_id.clone();
-                if let Err(err) = run_sync_blocking_send(async move {
-                    invoke_stop_typing(plugin, ctx)
-                        .await
-                        .map_err(|err| err.to_string())
-                }) {
-                    tracing::warn!(
-                        channel = %channel_id,
-                        error = %err,
-                        "failed to stop typing indicator after drop"
-                    );
+                if !self.stop_issued.swap(true, Ordering::AcqRel) {
+                    let plugin = self.plugin.clone();
+                    let ctx = self.ctx.clone();
+                    let channel_id = self.channel_id.clone();
+                    if let Err(err) = run_sync_blocking_send(async move {
+                        invoke_stop_typing(plugin, ctx)
+                            .await
+                            .map_err(|err| err.to_string())
+                    }) {
+                        tracing::warn!(
+                            channel = %channel_id,
+                            error = %err,
+                            "failed to stop typing indicator after drop"
+                        );
+                    }
                 }
             }
         }
@@ -291,12 +295,15 @@ pub async fn maybe_start_typing_loop(
     }
 
     let cancel = CancellationToken::new();
+    let stop_issued = Arc::new(AtomicBool::new(false));
     let interval_seconds = policy.typing.interval_seconds.max(1);
     let channel_id = channel_id.to_string();
     let handle_channel_id = channel_id.clone();
     let handle_plugin = plugin.clone();
     let handle_ctx = ctx.clone();
+    let handle_stop_issued = stop_issued.clone();
     let task_cancel = cancel.clone();
+    let task_stop_issued = stop_issued.clone();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds as u64));
         interval.tick().await;
@@ -313,8 +320,10 @@ pub async fn maybe_start_typing_loop(
             }
         }
 
-        if let Err(err) = invoke_stop_typing(plugin, ctx).await {
-            tracing::warn!(channel = %channel_id, error = %err, "failed to stop typing indicator");
+        if !task_stop_issued.swap(true, Ordering::AcqRel) {
+            if let Err(err) = invoke_stop_typing(plugin, ctx).await {
+                tracing::warn!(channel = %channel_id, error = %err, "failed to stop typing indicator");
+            }
         }
     });
 
@@ -324,6 +333,7 @@ pub async fn maybe_start_typing_loop(
         plugin: handle_plugin,
         ctx: handle_ctx,
         channel_id: handle_channel_id,
+        stop_issued: handle_stop_issued,
     })
 }
 

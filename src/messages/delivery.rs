@@ -160,12 +160,13 @@ async fn process_channel_messages(
             &message.metadata,
             &message_id,
             result,
-        );
+        )
+        .await;
     }
 }
 
 /// Handle the result of a message delivery attempt.
-fn handle_delivery_result(
+async fn handle_delivery_result(
     pipeline: &MessagePipeline,
     plugin_registry: &Arc<PluginRegistry>,
     channel_id: &str,
@@ -177,20 +178,15 @@ fn handle_delivery_result(
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
-                let plugin_registry = Arc::clone(plugin_registry);
-                let channel_id = channel_id.to_string();
-                tokio::spawn(async move {
-                    let policy =
-                        crate::channels::activity::load_channel_activity_policy_async(&channel_id)
-                            .await;
-                    crate::channels::activity::maybe_send_read_receipt(
-                        &plugin_registry,
-                        &channel_id,
-                        &policy,
-                        read_receipt,
-                    )
-                    .await;
-                });
+                let policy =
+                    crate::channels::activity::load_channel_activity_policy_async(channel_id).await;
+                crate::channels::activity::maybe_send_read_receipt(
+                    plugin_registry,
+                    channel_id,
+                    &policy,
+                    read_receipt,
+                )
+                .await;
             }
         }
         Ok(delivery) => {
@@ -377,13 +373,6 @@ mod tests {
                 mark_read_notify: None,
                 fail: false,
                 retryable: false,
-            }
-        }
-
-        fn with_read_receipts_and_notify(notify: Arc<Notify>) -> Self {
-            Self {
-                mark_read_notify: Some(notify),
-                ..Self::with_read_receipts()
             }
         }
     }
@@ -736,12 +725,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_delivery_marks_read_after_success_when_enabled() {
-        let mark_read_notify = Arc::new(Notify::new());
-        let mock = Arc::new(MockChannel::with_read_receipts_and_notify(
-            mark_read_notify.clone(),
-        ));
-        let (pipeline, plugin_reg, channel_reg) =
+    async fn test_handle_delivery_result_marks_read_after_success_when_enabled() {
+        let mock = Arc::new(MockChannel::with_read_receipts());
+        let (pipeline, plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
 
         let temp = tempfile::tempdir().unwrap();
@@ -779,25 +765,80 @@ mod tests {
                 ..Default::default()
             },
         );
-        pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+        let message = pipeline
+            .get_message(&queued.message_id)
+            .expect("queued message should be available");
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
+        handle_delivery_result(
+            &pipeline,
+            &plugin_reg,
+            "signal",
+            &message.message.metadata,
+            &queued.message_id,
+            Ok(plugins::DeliveryResult {
+                ok: true,
+                message_id: Some("sent-1".to_string()),
+                error: None,
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            }),
+        )
+        .await;
 
-        let pl = pipeline.clone();
-        let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
-            .await
-            .expect("read receipt should be dispatched");
-        let _ = shutdown_tx.send(true);
-        pipeline.notifier().notify_one();
-        let _ = handle.await;
-
+        assert_eq!(
+            pipeline.get_status(&queued.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Sent)
+        );
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_delivery_result_skips_read_receipt_on_delivery_failure() {
+        let mock = Arc::new(MockChannel::with_read_receipts());
+        let (pipeline, plugin_reg, _channel_reg) =
+            make_pipeline_and_registries("signal", Some(mock.clone()), true);
+
+        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+        let message = pipeline
+            .get_message(&queued.message_id)
+            .expect("queued message should be available");
+
+        handle_delivery_result(
+            &pipeline,
+            &plugin_reg,
+            "signal",
+            &message.message.metadata,
+            &queued.message_id,
+            Ok(plugins::DeliveryResult {
+                ok: false,
+                message_id: None,
+                error: Some("send failed".to_string()),
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            pipeline.get_status(&queued.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Failed)
+        );
+        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
     }
 }

@@ -352,6 +352,15 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
     if let Some(typing) = features_obj.get("typing") {
         let typing_path = format!("{}.typing", path);
         if let Some(typing_obj) = typing.as_object() {
+            for key in typing_obj.keys() {
+                if !matches!(key.as_str(), "enabled" | "mode" | "intervalSeconds") {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.{}", typing_path, key),
+                        message: format!("unknown typing feature key '{}'", key),
+                    });
+                }
+            }
             if let Some(enabled) = typing_obj.get("enabled") {
                 if !enabled.is_boolean() {
                     issues.push(SchemaIssue {
@@ -403,6 +412,15 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
     if let Some(read_receipts) = features_obj.get("readReceipts") {
         let read_receipts_path = format!("{}.readReceipts", path);
         if let Some(read_receipts_obj) = read_receipts.as_object() {
+            for key in read_receipts_obj.keys() {
+                if !matches!(key.as_str(), "enabled" | "mode") {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.{}", read_receipts_path, key),
+                        message: format!("unknown readReceipts feature key '{}'", key),
+                    });
+                }
+            }
             if let Some(enabled) = read_receipts_obj.get("enabled") {
                 if !enabled.is_boolean() {
                     issues.push(SchemaIssue {
@@ -2221,6 +2239,33 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.path == ".channels.signal.features.readReceipts.mode"));
+    }
+
+    #[test]
+    fn test_channels_features_unknown_keys_warn() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true,
+                            "intervalSecond": 5
+                        },
+                        "readReceipts": {
+                            "enabled": true,
+                            "extra": true
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| issue.path
+            == ".channels.signal.features.typing.intervalSecond"
+            && issue.message.contains("unknown typing feature key")));
+        assert!(issues.iter().any(|issue| issue.path
+            == ".channels.signal.features.readReceipts.extra"
+            && issue.message.contains("unknown readReceipts feature key")));
     }
 
     // --- cron ---
