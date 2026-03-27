@@ -307,7 +307,10 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
                 path: format!(".channels.{}", channel_name),
-                message: format!("unknown channel config key '{}'", channel_name),
+                message: format!(
+                    "unrecognized built-in channel id '{}'; external/plugin channel entries are accepted here but channel-specific features currently only apply to built-in channels",
+                    channel_name
+                ),
             });
         }
 
@@ -2176,7 +2179,7 @@ mod tests {
         });
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|issue| issue.path == ".channels.singal"
-            && issue.message.contains("unknown channel config key")));
+            && issue.message.contains("unrecognized built-in channel id")));
     }
 
     #[test]

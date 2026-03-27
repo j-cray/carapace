@@ -668,6 +668,48 @@ mod tests {
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_maybe_start_typing_loop_drop_cancels_background_task_current_thread() {
+        let stop_typing_notify = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel::with_stop_typing_notify(
+            ChannelCapabilities {
+                typing_indicators: true,
+                ..Default::default()
+            },
+            Some(stop_typing_notify.clone()),
+        ));
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register_channel("signal".to_string(), plugin.clone());
+        let policy = ChannelActivityPolicy {
+            typing: TypingFeaturePolicy {
+                enabled: true,
+                interval_seconds: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let handle = maybe_start_typing_loop(
+            registry,
+            "signal",
+            &policy,
+            TypingContext {
+                to: "+15551234567".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("typing loop should start");
+
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
+            .await
+            .expect("drop should stop typing promptly on current-thread runtimes");
+
+        assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
+        assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn test_maybe_send_read_receipt_honors_capability() {
         let plugin = Arc::new(MockChannel::new(ChannelCapabilities {

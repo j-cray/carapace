@@ -26,6 +26,10 @@ service HTTP port 18789. Adjust paths/ports for your deployment.
 - Signal’s REST API defaults to port 8080; this is separate from the Carapace port.
 - Channel activity features are configured under `channels.defaults.features.*`
   and `channels.<channel>.features.*`.
+- Today those channel-specific activity settings are implemented for built-in
+  native channels; external/plugin channel entries are accepted for forward
+  compatibility but may be ignored until plugin channel activity capabilities
+  are added.
 - `session.typingMode` and `session.typingIntervalSeconds` remain as a
   legacy/global fallback for typing only when you explicitly set them in
   config; prefer `channels.*.features.typing`.
