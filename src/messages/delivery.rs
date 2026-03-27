@@ -243,7 +243,7 @@ fn apply_message_hook_overrides(
         if let Ok(mut metadata) =
             serde_json::from_value::<crate::messages::outbound::MessageMetadata>(metadata.clone())
         {
-            metadata.preserve_runtime_fields_from(&message.metadata);
+            metadata.restore_runtime_only_fields_from(&message.metadata);
             message.metadata = metadata;
         }
     }

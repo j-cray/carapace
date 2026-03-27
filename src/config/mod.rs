@@ -824,6 +824,17 @@ pub fn update_cache(raw_value: Value, value: Value) {
     broadcast_config_change();
 }
 
+#[cfg(test)]
+pub(crate) fn update_cache_for_test_with_age(raw_value: Value, value: Value, age: Duration) {
+    let mut cache = CONFIG_CACHE.write();
+    *cache = Some(CachedConfig {
+        value: Arc::new(value),
+        raw_value: Arc::new(raw_value),
+        loaded_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+    });
+    broadcast_config_change();
+}
+
 pub fn subscribe_config_changes() -> tokio::sync::watch::Receiver<u64> {
     CONFIG_CHANGE_TX.subscribe()
 }

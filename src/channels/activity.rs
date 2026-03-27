@@ -718,7 +718,7 @@ mod tests {
             .unset("CARAPACE_DISABLE_CONFIG_CACHE")
             .set("CARAPACE_CONFIG_CACHE_MS", "1");
 
-        crate::config::update_cache(
+        crate::config::update_cache_for_test_with_age(
             serde_json::json!({
                 "channels": {
                     "signal": {
@@ -731,9 +731,8 @@ mod tests {
                 }
             }),
             serde_json::json!({}),
+            Duration::from_secs(1),
         );
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
         let policy = load_channel_activity_policy_async("signal").await;
         assert!(!policy.typing.enabled);

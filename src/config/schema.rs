@@ -2,7 +2,6 @@
 
 use serde_json::Value;
 
-use crate::channels::BUILTIN_CHANNEL_IDS;
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
 
 /// Severity of a schema validation issue.
@@ -303,17 +302,6 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
     };
 
     for (channel_name, entry) in channels {
-        if channel_name != "defaults" && !BUILTIN_CHANNEL_IDS.contains(&channel_name.as_str()) {
-            issues.push(SchemaIssue {
-                severity: Severity::Warning,
-                path: format!(".channels.{}", channel_name),
-                message: format!(
-                    "unrecognized built-in channel id '{}'; external/plugin channel entries are accepted here but channel-specific features currently only apply to built-in channels",
-                    channel_name
-                ),
-            });
-        }
-
         let Some(entry_obj) = entry.as_object() else {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -2193,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_channel_config_key_warns() {
+    fn test_unknown_channel_config_entry_is_accepted_for_forward_compatibility() {
         let cfg = json!({
             "channels": {
                 "singal": {
@@ -2206,8 +2194,11 @@ mod tests {
             }
         });
         let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|issue| issue.path == ".channels.singal"
-            && issue.message.contains("unrecognized built-in channel id")));
+        assert!(
+            !issues.iter().any(|issue| issue.path == ".channels.singal"),
+            "unexpected channel-id warning for forward-compatible entry: {:?}",
+            issues
+        );
     }
 
     #[test]

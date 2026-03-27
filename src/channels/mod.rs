@@ -3,11 +3,6 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
-// Keep this list in sync with the built-in channel modules registered by the host.
-pub const BUILTIN_CHANNEL_IDS: &[&str] = &[
-    "console", "signal", "telegram", "discord", "slack", "webhook",
-];
-
 pub mod activity;
 pub mod console;
 pub mod discord;

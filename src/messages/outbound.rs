@@ -164,10 +164,12 @@ pub struct MessageMetadata {
 }
 
 impl MessageMetadata {
-    pub fn preserve_runtime_fields_from(&mut self, previous: &Self) {
-        if self.read_receipt.is_none() {
-            self.read_receipt = previous.read_receipt.clone();
-        }
+    /// Restore runtime-only metadata after deserializing hook overrides.
+    ///
+    /// `read_receipt` is intentionally skipped across serialization boundaries,
+    /// so hook output can never preserve it on its own.
+    pub fn restore_runtime_only_fields_from(&mut self, previous: &Self) {
+        self.read_receipt = previous.read_receipt.clone();
     }
 }
 

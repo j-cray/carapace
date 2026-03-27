@@ -243,7 +243,15 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
 }
 
 fn redact_sensitive_signal_token(token: &str) -> String {
-    if token.chars().filter(|ch| ch.is_ascii_digit()).count() >= 4 {
+    let trimmed =
+        token.trim_matches(|ch: char| ch.is_ascii_punctuation() && ch != '+' && ch != '-');
+    let numeric = trimmed
+        .strip_prefix('+')
+        .unwrap_or(trimmed)
+        .chars()
+        .all(|ch| ch.is_ascii_digit());
+    let digit_count = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
+    if numeric && digit_count >= 4 {
         "[redacted]".to_string()
     } else {
         token.to_string()
@@ -575,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn test_signal_http_error_message_redacts_numeric_tokens() {
+    fn test_signal_http_error_message_redacts_phone_like_and_numeric_tokens() {
         let message = signal_http_error_message_with_body_prefix(
             "signal send",
             StatusCode::BAD_REQUEST,
@@ -585,6 +593,17 @@ mod tests {
         assert!(message.contains("[redacted]"));
         assert!(!message.contains("15551234567"));
         assert!(!message.contains("123456"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_preserves_non_numeric_diagnostics() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "failed at 2024-01-01 for ref-1234",
+        );
+        assert!(message.contains("2024-01-01"));
+        assert!(message.contains("ref-1234"));
     }
 
     #[test]
