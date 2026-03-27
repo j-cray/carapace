@@ -418,8 +418,8 @@ async fn invoke_stop_typing_with_running_state(
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
 ) -> Result<(), BindingError> {
-    let stop_task = tokio::task::spawn_blocking(move || plugin.stop_typing(ctx));
     stop_state.store(STOP_STATE_TASK_RUNNING, Ordering::Release);
+    let stop_task = tokio::task::spawn_blocking(move || plugin.stop_typing(ctx));
     let result = stop_task
         .await
         .map_err(|err| BindingError::CallError(err.to_string()))

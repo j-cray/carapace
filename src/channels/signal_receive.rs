@@ -198,7 +198,8 @@ pub async fn signal_receive_loop(
         .expect("failed to build Signal receive HTTP client");
     info!(phone_number = %phone_number, "Signal receive loop started");
     let mut config_rx = crate::config::subscribe_config_changes();
-    let mut activity_policy = crate::channels::activity::load_channel_activity_policy("signal");
+    let mut activity_policy =
+        crate::channels::activity::load_channel_activity_policy_async("signal").await;
 
     // Track consecutive transport and parse errors to avoid spamming logs.
     let mut consecutive_errors: u32 = 0;
@@ -301,7 +302,8 @@ pub async fn signal_receive_loop(
                     info!("Signal receive loop config subscription closed");
                     break;
                 }
-                activity_policy = crate::channels::activity::load_channel_activity_policy("signal");
+                activity_policy =
+                    crate::channels::activity::load_channel_activity_policy_async("signal").await;
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
