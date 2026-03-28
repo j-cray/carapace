@@ -1352,20 +1352,20 @@ pub async fn execute_run(
                 let recipient_id =
                     delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
                 if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
-                    let read_receipt = channel_activity_policy.as_ref().and_then(|policy| {
-                        if policy.read_receipts.enabled
-                            && policy.read_receipts.mode
-                                == crate::channels::activity::ReadReceiptMode::AfterResponse
-                            && channel_capabilities
-                                .as_ref()
-                                .map(|capabilities| capabilities.read_receipts)
-                                .unwrap_or(false)
-                        {
-                            read_receipt_context.clone()
-                        } else {
-                            None
-                        }
-                    });
+                    let read_receipt = if channel_capabilities
+                        .as_ref()
+                        .map(|capabilities| capabilities.read_receipts)
+                        .unwrap_or(false)
+                    {
+                        // Presence of read_receipt_context snapshots the receive-time
+                        // decision that Carapace owns the explicit ack for this
+                        // message. Preserve that context across later config changes
+                        // so we do not drop acknowledgements after auto-receipts were
+                        // already suppressed upstream.
+                        read_receipt_context.clone()
+                    } else {
+                        None
+                    };
                     let metadata = crate::messages::outbound::MessageMetadata {
                         recipient_id: Some(chat_id),
                         read_receipt,
@@ -2284,7 +2284,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_run_channel_activity_skips_queueing_read_receipt_when_policy_disabled() {
+    async fn test_execute_run_channel_activity_preserves_receive_time_read_receipt_context_when_policy_disables_later(
+    ) {
         crate::config::clear_cache();
         crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
 
@@ -2325,8 +2326,8 @@ mod tests {
             .next_for_channel("signal")
             .expect("execute_run should queue a signal delivery");
         assert!(
-            queued.message.metadata.read_receipt.is_none(),
-            "read receipt metadata should only be queued when the channel activity policy enables it"
+            queued.message.metadata.read_receipt.is_some(),
+            "receive-time read receipt context should be preserved even if policy is later disabled"
         );
 
         crate::config::clear_cache();

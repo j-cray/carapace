@@ -455,7 +455,9 @@ async fn invoke_stop_typing_with_running_state(
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
 ) -> Result<(), BindingError> {
-    let stop_task = spawn_stop_typing_worker(plugin, ctx, stop_state);
+    let Some(stop_task) = spawn_stop_typing_worker(plugin, ctx, stop_state) else {
+        return Ok(());
+    };
     let result = stop_task
         .await
         .map_err(|err| BindingError::CallError(err.to_string()))
@@ -467,16 +469,27 @@ fn spawn_stop_typing_worker(
     plugin: Arc<dyn ChannelPluginInstance>,
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
-) -> tokio::task::JoinHandle<Result<(), BindingError>> {
-    stop_state.store(STOP_STATE_TASK_RUNNING, Ordering::Release);
-    tokio::task::spawn_blocking(move || {
+) -> Option<tokio::task::JoinHandle<Result<(), BindingError>>> {
+    if stop_state
+        .compare_exchange(
+            STOP_STATE_TASK_RESERVED,
+            STOP_STATE_TASK_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return None;
+    }
+
+    Some(tokio::task::spawn_blocking(move || {
         let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
         mark_stop_completed(stop_state.as_ref());
         match result {
             Ok(result) => result,
             Err(payload) => resume_unwind(payload),
         }
-    })
+    }))
 }
 
 pub async fn maybe_send_read_receipt_with_plugin(
@@ -1060,6 +1073,26 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+        assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);
+    }
+
+    #[test]
+    fn test_spawn_stop_typing_worker_requires_reserved_state() {
+        let plugin = Arc::new(MockChannel::new(ChannelCapabilities {
+            typing_indicators: true,
+            ..Default::default()
+        }));
+        let stop_state = Arc::new(AtomicU8::new(STOP_STATE_COMPLETED));
+        let worker = spawn_stop_typing_worker(
+            plugin,
+            TypingContext {
+                to: "+15551234567".to_string(),
+                ..Default::default()
+            },
+            stop_state.clone(),
+        );
+
+        assert!(worker.is_none());
         assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);
     }
 
