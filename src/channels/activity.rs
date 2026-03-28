@@ -149,6 +149,10 @@ impl ActivityDispatcher {
         let stop_typing_worker = thread::Builder::new()
             .name("carapace-stop-typing".to_string())
             .spawn(move || {
+                // Stop-typing is cleanup, not optional side work. Keep this
+                // queue unbounded so completion bursts cannot drop stop signals;
+                // the queue is still naturally bounded by the number of active
+                // typing loops in the process.
                 while let Ok(request) = stop_typing_rx.recv() {
                     dispatch_stop_typing_blocking(
                         request.plugin,

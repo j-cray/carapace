@@ -291,6 +291,10 @@ fn redact_sensitive_signal_token(token: &str) -> String {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '='))
         && character_class_count >= 2;
+    // Keep the bare-numeric threshold higher than the labeled-phone regexes so
+    // common short diagnostics like ports, byte counts, and small status codes
+    // remain visible in operator logs. Shorter sensitive numerics should be
+    // caught by the contextual/labeled redaction passes above.
     let sensitive_numeric =
         (phone_like_numeric && digit_count >= 4) || (bare_numeric && digit_count >= 7);
     if sensitive_numeric || looks_like_uuid || looks_like_hex_secret || looks_like_opaque_token {
