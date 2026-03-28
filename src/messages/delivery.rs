@@ -25,8 +25,6 @@ pub async fn delivery_loop(
     _state: Arc<WsServerState>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let activity_dispatcher = crate::channels::activity::ActivityDispatcher::new();
-
     loop {
         // Wait for notification, timeout, or shutdown
         tokio::select! {
@@ -49,12 +47,10 @@ pub async fn delivery_loop(
             &pipeline,
             &plugin_registry,
             &channel_registry,
-            &activity_dispatcher,
+            crate::channels::activity::shared_activity_dispatcher(),
         )
         .await;
     }
-
-    activity_dispatcher.shutdown().await;
 }
 
 /// Process pending messages for each connected channel.
@@ -475,7 +471,7 @@ mod tests {
     }
 
     fn test_activity_dispatcher() -> crate::channels::activity::ActivityDispatcher {
-        crate::channels::activity::ActivityDispatcher::with_queue_capacity(8)
+        crate::channels::activity::ActivityDispatcher::with_queue_capacity(8, 8)
     }
 
     fn make_pipeline_and_registries(
@@ -835,7 +831,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
             .await
             .expect("read receipt should be dispatched asynchronously");
-        dispatcher.shutdown().await;
+        dispatcher.shutdown();
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
@@ -879,7 +875,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
             .await
             .expect("read receipt should be dispatched asynchronously");
-        dispatcher.shutdown().await;
+        dispatcher.shutdown();
 
         assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 1);
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
@@ -931,7 +927,7 @@ mod tests {
             &dispatcher,
         )
         .await;
-        dispatcher.shutdown().await;
+        dispatcher.shutdown();
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
@@ -977,7 +973,7 @@ mod tests {
             &dispatcher,
         )
         .await;
-        dispatcher.shutdown().await;
+        dispatcher.shutdown();
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
@@ -1036,7 +1032,7 @@ mod tests {
         .expect("delivery result handling should not wait for slow read receipt I/O");
 
         tokio::time::sleep(Duration::from_millis(300)).await;
-        dispatcher.shutdown().await;
+        dispatcher.shutdown();
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
     }
 

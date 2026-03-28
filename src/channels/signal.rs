@@ -225,6 +225,12 @@ fn signal_http_error_message_with_body_prefix(
 }
 
 fn sanitize_signal_error_excerpt(body_text: &str) -> String {
+    static LABELED_PHONE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)\b(recipient|source|sender|number)([:=])(\+?\d(?:[\d().:\-]{5,}\d))",
+        )
+        .expect("valid labeled phone regex")
+    });
     static EMBEDDED_PHONE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\+\d(?:[\d().:\-]{5,}\d)").expect("valid embedded phone regex")
     });
@@ -234,6 +240,9 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
         .map(redact_sensitive_signal_token)
         .collect::<Vec<_>>()
         .join(" ");
+    let collapsed = LABELED_PHONE_RE
+        .replace_all(&collapsed, "$1$2[redacted]")
+        .into_owned();
     let collapsed = EMBEDDED_PHONE_RE
         .replace_all(&collapsed, "[redacted]")
         .into_owned();
@@ -641,6 +650,19 @@ mod tests {
     }
 
     #[test]
+    fn test_signal_http_error_message_redacts_labeled_phone_values_without_plus_prefix() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "recipient:15551234567 source=15557654321 rejected by upstream",
+        );
+        assert!(message.contains("recipient:[redacted]"));
+        assert!(message.contains("source=[redacted]"));
+        assert!(!message.contains("15551234567"));
+        assert!(!message.contains("15557654321"));
+    }
+
+    #[test]
     fn test_signal_http_error_message_preserves_non_numeric_diagnostics() {
         let message = signal_http_error_message_with_body_prefix(
             "signal send",
@@ -661,6 +683,18 @@ mod tests {
         assert!(message.contains("8080"));
         assert!(message.contains("1024"));
         assert!(message.contains("4000"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_preserves_non_phone_labeled_numbers() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "ref:1234567890 port:8080 code=4000",
+        );
+        assert!(message.contains("ref:1234567890"));
+        assert!(message.contains("port:8080"));
+        assert!(message.contains("code=4000"));
     }
 
     #[test]

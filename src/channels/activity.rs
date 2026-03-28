@@ -3,15 +3,18 @@
 //! This module handles per-channel activity policy (typing indicators and read
 //! receipts) and the runtime helpers that drive those side effects.
 
+use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc as sync_mpsc;
+use std::sync::{Arc, LazyLock};
+use std::thread;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::runtime::{Handle, RuntimeFlavor};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -23,7 +26,7 @@ use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const READ_RECEIPT_DISPATCH_QUEUE_CAPACITY: usize = 64;
-const READ_RECEIPT_DISPATCH_SHUTDOWN_TIMEOUT_SECONDS: u64 = 10;
+const STOP_TYPING_DISPATCH_QUEUE_CAPACITY: usize = 16;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
@@ -100,9 +103,18 @@ struct ReadReceiptDispatchRequest {
     ctx: ReadReceiptContext,
 }
 
+struct StopTypingDispatchRequest {
+    plugin: Arc<dyn ChannelPluginInstance>,
+    channel_id: String,
+    ctx: TypingContext,
+    stop_state: Arc<AtomicU8>,
+}
+
 pub struct ActivityDispatcher {
-    read_receipt_tx: mpsc::Sender<ReadReceiptDispatchRequest>,
-    read_receipt_worker: Option<JoinHandle<()>>,
+    read_receipt_tx: Mutex<Option<sync_mpsc::SyncSender<ReadReceiptDispatchRequest>>>,
+    read_receipt_worker: Mutex<Option<thread::JoinHandle<()>>>,
+    stop_typing_tx: Mutex<Option<sync_mpsc::SyncSender<StopTypingDispatchRequest>>>,
+    stop_typing_worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Default for ActivityDispatcher {
@@ -113,26 +125,52 @@ impl Default for ActivityDispatcher {
 
 impl ActivityDispatcher {
     pub fn new() -> Self {
-        Self::with_queue_capacity(READ_RECEIPT_DISPATCH_QUEUE_CAPACITY)
+        Self::with_queue_capacity(
+            READ_RECEIPT_DISPATCH_QUEUE_CAPACITY,
+            STOP_TYPING_DISPATCH_QUEUE_CAPACITY,
+        )
     }
 
-    pub(crate) fn with_queue_capacity(capacity: usize) -> Self {
-        let (read_receipt_tx, mut read_receipt_rx) =
-            mpsc::channel::<ReadReceiptDispatchRequest>(capacity);
-        let read_receipt_worker = tokio::spawn(async move {
-            while let Some(request) = read_receipt_rx.recv().await {
-                maybe_send_read_receipt_with_plugin(
-                    request.plugin,
-                    &request.channel_id,
-                    request.ctx,
-                )
-                .await;
-            }
-        });
+    pub(crate) fn with_queue_capacity(
+        read_receipt_capacity: usize,
+        stop_typing_capacity: usize,
+    ) -> Self {
+        let (read_receipt_tx, read_receipt_rx) =
+            sync_mpsc::sync_channel::<ReadReceiptDispatchRequest>(read_receipt_capacity);
+        let read_receipt_worker = thread::Builder::new()
+            .name("carapace-read-receipts".to_string())
+            .spawn(move || {
+                while let Ok(request) = read_receipt_rx.recv() {
+                    dispatch_read_receipt_blocking(
+                        request.plugin,
+                        &request.channel_id,
+                        request.ctx,
+                    );
+                }
+            })
+            .expect("failed to spawn read receipt dispatcher thread");
+
+        let (stop_typing_tx, stop_typing_rx) =
+            sync_mpsc::sync_channel::<StopTypingDispatchRequest>(stop_typing_capacity);
+        let stop_typing_worker = thread::Builder::new()
+            .name("carapace-stop-typing".to_string())
+            .spawn(move || {
+                while let Ok(request) = stop_typing_rx.recv() {
+                    dispatch_stop_typing_blocking(
+                        request.plugin,
+                        &request.channel_id,
+                        request.ctx,
+                        request.stop_state,
+                    );
+                }
+            })
+            .expect("failed to spawn stop typing dispatcher thread");
 
         Self {
-            read_receipt_tx,
-            read_receipt_worker: Some(read_receipt_worker),
+            read_receipt_tx: Mutex::new(Some(read_receipt_tx)),
+            read_receipt_worker: Mutex::new(Some(read_receipt_worker)),
+            stop_typing_tx: Mutex::new(Some(stop_typing_tx)),
+            stop_typing_worker: Mutex::new(Some(stop_typing_worker)),
         }
     }
 
@@ -147,15 +185,23 @@ impl ActivityDispatcher {
             channel_id: channel_id.to_string(),
             ctx,
         };
-        match self.read_receipt_tx.try_send(request) {
+        let Some(sender) = self.read_receipt_tx.lock().as_ref().cloned() else {
+            tracing::warn!(
+                channel = %channel_id,
+                "read receipt dispatcher is shut down; dropping read receipt"
+            );
+            return;
+        };
+
+        match sender.try_send(request) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(sync_mpsc::TrySendError::Full(_)) => {
                 tracing::warn!(
                     channel = %channel_id,
                     "read receipt dispatch queue is full; dropping read receipt"
                 );
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(sync_mpsc::TrySendError::Disconnected(_)) => {
                 tracing::warn!(
                     channel = %channel_id,
                     "read receipt dispatcher is shut down; dropping read receipt"
@@ -164,27 +210,78 @@ impl ActivityDispatcher {
         }
     }
 
-    pub async fn shutdown(mut self) {
-        drop(self.read_receipt_tx);
-        let Some(mut worker) = self.read_receipt_worker.take() else {
+    pub fn try_dispatch_stop_typing(
+        &self,
+        plugin: Arc<dyn ChannelPluginInstance>,
+        channel_id: &str,
+        ctx: TypingContext,
+        stop_state: Arc<AtomicU8>,
+    ) {
+        let request = StopTypingDispatchRequest {
+            plugin,
+            channel_id: channel_id.to_string(),
+            ctx,
+            stop_state: stop_state.clone(),
+        };
+        let Some(sender) = self.stop_typing_tx.lock().as_ref().cloned() else {
+            mark_stop_completed(stop_state.as_ref());
+            tracing::warn!(
+                channel = %channel_id,
+                "stop typing dispatcher is shut down; dropping implicit stop request"
+            );
             return;
         };
 
-        tokio::select! {
-            result = &mut worker => {
-                if let Err(err) = result {
-                    tracing::warn!(error = %err, "read receipt dispatcher exited unexpectedly");
-                }
+        match sender.try_send(request) {
+            Ok(()) => {}
+            Err(sync_mpsc::TrySendError::Full(request)) => {
+                mark_stop_completed(request.stop_state.as_ref());
+                tracing::warn!(
+                    channel = %channel_id,
+                    "stop typing dispatch queue is full; dropping implicit stop request"
+                );
             }
-            _ = tokio::time::sleep(Duration::from_secs(
-                READ_RECEIPT_DISPATCH_SHUTDOWN_TIMEOUT_SECONDS,
-            )) => {
-                worker.abort();
-                let _ = worker.await;
-                tracing::warn!("timed out draining read receipt dispatcher during shutdown");
+            Err(sync_mpsc::TrySendError::Disconnected(request)) => {
+                mark_stop_completed(request.stop_state.as_ref());
+                tracing::warn!(
+                    channel = %channel_id,
+                    "stop typing dispatcher is shut down; dropping implicit stop request"
+                );
             }
         }
     }
+
+    pub fn shutdown(&self) {
+        self.read_receipt_tx.lock().take();
+        self.stop_typing_tx.lock().take();
+
+        if let Some(worker) = self.read_receipt_worker.lock().take() {
+            let result = crate::runtime_bridge::run_blocking_value(move || worker.join());
+            if let Err(payload) = result {
+                tracing::warn!(
+                    error = %panic_payload_to_string(payload),
+                    "read receipt dispatcher thread panicked during shutdown"
+                );
+            }
+        }
+
+        if let Some(worker) = self.stop_typing_worker.lock().take() {
+            let result = crate::runtime_bridge::run_blocking_value(move || worker.join());
+            if let Err(payload) = result {
+                tracing::warn!(
+                    error = %panic_payload_to_string(payload),
+                    "stop typing dispatcher thread panicked during shutdown"
+                );
+            }
+        }
+    }
+}
+
+static SHARED_ACTIVITY_DISPATCHER: LazyLock<ActivityDispatcher> =
+    LazyLock::new(ActivityDispatcher::new);
+
+pub fn shared_activity_dispatcher() -> &'static ActivityDispatcher {
+    &SHARED_ACTIVITY_DISPATCHER
 }
 
 impl std::fmt::Debug for TypingLoopHandle {
@@ -241,26 +338,36 @@ impl Drop for TypingLoopHandle {
                     }
                 }
             }
-            _ => {
+            Ok(handle) => {
                 if let Some(task) = self.task.take() {
                     task.abort();
-                }
-                if stop_fallback_needed(self.stop_state.as_ref()) {
-                    let plugin = self.plugin.clone();
-                    let ctx = self.ctx.clone();
-                    let channel_id = self.channel_id.clone();
-                    if let Err(err) = run_sync_blocking_send(async move {
-                        invoke_stop_typing(plugin, ctx)
-                            .await
-                            .map_err(|err| err.to_string())
-                    }) {
-                        tracing::warn!(
-                            channel = %channel_id,
-                            error = %err,
-                            "failed to stop typing indicator after drop"
+                    // Drain the aborted task on the same runtime so current-thread
+                    // callers do not leak detached typing tasks, while the actual
+                    // stop_typing side effect is handled by the bounded dispatcher.
+                    drop(handle.spawn(async move {
+                        let _ = task.await;
+                    }));
+                    if stop_fallback_needed(self.stop_state.as_ref()) {
+                        shared_activity_dispatcher().try_dispatch_stop_typing(
+                            self.plugin.clone(),
+                            &self.channel_id,
+                            self.ctx.clone(),
+                            self.stop_state.clone(),
                         );
                     }
-                    mark_stop_completed(self.stop_state.as_ref());
+                }
+            }
+            Err(_) => {
+                if let Some(task) = self.task.take() {
+                    task.abort();
+                    if stop_fallback_needed(self.stop_state.as_ref()) {
+                        shared_activity_dispatcher().try_dispatch_stop_typing(
+                            self.plugin.clone(),
+                            &self.channel_id,
+                            self.ctx.clone(),
+                            self.stop_state.clone(),
+                        );
+                    }
                 }
             }
         }
@@ -593,36 +700,15 @@ pub async fn maybe_send_read_receipt_with_plugin(
     channel_id: &str,
     ctx: ReadReceiptContext,
 ) {
-    match get_capabilities(plugin.clone()).await {
-        Ok(capabilities) => {
-            debug_assert!(
-                capabilities.read_receipts,
-                "maybe_send_read_receipt_with_plugin called for a channel without read_receipts capability"
-            );
-            if !capabilities.read_receipts {
-                tracing::warn!(
-                    channel = %channel_id,
-                    "skipping read receipt for a channel without read_receipts capability"
-                );
-                return;
-            }
-        }
-        Err(err) => {
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                false,
-                "failed to load channel capabilities for read-receipt assertion: {err}"
-            );
-            tracing::warn!(
-                channel = %channel_id,
-                error = %err,
-                "failed to load channel capabilities before sending read receipt"
-            );
-        }
-    }
-
-    if let Err(err) = invoke_mark_read(plugin, ctx).await {
-        tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
+    let channel_id = channel_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        send_read_receipt_with_plugin(plugin, &channel_id, ctx);
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(err) if err.is_panic() => resume_unwind(err.into_panic()),
+        Err(err) => tracing::warn!(error = %err, "read receipt worker task failed"),
     }
 }
 
@@ -652,13 +738,89 @@ async fn invoke_stop_typing(
         .map_err(|err| BindingError::CallError(err.to_string()))?
 }
 
-async fn invoke_mark_read(
+fn dispatch_read_receipt_blocking(
     plugin: Arc<dyn ChannelPluginInstance>,
+    channel_id: &str,
     ctx: ReadReceiptContext,
-) -> Result<(), BindingError> {
-    tokio::task::spawn_blocking(move || plugin.mark_read(ctx))
-        .await
-        .map_err(|err| BindingError::CallError(err.to_string()))?
+) {
+    send_read_receipt_with_plugin(plugin, channel_id, ctx);
+}
+
+fn dispatch_stop_typing_blocking(
+    plugin: Arc<dyn ChannelPluginInstance>,
+    channel_id: &str,
+    ctx: TypingContext,
+    stop_state: Arc<AtomicU8>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
+    mark_stop_completed(stop_state.as_ref());
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %err,
+                "failed to stop typing indicator after drop"
+            );
+        }
+        Err(payload) => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %panic_payload_to_string(payload),
+                "stop typing dispatcher panicked"
+            );
+        }
+    }
+}
+
+fn send_read_receipt_with_plugin(
+    plugin: Arc<dyn ChannelPluginInstance>,
+    channel_id: &str,
+    ctx: ReadReceiptContext,
+) {
+    match plugin.get_capabilities() {
+        Ok(capabilities) => {
+            debug_assert!(
+                capabilities.read_receipts,
+                "maybe_send_read_receipt_with_plugin called for a channel without read_receipts capability"
+            );
+            if !capabilities.read_receipts {
+                tracing::warn!(
+                    channel = %channel_id,
+                    "skipping read receipt for a channel without read_receipts capability"
+                );
+                return;
+            }
+        }
+        Err(err) => {
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                false,
+                "failed to load channel capabilities for read-receipt assertion: {err}"
+            );
+            tracing::warn!(
+                channel = %channel_id,
+                error = %err,
+                "failed to load channel capabilities before sending read receipt"
+            );
+            return;
+        }
+    }
+
+    if let Err(err) = plugin.mark_read(ctx) {
+        tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
+    }
+}
+
+fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
+    let payload = payload.as_ref();
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1062,6 +1224,50 @@ mod tests {
             .expect("drop should stop typing promptly on current-thread runtimes");
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
+        assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_maybe_start_typing_loop_drop_does_not_block_current_thread_runtime() {
+        let plugin = Arc::new(MockChannel::with_stop_typing_delay(
+            ChannelCapabilities {
+                typing_indicators: true,
+                ..Default::default()
+            },
+            Duration::from_millis(250),
+        ));
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register_channel("signal".to_string(), plugin.clone());
+        let policy = ChannelActivityPolicy {
+            typing: TypingFeaturePolicy {
+                enabled: true,
+                interval_seconds: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let handle = maybe_start_typing_loop(
+            registry,
+            "signal",
+            &policy,
+            None,
+            TypingContext {
+                to: "+15551234567".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("typing loop should start");
+
+        let started_at = std::time::Instant::now();
+        drop(handle);
+        assert!(
+            started_at.elapsed() < Duration::from_millis(150),
+            "drop should not block the current-thread runtime on slow stop_typing"
+        );
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
     }
 
