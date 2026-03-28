@@ -189,11 +189,9 @@ async fn handle_delivery_result(
             if let Some(read_receipt) = metadata.read_receipt.clone() {
                 // Keep delivery success on the hot path and dispatch read
                 // receipts through the owned activity worker.
-                activity_dispatcher.dispatch_verified_read_receipt(
-                    plugin.clone(),
-                    channel_id,
-                    read_receipt,
-                );
+                activity_dispatcher
+                    .dispatch_verified_read_receipt(plugin.clone(), channel_id, read_receipt)
+                    .await;
             }
         }
         Ok(delivery) => {
@@ -392,13 +390,6 @@ mod tests {
         fn with_read_receipts_notify(mark_read_notify: Arc<Notify>) -> Self {
             Self {
                 mark_read_notify: Some(mark_read_notify),
-                ..Self::with_read_receipts()
-            }
-        }
-
-        fn with_read_receipts_delay(mark_read_delay: Duration) -> Self {
-            Self {
-                mark_read_delay,
                 ..Self::with_read_receipts()
             }
         }
@@ -984,9 +975,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_handle_delivery_result_does_not_block_on_slow_read_receipt_dispatch() {
-        let mock = Arc::new(MockChannel::with_read_receipts_delay(
-            Duration::from_millis(250),
-        ));
+        let mark_read_notify = Arc::new(Notify::new());
+        let mock = Arc::new(MockChannel {
+            mark_read_notify: Some(mark_read_notify.clone()),
+            mark_read_delay: Duration::from_millis(250),
+            ..MockChannel::with_read_receipts()
+        });
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let dispatcher = test_activity_dispatcher();
@@ -1031,7 +1025,10 @@ mod tests {
         .await
         .expect("delivery result handling should not wait for slow read receipt I/O");
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
+        tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
+            .await
+            .expect("read receipt should complete asynchronously after delivery result returns");
         dispatcher.shutdown();
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
     }

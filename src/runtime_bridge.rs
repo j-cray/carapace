@@ -75,6 +75,7 @@ where
     run_in_current_thread_runtime(future)
 }
 
+#[cfg(test)]
 /// Run a synchronous blocking operation from code that may be inside a Tokio runtime.
 ///
 /// - If running inside a multi-threaded Tokio runtime, uses `block_in_place`.

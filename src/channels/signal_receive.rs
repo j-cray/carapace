@@ -143,7 +143,7 @@ fn read_receipt_context_for_signal_run(
     build_signal_read_receipt_context(envelope, data_message, sender)
 }
 
-fn maybe_dispatch_read_receipt_for_ignored_signal_message(
+async fn maybe_dispatch_read_receipt_for_ignored_signal_message(
     state: &Arc<WsServerState>,
     sender: Option<&str>,
     read_receipt_context: Option<ReadReceiptContext>,
@@ -189,11 +189,10 @@ fn maybe_dispatch_read_receipt_for_ignored_signal_message(
         return;
     };
 
-    state.activity_dispatcher().dispatch_verified_read_receipt(
-        plugin,
-        "signal",
-        read_receipt_context,
-    );
+    state
+        .activity_dispatcher()
+        .dispatch_verified_read_receipt(plugin, "signal", read_receipt_context)
+        .await;
 }
 
 fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
@@ -441,7 +440,8 @@ async fn process_envelope(
                 read_receipt_context,
                 carapace_manages_read_receipts,
                 "ignored non-text Signal message",
-            );
+            )
+            .await;
             return;
         } // No text content
     };
@@ -453,7 +453,8 @@ async fn process_envelope(
             read_receipt_context,
             carapace_manages_read_receipts,
             "ignored unsupported Signal group message",
-        );
+        )
+        .await;
         warn!("Ignoring Signal group message: Signal outbound currently supports direct messages only");
         return;
     }
