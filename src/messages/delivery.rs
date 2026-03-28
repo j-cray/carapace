@@ -471,7 +471,7 @@ mod tests {
     }
 
     fn test_activity_dispatcher() -> crate::channels::activity::ActivityDispatcher {
-        crate::channels::activity::ActivityDispatcher::with_queue_capacity(8, 8)
+        crate::channels::activity::ActivityDispatcher::with_queue_capacity(8)
     }
 
     fn make_pipeline_and_registries(

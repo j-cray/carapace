@@ -2263,7 +2263,7 @@ mod tests {
 
         let channel_ids = state.message_pipeline().channels_with_messages();
         assert_eq!(channel_ids, vec!["signal".to_string()]);
-        let dispatcher = crate::channels::activity::ActivityDispatcher::with_queue_capacity(8, 8);
+        let dispatcher = crate::channels::activity::ActivityDispatcher::with_queue_capacity(8);
 
         crate::messages::delivery::process_channel_messages(
             &channel_ids,

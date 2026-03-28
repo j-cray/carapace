@@ -321,6 +321,11 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
     };
 
     for (channel_name, entry) in channels {
+        if channel_name == "defaults" {
+            validate_channel_defaults(entry, issues);
+            continue;
+        }
+
         let Some(entry_obj) = entry.as_object() else {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -332,6 +337,17 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
             });
             continue;
         };
+
+        if let Some(suggested) = suggest_reserved_channel_defaults_key(channel_name) {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.{}", channel_name),
+                message: format!(
+                    "'{}' is not a channel id; did you mean the reserved global defaults key '{}'?",
+                    channel_name, suggested
+                ),
+            });
+        }
 
         if let Some(suggested) = suggest_builtin_channel_id(channel_name) {
             issues.push(SchemaIssue {
@@ -372,6 +388,48 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
                 issues,
             );
         }
+    }
+}
+
+fn validate_channel_defaults(entry: &Value, issues: &mut Vec<SchemaIssue>) {
+    let Some(entry_obj) = entry.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".channels.defaults".to_string(),
+            message: format!(
+                "defaults entry must be an object, got {}",
+                json_type_label(entry)
+            ),
+        });
+        return;
+    };
+
+    for key in entry_obj.keys() {
+        if key != "features" {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.defaults.{}", key),
+                message:
+                    "unknown defaults config key; supported key is .channels.defaults.features"
+                        .to_string(),
+            });
+        }
+    }
+
+    if let Some(features) = entry_obj.get("features") {
+        validate_channel_features(features, ".channels.defaults.features", issues);
+    }
+}
+
+fn suggest_reserved_channel_defaults_key(channel_name: &str) -> Option<&'static str> {
+    if channel_name == "defaults" {
+        return None;
+    }
+
+    if bounded_levenshtein(channel_name, "defaults", 2) <= 2 {
+        Some("defaults")
+    } else {
+        None
     }
 }
 
@@ -2548,6 +2606,53 @@ mod tests {
         assert!(issues.iter().any(|issue| issue.path
             == ".channels.signal.features.readReceipts.extra"
             && issue.message.contains("unknown readReceipts feature key")));
+    }
+
+    #[test]
+    fn test_channels_default_typo_warns_for_reserved_defaults_key() {
+        let cfg = json!({
+            "channels": {
+                "default": {
+                    "features": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.default"
+                && issue
+                    .message
+                    .contains("reserved global defaults key 'defaults'")
+        }));
+    }
+
+    #[test]
+    fn test_channels_defaults_rejects_channel_only_keys() {
+        let cfg = json!({
+            "channels": {
+                "defaults": {
+                    "features": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    },
+                    "session": {
+                        "scope": "dm"
+                    }
+                }
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.defaults.session"
+                && issue.message.contains(".channels.defaults.features")
+        }));
     }
 
     // --- cron ---

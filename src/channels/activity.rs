@@ -26,7 +26,6 @@ use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const READ_RECEIPT_DISPATCH_QUEUE_CAPACITY: usize = 64;
-const STOP_TYPING_DISPATCH_QUEUE_CAPACITY: usize = 16;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
@@ -113,7 +112,7 @@ struct StopTypingDispatchRequest {
 pub struct ActivityDispatcher {
     read_receipt_tx: Mutex<Option<sync_mpsc::SyncSender<ReadReceiptDispatchRequest>>>,
     read_receipt_worker: Mutex<Option<thread::JoinHandle<()>>>,
-    stop_typing_tx: Mutex<Option<sync_mpsc::SyncSender<StopTypingDispatchRequest>>>,
+    stop_typing_tx: Mutex<Option<sync_mpsc::Sender<StopTypingDispatchRequest>>>,
     stop_typing_worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -125,16 +124,10 @@ impl Default for ActivityDispatcher {
 
 impl ActivityDispatcher {
     pub fn new() -> Self {
-        Self::with_queue_capacity(
-            READ_RECEIPT_DISPATCH_QUEUE_CAPACITY,
-            STOP_TYPING_DISPATCH_QUEUE_CAPACITY,
-        )
+        Self::with_queue_capacity(READ_RECEIPT_DISPATCH_QUEUE_CAPACITY)
     }
 
-    pub(crate) fn with_queue_capacity(
-        read_receipt_capacity: usize,
-        stop_typing_capacity: usize,
-    ) -> Self {
+    pub(crate) fn with_queue_capacity(read_receipt_capacity: usize) -> Self {
         let (read_receipt_tx, read_receipt_rx) =
             sync_mpsc::sync_channel::<ReadReceiptDispatchRequest>(read_receipt_capacity);
         let read_receipt_worker = thread::Builder::new()
@@ -150,8 +143,7 @@ impl ActivityDispatcher {
             })
             .expect("failed to spawn read receipt dispatcher thread");
 
-        let (stop_typing_tx, stop_typing_rx) =
-            sync_mpsc::sync_channel::<StopTypingDispatchRequest>(stop_typing_capacity);
+        let (stop_typing_tx, stop_typing_rx) = sync_mpsc::channel::<StopTypingDispatchRequest>();
         let stop_typing_worker = thread::Builder::new()
             .name("carapace-stop-typing".to_string())
             .spawn(move || {
@@ -232,16 +224,9 @@ impl ActivityDispatcher {
             return;
         };
 
-        match sender.try_send(request) {
+        match sender.send(request) {
             Ok(()) => {}
-            Err(sync_mpsc::TrySendError::Full(request)) => {
-                mark_stop_completed(request.stop_state.as_ref());
-                tracing::warn!(
-                    channel = %channel_id,
-                    "stop typing dispatch queue is full; dropping implicit stop request"
-                );
-            }
-            Err(sync_mpsc::TrySendError::Disconnected(request)) => {
+            Err(sync_mpsc::SendError(request)) => {
                 mark_stop_completed(request.stop_state.as_ref());
                 tracing::warn!(
                     channel = %channel_id,
@@ -526,31 +511,36 @@ pub async fn maybe_start_typing_loop(
     let task = tokio::spawn(async move {
         let base_refresh_delay = Duration::from_secs(interval_seconds as u64);
         let mut consecutive_refresh_failures = 0_u32;
-        let mut next_refresh_delay = base_refresh_delay;
+        let mut next_refresh_at = tokio::time::Instant::now() + base_refresh_delay;
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => {
                     break;
                 }
-                _ = tokio::time::sleep(next_refresh_delay) => {
+                _ = tokio::time::sleep_until(next_refresh_at) => {
                     if let Err(err) = invoke_start_typing(plugin.clone(), ctx.clone()).await {
                         consecutive_refresh_failures = consecutive_refresh_failures.saturating_add(1);
-                        next_refresh_delay = typing_refresh_retry_delay(
+                        let retry_delay = typing_refresh_retry_delay(
                             base_refresh_delay,
                             consecutive_refresh_failures,
                         );
+                        next_refresh_at = tokio::time::Instant::now() + retry_delay;
                         if should_log_typing_refresh_failure(consecutive_refresh_failures) {
                             tracing::warn!(
                                 channel = %channel_id,
                                 error = %err,
                                 failures = consecutive_refresh_failures,
-                                retry_in_ms = next_refresh_delay.as_millis(),
+                                retry_in_ms = retry_delay.as_millis(),
                                 "failed to refresh typing indicator"
                             );
                         }
                     } else {
                         consecutive_refresh_failures = 0;
-                        next_refresh_delay = base_refresh_delay;
+                        next_refresh_at = next_typing_refresh_deadline(
+                            next_refresh_at,
+                            base_refresh_delay,
+                            tokio::time::Instant::now(),
+                        );
                     }
                 }
             }
@@ -647,6 +637,18 @@ fn typing_refresh_retry_delay(base_delay: Duration, consecutive_failures: u32) -
             .saturating_mul(multiplier)
             .min(MAX_TYPING_REFRESH_BACKOFF_SECONDS),
     )
+}
+
+fn next_typing_refresh_deadline(
+    previous_deadline: tokio::time::Instant,
+    cadence: Duration,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let mut next_deadline = previous_deadline + cadence;
+    while next_deadline <= now {
+        next_deadline += cadence;
+    }
+    next_deadline
 }
 
 fn should_log_typing_refresh_failure(consecutive_failures: u32) -> bool {
@@ -1222,6 +1224,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
             .await
             .expect("drop should stop typing promptly on current-thread runtimes");
+        tokio::task::yield_now().await;
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
@@ -1312,6 +1315,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
             .await
             .expect("drop should still stop typing when task cleanup was only reserved");
+        tokio::task::yield_now().await;
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
     }
@@ -1435,6 +1439,17 @@ mod tests {
     }
 
     #[test]
+    fn test_next_typing_refresh_deadline_stays_on_wall_clock_cadence() {
+        let start = tokio::time::Instant::now();
+        let cadence = Duration::from_secs(3);
+
+        let next =
+            next_typing_refresh_deadline(start + cadence, cadence, start + Duration::from_secs(7));
+
+        assert_eq!(next, start + Duration::from_secs(9));
+    }
+
+    #[test]
     fn test_should_log_typing_refresh_failure_throttles_noise() {
         assert!(should_log_typing_refresh_failure(1));
         assert!(should_log_typing_refresh_failure(2));
@@ -1442,6 +1457,41 @@ mod tests {
         assert!(should_log_typing_refresh_failure(4));
         assert!(!should_log_typing_refresh_failure(5));
         assert!(should_log_typing_refresh_failure(8));
+    }
+
+    #[test]
+    fn test_stop_typing_dispatcher_does_not_drop_bursty_cleanup_requests() {
+        let dispatcher = ActivityDispatcher::with_queue_capacity(1);
+        let plugin = Arc::new(MockChannel::with_stop_typing_delay(
+            ChannelCapabilities {
+                typing_indicators: true,
+                ..Default::default()
+            },
+            Duration::from_millis(10),
+        ));
+        let stop_states = (0..32)
+            .map(|_| Arc::new(AtomicU8::new(STOP_STATE_FALLBACK_RESERVED)))
+            .collect::<Vec<_>>();
+
+        for stop_state in &stop_states {
+            dispatcher.try_dispatch_stop_typing(
+                plugin.clone(),
+                "signal",
+                TypingContext {
+                    to: "+15551234567".to_string(),
+                    ..Default::default()
+                },
+                stop_state.clone(),
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+        dispatcher.shutdown();
+
+        assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 32);
+        assert!(stop_states
+            .iter()
+            .all(|state| state.load(Ordering::Acquire) == STOP_STATE_COMPLETED));
     }
 
     #[tokio::test]
