@@ -191,8 +191,7 @@ async fn maybe_dispatch_read_receipt_for_ignored_signal_message(
 
     state
         .activity_service()
-        .dispatch_verified_read_receipt(plugin, "signal", read_receipt_context)
-        .await;
+        .enqueue_verified_read_receipt(plugin, "signal", read_receipt_context);
 }
 
 fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {

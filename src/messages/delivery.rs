@@ -168,13 +168,12 @@ pub(crate) async fn process_channel_messages(
             &message_id,
             result,
             activity_service,
-        )
-        .await;
+        );
     }
 }
 
 /// Handle the result of a message delivery attempt.
-async fn handle_delivery_result(
+fn handle_delivery_result(
     pipeline: &MessagePipeline,
     plugin: &Arc<dyn plugins::ChannelPluginInstance>,
     channel_id: &str,
@@ -187,11 +186,14 @@ async fn handle_delivery_result(
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
-                // Keep delivery success on the hot path and dispatch read
-                // receipts through the owned activity worker.
-                activity_service
-                    .dispatch_verified_read_receipt(plugin.clone(), channel_id, read_receipt)
-                    .await;
+                // Delivery success records a read-receipt obligation onto the
+                // owned activity service without waiting for receipt-worker
+                // capacity or remote receipt I/O.
+                activity_service.enqueue_verified_read_receipt(
+                    plugin.clone(),
+                    channel_id,
+                    read_receipt,
+                );
             }
         }
         Ok(delivery) => {
@@ -342,6 +344,7 @@ mod tests {
         mark_read_delay: Duration,
         fail: bool,
         retryable: bool,
+        transient_failures: AtomicU32,
     }
 
     impl MockChannel {
@@ -355,6 +358,7 @@ mod tests {
                 mark_read_delay: Duration::ZERO,
                 fail: false,
                 retryable: false,
+                transient_failures: AtomicU32::new(0),
             }
         }
 
@@ -368,6 +372,15 @@ mod tests {
                 mark_read_delay: Duration::ZERO,
                 fail: true,
                 retryable,
+                transient_failures: AtomicU32::new(0),
+            }
+        }
+
+        fn fail_then_succeed(retryable: bool, failures: u32) -> Self {
+            Self {
+                retryable,
+                transient_failures: AtomicU32::new(failures),
+                ..Self::new()
             }
         }
 
@@ -384,6 +397,7 @@ mod tests {
                 mark_read_delay: Duration::ZERO,
                 fail: false,
                 retryable: false,
+                transient_failures: AtomicU32::new(0),
             }
         }
 
@@ -413,7 +427,11 @@ mod tests {
 
         fn send_text(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
             self.send_text_count.fetch_add(1, Ordering::Relaxed);
-            if self.fail {
+            let transient_failures = self.transient_failures.load(Ordering::Relaxed);
+            if transient_failures > 0 {
+                self.transient_failures.fetch_sub(1, Ordering::Relaxed);
+            }
+            if self.fail || transient_failures > 0 {
                 Ok(DeliveryResult {
                     ok: false,
                     message_id: None,
@@ -633,6 +651,76 @@ mod tests {
         assert_eq!(queued.last_error, Some("mock failure".to_string()));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_retryable_delivery_failure_preserves_read_receipt_until_success() {
+        let mark_read_notify = Arc::new(Notify::new());
+        let mock = Arc::new(MockChannel {
+            mark_read_notify: Some(mark_read_notify.clone()),
+            ..MockChannel::fail_then_succeed(true, 1)
+        });
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("signal", Some(mock.clone()), true);
+        let activity_service = test_activity_service();
+
+        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let queued = pipeline
+            .queue(msg, MsgOutboundContext::new().with_retries(2))
+            .unwrap();
+
+        process_channel_messages(
+            &["signal".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+            &activity_service,
+        )
+        .await;
+
+        let first_attempt = pipeline
+            .get_message(&queued.message_id)
+            .expect("message should remain queued after retryable failure");
+        assert_eq!(
+            first_attempt.status,
+            crate::messages::outbound::DeliveryStatus::Queued
+        );
+        assert!(
+            first_attempt.message.metadata.read_receipt.is_some(),
+            "retryable failure should preserve read receipt metadata for the next attempt"
+        );
+        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
+
+        process_channel_messages(
+            &["signal".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+            &activity_service,
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
+            .await
+            .expect("successful retry should dispatch the preserved read receipt");
+        activity_service.shutdown().await;
+
+        assert_eq!(
+            pipeline.get_status(&queued.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Sent)
+        );
+        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 2);
+        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn test_delivery_non_retryable_failure_marks_failed() {
         let mock = Arc::new(MockChannel::failing(false));
@@ -816,8 +904,7 @@ mod tests {
                 poll_id: None,
             }),
             &activity_service,
-        )
-        .await;
+        );
 
         tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
             .await
@@ -916,8 +1003,7 @@ mod tests {
                 poll_id: None,
             }),
             &activity_service,
-        )
-        .await;
+        );
         activity_service.shutdown().await;
 
         assert_eq!(
@@ -962,8 +1048,7 @@ mod tests {
                 poll_id: None,
             }),
             &activity_service,
-        )
-        .await;
+        );
         activity_service.shutdown().await;
 
         assert_eq!(
@@ -1002,28 +1087,28 @@ mod tests {
             .expect("queued message should be available");
         let plugin: Arc<dyn ChannelPluginInstance> = mock.clone();
 
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            handle_delivery_result(
-                &pipeline,
-                &plugin,
-                "signal",
-                &message.message.metadata,
-                &queued.message_id,
-                Ok(plugins::DeliveryResult {
-                    ok: true,
-                    message_id: Some("sent-1".to_string()),
-                    error: None,
-                    retryable: false,
-                    conversation_id: None,
-                    to_jid: None,
-                    poll_id: None,
-                }),
-                &activity_service,
-            ),
-        )
-        .await
-        .expect("delivery result handling should not wait for slow read receipt I/O");
+        let started_at = std::time::Instant::now();
+        handle_delivery_result(
+            &pipeline,
+            &plugin,
+            "signal",
+            &message.message.metadata,
+            &queued.message_id,
+            Ok(plugins::DeliveryResult {
+                ok: true,
+                message_id: Some("sent-1".to_string()),
+                error: None,
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            }),
+            &activity_service,
+        );
+        assert!(
+            started_at.elapsed() < Duration::from_millis(50),
+            "delivery result handling should not wait for slow read receipt I/O"
+        );
 
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
         tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())

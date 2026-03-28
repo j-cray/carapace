@@ -1251,6 +1251,11 @@ pub async fn execute_run(
             .map(|capabilities| capabilities.typing_indicators)
             .unwrap_or(false)
         {
+            if policy.typing.enabled {
+                state
+                    .activity_service()
+                    .warn_unsupported_feature(channel_id, "typing");
+            }
             None
         } else {
             let typing_context =
@@ -1421,6 +1426,25 @@ pub async fn execute_run(
 
     if let Some(handle) = typing_handle {
         handle.stop().await;
+    }
+
+    if execution_result.is_err() {
+        let (_, read_receipt_context) = delivery_context_from_registry(&state, &run_id);
+        if let (Some(channel_id), Some(policy), Some(read_receipt_context)) = (
+            delivery_channel_id,
+            channel_activity_policy.as_ref(),
+            read_receipt_context.as_ref(),
+        ) {
+            if config.deliver && policy.read_receipts.enabled {
+                tracing::warn!(
+                    run_id = %run_id,
+                    channel = %channel_id,
+                    recipient = %read_receipt_context.recipient,
+                    timestamp = ?read_receipt_context.timestamp,
+                    "withholding explicit read receipt because after-response policy requires a successful response delivery"
+                );
+            }
+        }
     }
 
     execution_result

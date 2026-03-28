@@ -9,10 +9,14 @@
 //! - shutdown closes intake first, then drains already-queued work until a
 //!   deadline, joining the real worker threads directly.
 //! - work still queued after the deadline is dropped explicitly with logging.
+//! - read receipts are committed as non-lossy in-process obligations so
+//!   successful delivery never waits on receipt-worker capacity.
 //! - activity-capable channel implementations must bound their own blocking
 //!   I/O; the dispatcher does not spawn detached per-operation timeout threads.
 //! - config reload only affects future polls/messages because each receive loop
 //!   iteration snapshots its activity policy before polling and dispatch.
+//! - enabled-but-unsupported features warn both at runtime and when startup or
+//!   config reload evaluates channel capabilities against policy.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -38,7 +42,6 @@ use crate::runtime_bridge::run_sync_blocking_send;
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
-const READ_RECEIPT_DISPATCH_QUEUE_CAPACITY: usize = 128;
 const ACTIVITY_BLOCKING_IO_MAX_SECS: u64 = 5;
 // This budget must stay at or above the longest built-in activity operation
 // timeout so graceful shutdown drains already-queued work instead of routinely
@@ -118,6 +121,9 @@ pub enum TypingMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReadReceiptMode {
+    // Carapace sends an explicit receipt only after the assistant response has
+    // been delivered successfully. Failed or cancelled runs intentionally
+    // leave the inbound message unread.
     #[default]
     AfterResponse,
 }
@@ -180,7 +186,6 @@ struct VerifiedReadReceiptDispatchRequest {
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: String,
     ctx: ReadReceiptContext,
-    _queue_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 struct StopTypingDispatchRequest {
@@ -223,15 +228,14 @@ impl ActivityService {
         &self.dispatcher
     }
 
-    pub async fn dispatch_verified_read_receipt(
+    pub fn enqueue_verified_read_receipt(
         &self,
         plugin: Arc<dyn ChannelPluginInstance>,
         channel_id: &str,
         ctx: ReadReceiptContext,
     ) {
         self.dispatcher
-            .dispatch_verified_read_receipt(plugin, channel_id, ctx)
-            .await;
+            .enqueue_verified_read_receipt(plugin, channel_id, ctx);
     }
 
     pub fn dispatch_stop_typing(
@@ -267,6 +271,17 @@ impl ActivityService {
         }
     }
 
+    pub async fn warn_configured_unsupported_features_for_registered_channels(
+        &self,
+        plugin_registry: Arc<PluginRegistry>,
+    ) {
+        for (channel_id, feature) in
+            collect_configured_unsupported_features_for_registered_channels(plugin_registry).await
+        {
+            self.warn_unsupported_feature(&channel_id, feature);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn reset_unsupported_activity_feature_warnings_for_test(&self) {
         self.unsupported_feature_warnings.lock().reset();
@@ -279,7 +294,6 @@ pub struct ActivityDispatcher {
     stop_typing_tx: Mutex<Option<sync_mpsc::Sender<StopTypingDispatchRequest>>>,
     stop_typing_worker: Mutex<Option<thread::JoinHandle<()>>>,
     read_receipt_backlog: Arc<AtomicUsize>,
-    read_receipt_permits: Arc<tokio::sync::Semaphore>,
     stop_typing_backlog: Arc<AtomicUsize>,
     backlog_warning_threshold: usize,
     shutting_down: Arc<AtomicBool>,
@@ -294,35 +308,24 @@ impl Default for ActivityDispatcher {
 
 impl ActivityDispatcher {
     pub fn new() -> Self {
-        Self::with_options(
-            ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD,
-            READ_RECEIPT_DISPATCH_QUEUE_CAPACITY,
-        )
+        Self::with_options(ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD)
     }
 
     #[cfg(test)]
     pub(crate) fn with_backlog_warning_threshold(backlog_warning_threshold: usize) -> Self {
-        Self::with_options(
-            backlog_warning_threshold,
-            READ_RECEIPT_DISPATCH_QUEUE_CAPACITY,
-        )
+        Self::with_options(backlog_warning_threshold)
     }
 
-    pub(crate) fn with_options(
-        backlog_warning_threshold: usize,
-        read_receipt_queue_capacity: usize,
-    ) -> Self {
+    pub(crate) fn with_options(backlog_warning_threshold: usize) -> Self {
         let read_receipt_backlog = Arc::new(AtomicUsize::new(0));
-        let read_receipt_permits =
-            Arc::new(tokio::sync::Semaphore::new(read_receipt_queue_capacity));
         let stop_typing_backlog = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let shutdown_deadline = Arc::new(Mutex::new(None));
 
         // Once upstream auto-receipts are disabled, Carapace owns explicit
-        // read-receipt delivery for the message. Use semaphore-backed
-        // backpressure so queue growth is bounded in memory without falling
-        // back to best-effort drops.
+        // read-receipt delivery for the message. Keep this queue non-lossy and
+        // non-blocking for the delivery path; backlog warnings make sustained
+        // worker lag visible instead of dropping obligations silently.
         let (read_receipt_tx, read_receipt_rx) =
             sync_mpsc::channel::<VerifiedReadReceiptDispatchRequest>();
         let read_receipt_backlog_worker = read_receipt_backlog.clone();
@@ -386,7 +389,6 @@ impl ActivityDispatcher {
             stop_typing_tx: Mutex::new(Some(stop_typing_tx)),
             stop_typing_worker: Mutex::new(Some(stop_typing_worker)),
             read_receipt_backlog,
-            read_receipt_permits,
             stop_typing_backlog,
             backlog_warning_threshold,
             shutting_down,
@@ -394,7 +396,7 @@ impl ActivityDispatcher {
         }
     }
 
-    pub async fn dispatch_verified_read_receipt(
+    pub fn enqueue_verified_read_receipt(
         &self,
         plugin: Arc<dyn ChannelPluginInstance>,
         channel_id: &str,
@@ -408,29 +410,10 @@ impl ActivityDispatcher {
             return;
         }
 
-        let permit = match self.read_receipt_permits.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                tracing::warn!(
-                    channel = %channel_id,
-                    "read receipt dispatcher is shut down; dropping read receipt"
-                );
-                return;
-            }
-        };
-        if self.shutting_down.load(Ordering::Acquire) {
-            tracing::warn!(
-                channel = %channel_id,
-                "read receipt dispatcher is shutting down; dropping read receipt"
-            );
-            return;
-        }
-
         let request = VerifiedReadReceiptDispatchRequest {
             plugin,
             channel_id: channel_id.to_string(),
             ctx,
-            _queue_permit: permit,
         };
         let sender = self.read_receipt_tx.lock();
         let Some(sender) = sender.as_ref() else {
@@ -523,7 +506,6 @@ impl ActivityDispatcher {
         }
         let deadline = Instant::now() + grace;
         *self.shutdown_deadline.lock() = Some(deadline);
-        self.read_receipt_permits.close();
         self.read_receipt_tx.lock().take();
         self.stop_typing_tx.lock().take();
 
@@ -679,6 +661,38 @@ pub async fn load_channel_activity_policy_async(channel: &str) -> ChannelActivit
             ChannelActivityPolicy::default()
         }
     }
+}
+
+pub async fn collect_configured_unsupported_features_for_registered_channels(
+    plugin_registry: Arc<PluginRegistry>,
+) -> Vec<(String, &'static str)> {
+    let mut unsupported = Vec::new();
+    for (channel_id, plugin) in plugin_registry.get_channels() {
+        let policy = load_channel_activity_policy_async(&channel_id).await;
+        if !policy.typing.enabled && !policy.read_receipts.enabled {
+            continue;
+        }
+
+        let capabilities = match get_capabilities(plugin).await {
+            Ok(capabilities) => capabilities,
+            Err(err) => {
+                tracing::warn!(
+                    channel = %channel_id,
+                    error = %err,
+                    "failed to load channel capabilities while checking configured activity feature support"
+                );
+                continue;
+            }
+        };
+
+        if policy.typing.enabled && !capabilities.typing_indicators {
+            unsupported.push((channel_id.clone(), "typing"));
+        }
+        if policy.read_receipts.enabled && !capabilities.read_receipts {
+            unsupported.push((channel_id, "read_receipts"));
+        }
+    }
+    unsupported
 }
 
 fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeaturePolicy) {
@@ -1924,7 +1938,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_activity_dispatcher_shutdown_waits_for_inflight_bounded_operation() {
-        let dispatcher = ActivityDispatcher::with_options(8, READ_RECEIPT_DISPATCH_QUEUE_CAPACITY);
+        let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(8);
         let plugin = Arc::new(MockChannel::with_mark_read_delay(
             ChannelCapabilities {
                 read_receipts: true,
@@ -1932,17 +1946,15 @@ mod tests {
             },
             Duration::from_millis(25),
         ));
-        dispatcher
-            .dispatch_verified_read_receipt(
-                plugin.clone(),
-                "signal",
-                ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-            )
-            .await;
+        dispatcher.enqueue_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            },
+        );
         let started_at = std::time::Instant::now();
         dispatcher.shutdown();
 
@@ -1955,7 +1967,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_activity_dispatcher_shutdown_drains_queued_read_receipts_until_deadline() {
-        let dispatcher = ActivityDispatcher::with_options(8, READ_RECEIPT_DISPATCH_QUEUE_CAPACITY);
+        let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(8);
         let plugin = Arc::new(MockChannel::with_mark_read_delay(
             ChannelCapabilities {
                 read_receipts: true,
@@ -1965,17 +1977,15 @@ mod tests {
         ));
 
         for timestamp in 0..4_u64 {
-            dispatcher
-                .dispatch_verified_read_receipt(
-                    plugin.clone(),
-                    "signal",
-                    ReadReceiptContext {
-                        recipient: "+15551234567".to_string(),
-                        timestamp: Some(timestamp),
-                        ..Default::default()
-                    },
-                )
-                .await;
+            dispatcher.enqueue_verified_read_receipt(
+                plugin.clone(),
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(timestamp),
+                    ..Default::default()
+                },
+            );
         }
 
         dispatcher.shutdown_for_test(Duration::from_millis(100));
@@ -1986,7 +1996,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_activity_dispatcher_drop_joins_workers_without_explicit_shutdown() {
         let mark_read_started_notify = Arc::new(Notify::new());
-        let dispatcher = ActivityDispatcher::with_options(8, READ_RECEIPT_DISPATCH_QUEUE_CAPACITY);
+        let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(8);
         let plugin = Arc::new(MockChannel::with_mark_read_delay_and_notify(
             ChannelCapabilities {
                 read_receipts: true,
@@ -1996,17 +2006,15 @@ mod tests {
             mark_read_started_notify.clone(),
         ));
 
-        dispatcher
-            .dispatch_verified_read_receipt(
-                plugin.clone(),
-                "signal",
-                ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-            )
-            .await;
+        dispatcher.enqueue_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            },
+        );
 
         tokio::time::timeout(Duration::from_secs(1), mark_read_started_notify.notified())
             .await
@@ -2068,17 +2076,15 @@ mod tests {
         ));
 
         for timestamp in 0..32_u64 {
-            dispatcher
-                .dispatch_verified_read_receipt(
-                    plugin.clone(),
-                    "signal",
-                    ReadReceiptContext {
-                        recipient: "+15551234567".to_string(),
-                        timestamp: Some(timestamp),
-                        ..Default::default()
-                    },
-                )
-                .await;
+            dispatcher.enqueue_verified_read_receipt(
+                plugin.clone(),
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(timestamp),
+                    ..Default::default()
+                },
+            );
         }
 
         std::thread::sleep(Duration::from_millis(500));
@@ -2116,17 +2122,15 @@ mod tests {
         });
         let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(8);
 
-        dispatcher
-            .dispatch_verified_read_receipt(
-                plugin.clone(),
-                "signal",
-                ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-            )
-            .await;
+        dispatcher.enqueue_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            },
+        );
 
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
@@ -2151,28 +2155,24 @@ mod tests {
         });
         let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(8);
 
-        dispatcher
-            .dispatch_verified_read_receipt(
-                plugin.clone(),
-                "signal",
-                ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-            )
-            .await;
-        dispatcher
-            .dispatch_verified_read_receipt(
-                plugin.clone(),
-                "signal",
-                ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(124),
-                    ..Default::default()
-                },
-            )
-            .await;
+        dispatcher.enqueue_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            },
+        );
+        dispatcher.enqueue_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(124),
+                ..Default::default()
+            },
+        );
 
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
@@ -2183,8 +2183,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_read_receipt_dispatcher_backpressures_when_queue_is_full() {
-        let dispatcher = Arc::new(ActivityDispatcher::with_options(8, 1));
+    async fn test_read_receipt_dispatcher_enqueues_without_waiting_for_slow_io() {
+        let dispatcher = Arc::new(ActivityDispatcher::with_backlog_warning_threshold(8));
         let plugin = Arc::new(MockChannel::with_mark_read_delay(
             ChannelCapabilities {
                 read_receipts: true,
@@ -2193,44 +2193,30 @@ mod tests {
             Duration::from_millis(150),
         ));
 
-        dispatcher
-            .dispatch_verified_read_receipt(
-                plugin.clone(),
-                "signal",
-                ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(1),
-                    ..Default::default()
-                },
-            )
-            .await;
-
-        let dispatcher_clone = dispatcher.clone();
-        let plugin_clone = plugin.clone();
-        let second_dispatch = tokio::spawn(async move {
-            dispatcher_clone
-                .dispatch_verified_read_receipt(
-                    plugin_clone,
-                    "signal",
-                    ReadReceiptContext {
-                        recipient: "+15551234567".to_string(),
-                        timestamp: Some(2),
-                        ..Default::default()
-                    },
-                )
-                .await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            !second_dispatch.is_finished(),
-            "second dispatch should backpressure while the bounded queue is full"
+        let started_at = std::time::Instant::now();
+        dispatcher.enqueue_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(1),
+                ..Default::default()
+            },
+        );
+        dispatcher.enqueue_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(2),
+                ..Default::default()
+            },
         );
 
-        tokio::time::timeout(Duration::from_secs(1), second_dispatch)
-            .await
-            .expect("second dispatch should complete once capacity is released")
-            .expect("second dispatch task should succeed");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(50),
+            "enqueuing read receipts should not wait for slow receipt I/O"
+        );
 
         dispatcher.shutdown();
         assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 2);
@@ -2264,5 +2250,45 @@ mod tests {
         assert!(registry.should_warn("signal:typing", start));
         assert!(!registry.should_warn("signal:typing", start + Duration::from_millis(500)));
         assert!(registry.should_warn("signal:typing", start + Duration::from_secs(2)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_collect_configured_unsupported_features_for_registered_channels() {
+        crate::config::clear_cache();
+        crate::config::update_cache(
+            serde_json::json!({
+                "channels": {
+                    "custom": {
+                        "features": {
+                            "typing": { "enabled": true },
+                            "readReceipts": { "enabled": true },
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "channels": {
+                    "custom": {
+                        "features": {
+                            "typing": { "enabled": true },
+                            "readReceipts": { "enabled": true },
+                        }
+                    }
+                }
+            }),
+        );
+
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel(
+            "custom".to_string(),
+            Arc::new(MockChannel::new(ChannelCapabilities::default())),
+        );
+
+        let unsupported =
+            collect_configured_unsupported_features_for_registered_channels(plugin_registry).await;
+
+        assert!(unsupported.contains(&("custom".to_string(), "typing")));
+        assert!(unsupported.contains(&("custom".to_string(), "read_receipts")));
+        crate::config::clear_cache();
     }
 }
