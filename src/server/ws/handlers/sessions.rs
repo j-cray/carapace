@@ -100,6 +100,16 @@ pub struct AgentRunResult {
     pub completed_at: Option<u64>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct AgentRunSnapshot {
+    pub run_id: String,
+    pub session_key: String,
+    pub message: String,
+    pub read_receipt_context: Option<crate::plugins::ReadReceiptContext>,
+    pub status: AgentRunStatus,
+}
+
 /// Registry for tracking active agent runs
 #[derive(Default)]
 pub struct AgentRunRegistry {
@@ -212,6 +222,20 @@ impl AgentRunRegistry {
         } else {
             None
         }
+    }
+
+    #[cfg(test)]
+    pub fn snapshot_runs(&self) -> Vec<AgentRunSnapshot> {
+        self.runs
+            .values()
+            .map(|run| AgentRunSnapshot {
+                run_id: run.run_id.clone(),
+                session_key: run.session_key.clone(),
+                message: run.message.clone(),
+                read_receipt_context: run.read_receipt_context.clone(),
+                status: run.status,
+            })
+            .collect()
     }
 
     /// Mark a run as started.

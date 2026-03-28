@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -471,6 +472,8 @@ pub struct WsServerState {
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
     /// Runtime-owned dispatcher for channel activity side effects.
     activity_dispatcher: Arc<channels::activity::ActivityDispatcher>,
+    /// Ensures runtime activity shutdown is owned and initiated exactly once.
+    activity_shutdown_started: AtomicBool,
     /// Retained plugin runtime for instantiated plugin lifetimes and epoch ticker.
     plugin_runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     /// Startup-time plugin activation report
@@ -553,6 +556,7 @@ impl WsServerState {
             tools_registry: None,
             plugin_registry: None,
             activity_dispatcher: Arc::new(channels::activity::ActivityDispatcher::new()),
+            activity_shutdown_started: AtomicBool::new(false),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -613,6 +617,7 @@ impl WsServerState {
             tools_registry: None,
             plugin_registry: None,
             activity_dispatcher: Arc::new(channels::activity::ActivityDispatcher::new()),
+            activity_shutdown_started: AtomicBool::new(false),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -775,6 +780,22 @@ impl WsServerState {
 
     pub fn activity_dispatcher(&self) -> &Arc<channels::activity::ActivityDispatcher> {
         &self.activity_dispatcher
+    }
+
+    /// Runtime-owned shutdown entrypoint for channel activity side effects.
+    ///
+    /// This is the only runtime path that should close intake and drain the
+    /// activity subsystem. Callers may invoke it more than once, but only the
+    /// first call will actually initiate shutdown.
+    pub fn shutdown_activity_service(&self) {
+        if self
+            .activity_shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.activity_dispatcher.shutdown();
     }
 
     pub(crate) fn plugin_runtime(

@@ -2,6 +2,15 @@
 //!
 //! This module handles per-channel activity policy (typing indicators and read
 //! receipts) and the runtime helpers that drive those side effects.
+//!
+//! Activity subsystem contract:
+//! - `WsServerState` owns the runtime activity service and is the only runtime
+//!   shutdown entrypoint.
+//! - shutdown closes intake first, then drains already-queued work until a
+//!   deadline using bounded per-operation execution.
+//! - work still queued after the deadline is dropped explicitly with logging.
+//! - config reload only affects future polls/messages because each receive loop
+//!   iteration snapshots its activity policy before polling and dispatch.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -10,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc as sync_mpsc;
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use parking_lot::Mutex;
@@ -29,6 +38,7 @@ const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
 const ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS: u64 = 10;
+const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 = 250;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
@@ -127,6 +137,7 @@ pub struct ActivityDispatcher {
     stop_typing_backlog: Arc<AtomicUsize>,
     backlog_warning_threshold: usize,
     shutting_down: Arc<AtomicBool>,
+    shutdown_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Default for ActivityDispatcher {
@@ -158,6 +169,7 @@ impl ActivityDispatcher {
         let read_receipt_backlog = Arc::new(AtomicUsize::new(0));
         let stop_typing_backlog = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let shutdown_deadline = Arc::new(Mutex::new(None));
 
         // Once upstream auto-receipts are disabled, Carapace owns explicit
         // read-receipt delivery for the message. Keep this queue non-lossy so
@@ -167,13 +179,18 @@ impl ActivityDispatcher {
             sync_mpsc::channel::<VerifiedReadReceiptDispatchRequest>();
         let read_receipt_backlog_worker = read_receipt_backlog.clone();
         let read_receipt_shutdown = shutting_down.clone();
+        let read_receipt_deadline = shutdown_deadline.clone();
         let read_receipt_timeout = operation_timeout;
         let read_receipt_worker = thread::Builder::new()
             .name("carapace-read-receipts".to_string())
             .spawn(move || {
                 while let Ok(request) = read_receipt_rx.recv() {
                     read_receipt_backlog_worker.fetch_sub(1, Ordering::AcqRel);
-                    if read_receipt_shutdown.load(Ordering::Acquire) {
+                    if should_drop_activity_work(
+                        read_receipt_shutdown.as_ref(),
+                        &read_receipt_deadline,
+                    ) {
+                        log_dropped_read_receipt_after_shutdown(&request.channel_id, &request.ctx);
                         continue;
                     }
                     dispatch_read_receipt_blocking(
@@ -189,6 +206,7 @@ impl ActivityDispatcher {
         let (stop_typing_tx, stop_typing_rx) = sync_mpsc::channel::<StopTypingDispatchRequest>();
         let stop_typing_backlog_worker = stop_typing_backlog.clone();
         let stop_typing_shutdown = shutting_down.clone();
+        let stop_typing_deadline = shutdown_deadline.clone();
         let stop_typing_timeout = operation_timeout;
         let stop_typing_worker = thread::Builder::new()
             .name("carapace-stop-typing".to_string())
@@ -199,8 +217,12 @@ impl ActivityDispatcher {
                 // of active typing loops in the runtime.
                 while let Ok(request) = stop_typing_rx.recv() {
                     stop_typing_backlog_worker.fetch_sub(1, Ordering::AcqRel);
-                    if stop_typing_shutdown.load(Ordering::Acquire) {
+                    if should_drop_activity_work(
+                        stop_typing_shutdown.as_ref(),
+                        &stop_typing_deadline,
+                    ) {
                         mark_stop_completed(request.stop_state.as_ref());
+                        log_dropped_stop_typing_after_shutdown(&request.channel_id, &request.ctx);
                         continue;
                     }
                     dispatch_stop_typing_blocking(
@@ -223,6 +245,7 @@ impl ActivityDispatcher {
             stop_typing_backlog,
             backlog_warning_threshold,
             shutting_down,
+            shutdown_deadline,
         }
     }
 
@@ -308,22 +331,25 @@ impl ActivityDispatcher {
         }
     }
 
-    pub fn shutdown(&self) {
-        self.shutting_down.store(true, Ordering::Release);
-        let pending_read_receipts = self.read_receipt_backlog.load(Ordering::Acquire);
-        if pending_read_receipts > 0 {
-            tracing::warn!(
-                backlog = pending_read_receipts,
-                "dropping queued read receipts during activity dispatcher shutdown"
-            );
+    pub(crate) fn shutdown(&self) {
+        self.shutdown_with_deadline(Duration::from_millis(ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_for_test(&self, grace: Duration) {
+        self.shutdown_with_deadline(grace);
+    }
+
+    fn shutdown_with_deadline(&self, grace: Duration) {
+        if self
+            .shutting_down
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
         }
-        let pending_stop_typing = self.stop_typing_backlog.load(Ordering::Acquire);
-        if pending_stop_typing > 0 {
-            tracing::warn!(
-                backlog = pending_stop_typing,
-                "dropping queued stop-typing cleanups during activity dispatcher shutdown"
-            );
-        }
+        let deadline = Instant::now() + grace;
+        *self.shutdown_deadline.lock() = Some(deadline);
         self.read_receipt_tx.lock().take();
         self.stop_typing_tx.lock().take();
 
@@ -756,6 +782,36 @@ fn log_activity_backlog_if_needed(
             "activity dispatcher backlog is growing"
         );
     }
+}
+
+fn should_drop_activity_work(
+    shutting_down: &AtomicBool,
+    shutdown_deadline: &Mutex<Option<Instant>>,
+) -> bool {
+    if !shutting_down.load(Ordering::Acquire) {
+        return false;
+    }
+    shutdown_deadline
+        .lock()
+        .as_ref()
+        .is_some_and(|deadline| Instant::now() > *deadline)
+}
+
+fn log_dropped_read_receipt_after_shutdown(channel_id: &str, ctx: &ReadReceiptContext) {
+    tracing::warn!(
+        channel = %channel_id,
+        recipient = %ctx.recipient,
+        timestamp = ?ctx.timestamp,
+        "dropped queued read receipt after activity shutdown deadline"
+    );
+}
+
+fn log_dropped_stop_typing_after_shutdown(channel_id: &str, ctx: &TypingContext) {
+    tracing::warn!(
+        channel = %channel_id,
+        recipient = %ctx.to,
+        "dropped queued stop-typing cleanup after activity shutdown deadline"
+    );
 }
 
 fn observe_finished_typing_task_after_abort(task: JoinHandle<()>, channel_id: &str) {
@@ -1775,6 +1831,34 @@ mod tests {
             started_at.elapsed() < Duration::from_millis(100),
             "dispatcher shutdown should stay bounded when an activity operation stalls"
         );
+    }
+
+    #[test]
+    fn test_activity_dispatcher_shutdown_drains_queued_read_receipts_until_deadline() {
+        let dispatcher = ActivityDispatcher::with_options(8, Duration::from_millis(50));
+        let plugin = Arc::new(MockChannel::with_mark_read_delay(
+            ChannelCapabilities {
+                read_receipts: true,
+                ..Default::default()
+            },
+            Duration::from_millis(5),
+        ));
+
+        for timestamp in 0..4_u64 {
+            dispatcher.dispatch_verified_read_receipt(
+                plugin.clone(),
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(timestamp),
+                    ..Default::default()
+                },
+            );
+        }
+
+        dispatcher.shutdown_for_test(Duration::from_millis(100));
+
+        assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 4);
     }
 
     #[test]

@@ -175,6 +175,24 @@ fn build_receive_url(
     url
 }
 
+#[derive(Debug, Clone)]
+struct SignalReceivePollSnapshot {
+    receive_url: url::Url,
+    carapace_manages_read_receipts: bool,
+}
+
+fn snapshot_signal_receive_poll(
+    base_url: &url::Url,
+    phone_number: &str,
+    activity_policy: &crate::channels::activity::ChannelActivityPolicy,
+) -> SignalReceivePollSnapshot {
+    let carapace_manages_read_receipts = activity_policy.read_receipts.enabled;
+    SignalReceivePollSnapshot {
+        receive_url: build_receive_url(base_url, phone_number, carapace_manages_read_receipts),
+        carapace_manages_read_receipts,
+    }
+}
+
 fn record_signal_parse_failure<E: std::fmt::Display>(
     context: &str,
     err: E,
@@ -231,13 +249,10 @@ pub async fn signal_receive_loop(
             break;
         }
 
-        let receive_url = build_receive_url(
-            &base_url,
-            &phone_number,
-            activity_policy.read_receipts.enabled,
-        );
+        let poll_snapshot =
+            snapshot_signal_receive_poll(&base_url, &phone_number, &activity_policy);
 
-        match client.get(receive_url).send().await {
+        match client.get(poll_snapshot.receive_url.clone()).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if consecutive_errors > 0 {
                     info!(
@@ -257,7 +272,7 @@ pub async fn signal_receive_loop(
                                     process_envelope(
                                         &envelope,
                                         &state,
-                                        activity_policy.read_receipts.enabled,
+                                        poll_snapshot.carapace_manages_read_receipts,
                                     )
                                     .await;
                                 }
@@ -422,7 +437,60 @@ async fn process_envelope(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::extract::{OriginalUri, Path, State};
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use parking_lot::Mutex;
+
     use super::*;
+    use crate::server::ws::WsServerConfig;
+
+    #[derive(Clone)]
+    struct SignalReceiveTestServerState {
+        requests: Arc<Mutex<Vec<String>>>,
+        responses: Arc<Mutex<VecDeque<Value>>>,
+    }
+
+    async fn signal_receive_test_handler(
+        State(state): State<SignalReceiveTestServerState>,
+        OriginalUri(uri): OriginalUri,
+        Path(_number): Path<String>,
+    ) -> Json<Value> {
+        state.requests.lock().push(
+            uri.path_and_query()
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| uri.path().to_string()),
+        );
+        Json(
+            state
+                .responses
+                .lock()
+                .pop_front()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )
+    }
+
+    async fn wait_for_condition<F>(timeout: Duration, mut condition: F)
+    where
+        F: FnMut() -> bool,
+    {
+        let started = tokio::time::Instant::now();
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(
+                started.elapsed() < timeout,
+                "condition was not satisfied within {:?}",
+                timeout
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     #[test]
     fn test_parse_inbound_message() {
@@ -680,6 +748,29 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_signal_receive_poll_uses_single_policy_view() {
+        let activity_policy = crate::channels::activity::ChannelActivityPolicy {
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let snapshot = snapshot_signal_receive_poll(
+            &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
+            "+15551234567",
+            &activity_policy,
+        );
+
+        assert!(snapshot.carapace_manages_read_receipts);
+        assert_eq!(
+            snapshot.receive_url.as_str(),
+            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+        );
+    }
+
+    #[test]
     fn test_validate_signal_receive_url_rejects_non_https_non_loopback_base_url() {
         let err = validate_signal_url("http://example.com:8080", "signal receive", true)
             .expect_err("non-loopback receive URL should be rejected");
@@ -877,5 +968,156 @@ mod tests {
         let ids =
             resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
         assert!(ids.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_signal_receive_loop_reload_affects_future_polls_and_messages_only() {
+        crate::config::clear_cache();
+
+        let initial_config = serde_json::json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "readReceipts": {
+                            "enabled": false
+                        }
+                    }
+                }
+            }
+        });
+        crate::config::update_cache(initial_config.clone(), initial_config);
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(VecDeque::from(vec![
+            serde_json::json!([
+                {
+                    "sourceNumber": "+15559876543",
+                    "timestamp": 1706745600000_u64,
+                    "dataMessage": {
+                        "message": "first",
+                        "timestamp": 1706745600000_u64
+                    }
+                }
+            ]),
+            serde_json::json!([
+                {
+                    "sourceNumber": "+15559876543",
+                    "timestamp": 1706745601000_u64,
+                    "dataMessage": {
+                        "message": "second",
+                        "timestamp": 1706745601000_u64
+                    }
+                }
+            ]),
+        ])));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test Signal receive server");
+        let addr = listener.local_addr().expect("local addr");
+        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
+        let app = Router::new()
+            .route("/api/v1/receive/{number}", get(signal_receive_test_handler))
+            .with_state(SignalReceiveTestServerState {
+                requests: requests.clone(),
+                responses: responses.clone(),
+            });
+        let server_task = tokio::spawn(async move {
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let mut shutdown = server_shutdown_rx;
+                let _ = shutdown.changed().await;
+            });
+            server.await.expect("serve test Signal receive server");
+        });
+
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let receive_task = tokio::spawn(signal_receive_loop(
+            format!("http://127.0.0.1:{}/api", addr.port()),
+            "+15551234567".to_string(),
+            state.clone(),
+            state.channel_registry().clone(),
+            shutdown_rx,
+        ));
+
+        wait_for_condition(Duration::from_secs(2), || {
+            state
+                .agent_run_registry
+                .lock()
+                .snapshot_runs()
+                .iter()
+                .any(|run| run.message == "first" && run.read_receipt_context.is_none())
+        })
+        .await;
+
+        let reloaded_config = serde_json::json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "readReceipts": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+        crate::config::update_cache(reloaded_config.clone(), reloaded_config);
+
+        wait_for_condition(Duration::from_secs(2), || {
+            state
+                .agent_run_registry
+                .lock()
+                .snapshot_runs()
+                .iter()
+                .any(|run| {
+                    run.message == "second"
+                        && run
+                            .read_receipt_context
+                            .as_ref()
+                            .and_then(|ctx| ctx.timestamp)
+                            == Some(1706745601000_u64)
+                })
+        })
+        .await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), receive_task)
+            .await
+            .expect("receive loop should exit")
+            .expect("receive loop task should succeed");
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server should exit")
+            .expect("server task should succeed");
+
+        let requests = requests.lock().clone();
+        assert!(requests
+            .first()
+            .is_some_and(|request| !request.contains("send_read_receipts=false")));
+        assert!(requests
+            .get(1)
+            .is_some_and(|request| request.contains("send_read_receipts=false")));
+
+        let runs = state.agent_run_registry.lock().snapshot_runs();
+        let first = runs
+            .iter()
+            .find(|run| run.message == "first")
+            .expect("first inbound run");
+        assert!(first.read_receipt_context.is_none());
+
+        let second = runs
+            .iter()
+            .find(|run| run.message == "second")
+            .expect("second inbound run");
+        assert_eq!(
+            second
+                .read_receipt_context
+                .as_ref()
+                .and_then(|ctx| ctx.timestamp),
+            Some(1706745601000_u64)
+        );
+
+        crate::config::clear_cache();
     }
 }
