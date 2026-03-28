@@ -1358,6 +1358,20 @@ pub async fn execute_run(
                 let recipient_id =
                     delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
                 if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
+                    if channel_activity_policy
+                        .as_ref()
+                        .map(|policy| policy.read_receipts.enabled)
+                        .unwrap_or(false)
+                        && !channel_capabilities
+                            .as_ref()
+                            .map(|capabilities| capabilities.read_receipts)
+                            .unwrap_or(false)
+                    {
+                        crate::channels::activity::warn_unsupported_activity_feature(
+                            channel_id,
+                            "read_receipts",
+                        );
+                    }
                     let read_receipt = if channel_capabilities
                         .as_ref()
                         .map(|capabilities| capabilities.read_receipts)

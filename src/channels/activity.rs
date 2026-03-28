@@ -4,10 +4,11 @@
 //! receipts) and the runtime helpers that drive those side effects.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc as sync_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::Duration;
 
@@ -27,12 +28,15 @@ use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
-const ACTIVITY_DISPATCH_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+const ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS: u64 = 10;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
 const STOP_STATE_FALLBACK_RESERVED: u8 = 3;
 const STOP_STATE_COMPLETED: u8 = 4;
+
+static UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -122,6 +126,7 @@ pub struct ActivityDispatcher {
     read_receipt_backlog: Arc<AtomicUsize>,
     stop_typing_backlog: Arc<AtomicUsize>,
     backlog_warning_threshold: usize,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl Default for ActivityDispatcher {
@@ -132,12 +137,27 @@ impl Default for ActivityDispatcher {
 
 impl ActivityDispatcher {
     pub fn new() -> Self {
-        Self::with_backlog_warning_threshold(ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD)
+        Self::with_options(
+            ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD,
+            Duration::from_secs(ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS),
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_backlog_warning_threshold(backlog_warning_threshold: usize) -> Self {
+        Self::with_options(
+            backlog_warning_threshold,
+            Duration::from_secs(ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS),
+        )
+    }
+
+    pub(crate) fn with_options(
+        backlog_warning_threshold: usize,
+        operation_timeout: Duration,
+    ) -> Self {
         let read_receipt_backlog = Arc::new(AtomicUsize::new(0));
         let stop_typing_backlog = Arc::new(AtomicUsize::new(0));
+        let shutting_down = Arc::new(AtomicBool::new(false));
 
         // Once upstream auto-receipts are disabled, Carapace owns explicit
         // read-receipt delivery for the message. Keep this queue non-lossy so
@@ -146,15 +166,21 @@ impl ActivityDispatcher {
         let (read_receipt_tx, read_receipt_rx) =
             sync_mpsc::channel::<VerifiedReadReceiptDispatchRequest>();
         let read_receipt_backlog_worker = read_receipt_backlog.clone();
+        let read_receipt_shutdown = shutting_down.clone();
+        let read_receipt_timeout = operation_timeout;
         let read_receipt_worker = thread::Builder::new()
             .name("carapace-read-receipts".to_string())
             .spawn(move || {
                 while let Ok(request) = read_receipt_rx.recv() {
                     read_receipt_backlog_worker.fetch_sub(1, Ordering::AcqRel);
+                    if read_receipt_shutdown.load(Ordering::Acquire) {
+                        continue;
+                    }
                     dispatch_read_receipt_blocking(
                         request.plugin,
                         &request.channel_id,
                         request.ctx,
+                        read_receipt_timeout,
                     );
                 }
             })
@@ -162,6 +188,8 @@ impl ActivityDispatcher {
 
         let (stop_typing_tx, stop_typing_rx) = sync_mpsc::channel::<StopTypingDispatchRequest>();
         let stop_typing_backlog_worker = stop_typing_backlog.clone();
+        let stop_typing_shutdown = shutting_down.clone();
+        let stop_typing_timeout = operation_timeout;
         let stop_typing_worker = thread::Builder::new()
             .name("carapace-stop-typing".to_string())
             .spawn(move || {
@@ -171,11 +199,16 @@ impl ActivityDispatcher {
                 // of active typing loops in the runtime.
                 while let Ok(request) = stop_typing_rx.recv() {
                     stop_typing_backlog_worker.fetch_sub(1, Ordering::AcqRel);
+                    if stop_typing_shutdown.load(Ordering::Acquire) {
+                        mark_stop_completed(request.stop_state.as_ref());
+                        continue;
+                    }
                     dispatch_stop_typing_blocking(
                         request.plugin,
                         &request.channel_id,
                         request.ctx,
                         request.stop_state,
+                        stop_typing_timeout,
                     );
                 }
             })
@@ -189,6 +222,7 @@ impl ActivityDispatcher {
             read_receipt_backlog,
             stop_typing_backlog,
             backlog_warning_threshold,
+            shutting_down,
         }
     }
 
@@ -275,23 +309,30 @@ impl ActivityDispatcher {
     }
 
     pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let pending_read_receipts = self.read_receipt_backlog.load(Ordering::Acquire);
+        if pending_read_receipts > 0 {
+            tracing::warn!(
+                backlog = pending_read_receipts,
+                "dropping queued read receipts during activity dispatcher shutdown"
+            );
+        }
+        let pending_stop_typing = self.stop_typing_backlog.load(Ordering::Acquire);
+        if pending_stop_typing > 0 {
+            tracing::warn!(
+                backlog = pending_stop_typing,
+                "dropping queued stop-typing cleanups during activity dispatcher shutdown"
+            );
+        }
         self.read_receipt_tx.lock().take();
         self.stop_typing_tx.lock().take();
 
         if let Some(worker) = self.read_receipt_worker.lock().take() {
-            join_activity_worker_with_timeout(
-                worker,
-                "read receipt",
-                Duration::from_secs(ACTIVITY_DISPATCH_SHUTDOWN_TIMEOUT_SECS),
-            );
+            join_activity_worker(worker, "read receipt");
         }
 
         if let Some(worker) = self.stop_typing_worker.lock().take() {
-            join_activity_worker_with_timeout(
-                worker,
-                "stop typing",
-                Duration::from_secs(ACTIVITY_DISPATCH_SHUTDOWN_TIMEOUT_SECS),
-            );
+            join_activity_worker(worker, "stop typing");
         }
     }
 }
@@ -528,6 +569,7 @@ pub async fn maybe_start_typing_loop(
         None => get_capabilities(plugin.clone()).await.ok()?,
     };
     if !capabilities.typing_indicators {
+        warn_unsupported_activity_feature(channel_id, "typing");
         return None;
     }
 
@@ -616,20 +658,26 @@ fn reserve_task_stop(stop_state: &AtomicU8) -> bool {
 }
 
 fn stop_fallback_needed(stop_state: &AtomicU8) -> bool {
-    for expected in [STOP_STATE_NOT_REQUESTED, STOP_STATE_TASK_RESERVED] {
-        if stop_state
-            .compare_exchange(
-                expected,
-                STOP_STATE_FALLBACK_RESERVED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            return true;
+    let mut current = stop_state.load(Ordering::Acquire);
+    loop {
+        match current {
+            STOP_STATE_NOT_REQUESTED | STOP_STATE_TASK_RESERVED => {
+                match stop_state.compare_exchange(
+                    current,
+                    STOP_STATE_FALLBACK_RESERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(next) => current = next,
+                }
+            }
+            STOP_STATE_TASK_RUNNING | STOP_STATE_FALLBACK_RESERVED | STOP_STATE_COMPLETED => {
+                return false;
+            }
+            _ => return false,
         }
     }
-    false
 }
 
 fn mark_stop_completed(stop_state: &AtomicU8) {
@@ -724,41 +772,57 @@ fn observe_finished_typing_task_after_abort(task: JoinHandle<()>, channel_id: &s
     }
 }
 
-fn join_activity_worker_with_timeout(
-    worker: thread::JoinHandle<()>,
+fn join_activity_worker(worker: thread::JoinHandle<()>, activity: &'static str) {
+    if let Err(payload) = worker.join() {
+        tracing::warn!(
+            activity,
+            error = %panic_payload_to_string(payload),
+            "activity dispatcher worker panicked during shutdown"
+        );
+    }
+}
+
+enum ActivityOperationOutcome {
+    Ok,
+    Error(BindingError),
+    TimedOut,
+    Panicked(String),
+    SpawnFailed(String),
+    Disconnected,
+}
+
+fn run_activity_operation_with_timeout<F>(
     activity: &'static str,
     timeout: Duration,
-) {
-    let (done_tx, done_rx) = sync_mpsc::sync_channel::<()>(1);
-    let join_activity = activity.to_string();
-    let _join_helper = thread::Builder::new()
-        .name(format!("carapace-{activity}-join"))
+    operation: F,
+) -> ActivityOperationOutcome
+where
+    F: FnOnce() -> Result<(), BindingError> + Send + 'static,
+{
+    let (done_tx, done_rx) = sync_mpsc::sync_channel(1);
+    // Blocking threads cannot be force-cancelled in-process, so bound the
+    // worker's wait time here and let shutdown join the real worker threads
+    // directly after they drain or skip queued work.
+    match thread::Builder::new()
+        .name(format!("carapace-{activity}-op"))
         .spawn(move || {
-            if let Err(payload) = worker.join() {
-                tracing::warn!(
-                    activity = %join_activity,
-                    error = %panic_payload_to_string(payload),
-                    "activity dispatcher worker panicked during shutdown"
-                );
+            let outcome = match catch_unwind(AssertUnwindSafe(operation)) {
+                Ok(Ok(())) => ActivityOperationOutcome::Ok,
+                Ok(Err(err)) => ActivityOperationOutcome::Error(err),
+                Err(payload) => {
+                    ActivityOperationOutcome::Panicked(panic_payload_to_string(payload))
+                }
+            };
+            let _ = done_tx.send(outcome);
+        }) {
+        Ok(_op_thread) => match done_rx.recv_timeout(timeout) {
+            Ok(outcome) => outcome,
+            Err(sync_mpsc::RecvTimeoutError::Timeout) => ActivityOperationOutcome::TimedOut,
+            Err(sync_mpsc::RecvTimeoutError::Disconnected) => {
+                ActivityOperationOutcome::Disconnected
             }
-            let _ = done_tx.send(());
-        });
-
-    match done_rx.recv_timeout(timeout) {
-        Ok(()) => {}
-        Err(sync_mpsc::RecvTimeoutError::Timeout) => {
-            tracing::warn!(
-                activity,
-                timeout_ms = timeout.as_millis(),
-                "activity dispatcher worker did not drain before shutdown timeout"
-            );
-        }
-        Err(sync_mpsc::RecvTimeoutError::Disconnected) => {
-            tracing::warn!(
-                activity,
-                "activity dispatcher join helper disconnected during shutdown"
-            );
-        }
+        },
+        Err(err) => ActivityOperationOutcome::SpawnFailed(err.to_string()),
     }
 }
 
@@ -813,7 +877,12 @@ async fn send_verified_read_receipt_with_plugin(
     let channel_id = channel_id.to_string();
     let worker_channel_id = channel_id.clone();
     match tokio::task::spawn_blocking(move || {
-        dispatch_read_receipt_blocking(plugin, &worker_channel_id, ctx);
+        dispatch_read_receipt_blocking(
+            plugin,
+            &worker_channel_id,
+            ctx,
+            Duration::from_secs(ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS),
+        );
     })
     .await
     {
@@ -859,18 +928,40 @@ fn dispatch_read_receipt_blocking(
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: &str,
     ctx: ReadReceiptContext,
+    timeout: Duration,
 ) {
-    let result = catch_unwind(AssertUnwindSafe(|| plugin.mark_read(ctx)));
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
+    match run_activity_operation_with_timeout("read-receipt", timeout, move || {
+        plugin.mark_read(ctx)
+    }) {
+        ActivityOperationOutcome::Ok => {}
+        ActivityOperationOutcome::Error(err) => {
             tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
         }
-        Err(payload) => {
+        ActivityOperationOutcome::TimedOut => {
             tracing::warn!(
                 channel = %channel_id,
-                error = %panic_payload_to_string(payload),
+                timeout_ms = timeout.as_millis(),
+                "read receipt timed out in activity dispatcher"
+            );
+        }
+        ActivityOperationOutcome::Panicked(error) => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %error,
                 "read receipt dispatcher panicked"
+            );
+        }
+        ActivityOperationOutcome::SpawnFailed(error) => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %error,
+                "failed to spawn read receipt activity operation"
+            );
+        }
+        ActivityOperationOutcome::Disconnected => {
+            tracing::warn!(
+                channel = %channel_id,
+                "read receipt activity operation disconnected before reporting a result"
             );
         }
     }
@@ -881,25 +972,60 @@ fn dispatch_stop_typing_blocking(
     channel_id: &str,
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
+    timeout: Duration,
 ) {
-    let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
+    let result = run_activity_operation_with_timeout("stop-typing", timeout, move || {
+        plugin.stop_typing(ctx)
+    });
     mark_stop_completed(stop_state.as_ref());
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
+        ActivityOperationOutcome::Ok => {}
+        ActivityOperationOutcome::Error(err) => {
             tracing::warn!(
                 channel = %channel_id,
                 error = %err,
                 "failed to stop typing indicator after drop"
             );
         }
-        Err(payload) => {
+        ActivityOperationOutcome::TimedOut => {
             tracing::warn!(
                 channel = %channel_id,
-                error = %panic_payload_to_string(payload),
+                timeout_ms = timeout.as_millis(),
+                "stop typing activity timed out during cleanup"
+            );
+        }
+        ActivityOperationOutcome::Panicked(error) => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %error,
                 "stop typing dispatcher panicked"
             );
         }
+        ActivityOperationOutcome::SpawnFailed(error) => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %error,
+                "failed to spawn stop typing activity operation"
+            );
+        }
+        ActivityOperationOutcome::Disconnected => {
+            tracing::warn!(
+                channel = %channel_id,
+                "stop typing activity operation disconnected before reporting a result"
+            );
+        }
+    }
+}
+
+pub(crate) fn warn_unsupported_activity_feature(channel_id: &str, feature: &str) {
+    let key = format!("{channel_id}:{feature}");
+    let mut seen = UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock();
+    if seen.insert(key) {
+        tracing::warn!(
+            channel = %channel_id,
+            feature,
+            "channel activity feature is enabled in config but unsupported by this channel; ignoring"
+        );
     }
 }
 
@@ -1508,6 +1634,16 @@ mod tests {
         assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_TASK_RUNNING);
     }
 
+    #[test]
+    fn test_stop_fallback_needed_claims_reserved_state() {
+        let stop_state = AtomicU8::new(STOP_STATE_TASK_RESERVED);
+        assert!(stop_fallback_needed(&stop_state));
+        assert_eq!(
+            stop_state.load(Ordering::Acquire),
+            STOP_STATE_FALLBACK_RESERVED
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_invoke_stop_typing_marks_completed_even_if_waiter_is_aborted() {
         let plugin = Arc::new(MockChannel::with_stop_typing_delay(
@@ -1570,6 +1706,16 @@ mod tests {
     }
 
     #[test]
+    fn test_stop_fallback_needed_preserves_fallback_reserved_state() {
+        let stop_state = AtomicU8::new(STOP_STATE_FALLBACK_RESERVED);
+        assert!(!stop_fallback_needed(&stop_state));
+        assert_eq!(
+            stop_state.load(Ordering::Acquire),
+            STOP_STATE_FALLBACK_RESERVED
+        );
+    }
+
+    #[test]
     fn test_typing_refresh_retry_delay_backs_off_and_caps() {
         let base = Duration::from_secs(2);
         assert_eq!(typing_refresh_retry_delay(base, 0), Duration::from_secs(2));
@@ -1604,17 +1750,30 @@ mod tests {
     }
 
     #[test]
-    fn test_join_activity_worker_with_timeout_returns_promptly_when_worker_stalls() {
-        let worker = thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(50));
-        });
-
+    fn test_activity_dispatcher_shutdown_returns_promptly_when_worker_operation_stalls() {
+        let dispatcher = ActivityDispatcher::with_options(8, Duration::from_millis(5));
+        let plugin = Arc::new(MockChannel::with_mark_read_delay(
+            ChannelCapabilities {
+                read_receipts: true,
+                ..Default::default()
+            },
+            Duration::from_millis(250),
+        ));
+        dispatcher.dispatch_verified_read_receipt(
+            plugin,
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            },
+        );
         let started_at = std::time::Instant::now();
-        join_activity_worker_with_timeout(worker, "test", Duration::from_millis(5));
+        dispatcher.shutdown();
 
         assert!(
-            started_at.elapsed() < Duration::from_millis(40),
-            "shutdown helper should stay bounded when a worker stalls"
+            started_at.elapsed() < Duration::from_millis(100),
+            "dispatcher shutdown should stay bounded when an activity operation stalls"
         );
     }
 

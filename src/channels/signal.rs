@@ -225,6 +225,11 @@ fn signal_http_error_message_with_body_prefix(
 }
 
 fn sanitize_signal_error_excerpt(body_text: &str) -> String {
+    static SECRET_LABELED_NUMERIC_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)\b(code|otp|pin|verification|confirmation)([:=])(\d{4,8})\b")
+                .expect("valid secret-labeled numeric regex")
+        });
     static KNOWN_LABELED_PHONE_RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| {
             regex::Regex::new(
@@ -248,6 +253,9 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
         .map(redact_sensitive_signal_token)
         .collect::<Vec<_>>()
         .join(" ");
+    let collapsed = SECRET_LABELED_NUMERIC_RE
+        .replace_all(&collapsed, "$1$2[redacted]")
+        .into_owned();
     let collapsed = KNOWN_LABELED_PHONE_RE
         .replace_all(&collapsed, "$1$2[redacted]")
         .into_owned();
@@ -279,7 +287,7 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
 fn preserves_numeric_label(label: &str) -> bool {
     matches!(
         label.to_ascii_lowercase().as_str(),
-        "port" | "code" | "status" | "ref"
+        "port" | "status" | "ref"
     )
 }
 
@@ -742,11 +750,28 @@ mod tests {
         let message = signal_http_error_message_with_body_prefix(
             "signal send",
             StatusCode::BAD_REQUEST,
-            "ref:1234567890 port:8080 code=4000",
+            "ref:1234567890 port:8080 status=4000",
         );
         assert!(message.contains("ref:1234567890"));
         assert!(message.contains("port:8080"));
-        assert!(message.contains("code=4000"));
+        assert!(message.contains("status=4000"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_secret_labeled_short_numeric_values() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "code=123456 otp:4321 pin=9876 verification=112233 confirmation:445566",
+        );
+        assert!(message.contains("code=[redacted]"));
+        assert!(message.contains("otp:[redacted]"));
+        assert!(message.contains("pin=[redacted]"));
+        assert!(message.contains("verification=[redacted]"));
+        assert!(message.contains("confirmation:[redacted]"));
+        assert!(!message.contains("123456"));
+        assert!(!message.contains("4321"));
+        assert!(!message.contains("9876"));
     }
 
     #[test]

@@ -654,6 +654,32 @@ mod tests {
     }
 
     #[test]
+    fn test_build_receive_url_preserves_non_root_path_prefix() {
+        assert_eq!(
+            build_receive_url(
+                &url::Url::parse("http://localhost:8080/api").unwrap(),
+                "+15551234567",
+                false
+            )
+            .as_str(),
+            "http://localhost:8080/api/v1/receive/%2B15551234567"
+        );
+    }
+
+    #[test]
+    fn test_build_receive_url_preserves_non_root_path_prefix_and_query() {
+        assert_eq!(
+            build_receive_url(
+                &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
+                "+15551234567",
+                true
+            )
+            .as_str(),
+            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+        );
+    }
+
+    #[test]
     fn test_validate_signal_receive_url_rejects_non_https_non_loopback_base_url() {
         let err = validate_signal_url("http://example.com:8080", "signal receive", true)
             .expect_err("non-loopback receive URL should be rejected");
