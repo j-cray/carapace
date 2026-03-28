@@ -1208,37 +1208,38 @@ pub async fn execute_run(
     } else {
         None
     };
-    let channel_capabilities = if let (Some(channel_id), Some(plugin_registry)) =
-        (delivery_channel_id, state.plugin_registry())
-    {
-        if let Some(plugin) = plugin_registry.get_channel(channel_id) {
-            match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
-                Ok(Ok(capabilities)) => Some(capabilities),
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        channel = %channel_id,
-                        error = %err,
-                        "failed to load channel capabilities for activity features"
-                    );
-                    None
+    let (channel_capabilities, capability_probe_failed) =
+        if let (Some(channel_id), Some(plugin_registry)) =
+            (delivery_channel_id, state.plugin_registry())
+        {
+            if let Some(plugin) = plugin_registry.get_channel(channel_id) {
+                match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
+                    Ok(Ok(capabilities)) => (Some(capabilities), false),
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            channel = %channel_id,
+                            error = %err,
+                            "failed to load channel capabilities for activity features"
+                        );
+                        (None, true)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            channel = %channel_id,
+                            error = %err,
+                            "activity capability worker failed"
+                        );
+                        (None, true)
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        channel = %channel_id,
-                        error = %err,
-                        "activity capability worker failed"
-                    );
-                    None
-                }
+            } else {
+                (None, false)
             }
         } else {
-            None
-        }
-    } else {
-        None
-    };
+            (None, false)
+        };
 
     let mut typing_handle = if let (Some(channel_id), Some(plugin_registry), Some(policy)) = (
         delivery_channel_id,
@@ -1275,7 +1276,7 @@ pub async fn execute_run(
                         channel_id,
                         policy,
                         channel_capabilities.clone(),
-                        state.activity_dispatcher().clone(),
+                        state.activity_service().clone(),
                         ctx,
                     )
                     .await
@@ -1362,26 +1363,29 @@ pub async fn execute_run(
                         .as_ref()
                         .map(|policy| policy.read_receipts.enabled)
                         .unwrap_or(false)
+                        && read_receipt_context.is_none()
                         && !channel_capabilities
                             .as_ref()
                             .map(|capabilities| capabilities.read_receipts)
                             .unwrap_or(false)
                     {
-                        crate::channels::activity::warn_unsupported_activity_feature(
-                            channel_id,
-                            "read_receipts",
-                        );
+                        state
+                            .activity_service()
+                            .warn_unsupported_feature(channel_id, "read_receipts");
                     }
-                    let read_receipt = if channel_capabilities
-                        .as_ref()
-                        .map(|capabilities| capabilities.read_receipts)
-                        .unwrap_or(false)
-                    {
+                    let read_receipt = if read_receipt_context.is_some() {
+                        if capability_probe_failed {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                channel = %channel_id,
+                                "preserving explicit read receipt after capability probe failure because upstream auto-receipts were already suppressed at receive time"
+                            );
+                        }
                         // Presence of read_receipt_context snapshots the receive-time
                         // decision that Carapace owns the explicit ack for this
                         // message. Preserve that context across later config changes
-                        // so we do not drop acknowledgements after auto-receipts were
-                        // already suppressed upstream.
+                        // and later capability-probe failures so we do not drop
+                        // acknowledgements after auto-receipts were already suppressed upstream.
                         read_receipt_context.clone()
                     } else {
                         None
@@ -1604,6 +1608,7 @@ mod tests {
     struct ActivityRecordingChannel {
         events: Mutex<Vec<&'static str>>,
         mark_read_notify: Notify,
+        capability_error: Option<&'static str>,
     }
 
     impl ActivityRecordingChannel {
@@ -1611,6 +1616,14 @@ mod tests {
             Self {
                 events: Mutex::new(Vec::new()),
                 mark_read_notify: Notify::new(),
+                capability_error: None,
+            }
+        }
+
+        fn with_capability_error(error: &'static str) -> Self {
+            Self {
+                capability_error: Some(error),
+                ..Self::new()
             }
         }
 
@@ -1636,6 +1649,9 @@ mod tests {
         }
 
         fn get_capabilities(&self) -> Result<ChannelCapabilities, BindingError> {
+            if let Some(error) = self.capability_error {
+                return Err(BindingError::CallError(error.to_string()));
+            }
             Ok(ChannelCapabilities {
                 typing_indicators: true,
                 read_receipts: true,
@@ -2283,15 +2299,15 @@ mod tests {
 
         let channel_ids = state.message_pipeline().channels_with_messages();
         assert_eq!(channel_ids, vec!["signal".to_string()]);
-        let dispatcher =
-            crate::channels::activity::ActivityDispatcher::with_backlog_warning_threshold(8);
+        let activity_service =
+            crate::channels::activity::ActivityService::with_backlog_warning_threshold(8);
 
         crate::messages::delivery::process_channel_messages(
             &channel_ids,
             state.message_pipeline(),
             &plugin_registry,
             state.channel_registry(),
-            &dispatcher,
+            &activity_service,
         )
         .await;
 
@@ -2301,7 +2317,7 @@ mod tests {
         )
         .await
         .expect("delivery success should trigger a read receipt");
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
 
         assert_eq!(plugin.events(), vec!["start", "stop", "send", "read"]);
         crate::config::clear_cache();
@@ -2352,6 +2368,58 @@ mod tests {
         assert!(
             queued.message.metadata.read_receipt.is_some(),
             "receive-time read receipt context should be preserved even if policy is later disabled"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_channel_activity_preserves_receive_time_read_receipt_context_when_capability_probe_fails(
+    ) {
+        crate::config::clear_cache();
+        crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
+
+        let plugin = Arc::new(ActivityRecordingChannel::with_capability_error(
+            "capability probe failed",
+        ));
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin);
+        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry);
+        state.channel_registry().register(
+            crate::channels::ChannelInfo::new("signal", "Signal")
+                .with_status(crate::channels::ChannelStatus::Connected),
+        );
+
+        let run_id = "run-channel-activity-capability-failure";
+        let session_key = "test-channel-activity-capability-failure";
+        let chat_id = "+15551234567";
+        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
+
+        let provider = Arc::new(MockProvider::text("Hello world!"));
+        let config = AgentConfig {
+            max_turns: 5,
+            deliver: true,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let queued = state
+            .message_pipeline()
+            .next_for_channel("signal")
+            .expect("execute_run should queue a signal delivery");
+        assert!(
+            queued.message.metadata.read_receipt.is_some(),
+            "receive-time read receipt context should be preserved even if the later capability probe fails"
         );
 
         crate::config::clear_cache();

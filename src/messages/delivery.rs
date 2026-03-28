@@ -47,7 +47,7 @@ pub async fn delivery_loop(
             &pipeline,
             &plugin_registry,
             &channel_registry,
-            state.activity_dispatcher(),
+            state.activity_service(),
         )
         .await;
     }
@@ -59,7 +59,7 @@ pub(crate) async fn process_channel_messages(
     pipeline: &MessagePipeline,
     plugin_registry: &Arc<PluginRegistry>,
     channel_registry: &ChannelRegistry,
-    activity_dispatcher: &crate::channels::activity::ActivityDispatcher,
+    activity_service: &crate::channels::activity::ActivityService,
 ) {
     for channel_id in channel_ids {
         if !channel_registry.is_connected(channel_id) {
@@ -167,7 +167,7 @@ pub(crate) async fn process_channel_messages(
             &message.metadata,
             &message_id,
             result,
-            activity_dispatcher,
+            activity_service,
         )
         .await;
     }
@@ -181,7 +181,7 @@ async fn handle_delivery_result(
     metadata: &crate::messages::outbound::MessageMetadata,
     message_id: &crate::messages::outbound::MessageId,
     result: Result<plugins::DeliveryResult, plugins::BindingError>,
-    activity_dispatcher: &crate::channels::activity::ActivityDispatcher,
+    activity_service: &crate::channels::activity::ActivityService,
 ) {
     match result {
         Ok(delivery) if delivery.ok => {
@@ -189,7 +189,7 @@ async fn handle_delivery_result(
             if let Some(read_receipt) = metadata.read_receipt.clone() {
                 // Keep delivery success on the hot path and dispatch read
                 // receipts through the owned activity worker.
-                activity_dispatcher
+                activity_service
                     .dispatch_verified_read_receipt(plugin.clone(), channel_id, read_receipt)
                     .await;
             }
@@ -461,8 +461,8 @@ mod tests {
         }
     }
 
-    fn test_activity_dispatcher() -> crate::channels::activity::ActivityDispatcher {
-        crate::channels::activity::ActivityDispatcher::with_backlog_warning_threshold(8)
+    fn test_activity_service() -> crate::channels::activity::ActivityService {
+        crate::channels::activity::ActivityService::with_backlog_warning_threshold(8)
     }
 
     fn make_pipeline_and_registries(
@@ -757,7 +757,7 @@ mod tests {
         ));
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let dispatcher = test_activity_dispatcher();
+        let activity_service = test_activity_service();
 
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("carapace.json5");
@@ -815,14 +815,14 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
-            &dispatcher,
+            &activity_service,
         )
         .await;
 
         tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
             .await
             .expect("read receipt should be dispatched asynchronously");
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
@@ -839,7 +839,7 @@ mod tests {
         ));
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let dispatcher = test_activity_dispatcher();
+        let activity_service = test_activity_service();
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
@@ -859,14 +859,14 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
-            &dispatcher,
+            &activity_service,
         )
         .await;
 
         tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
             .await
             .expect("read receipt should be dispatched asynchronously");
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
 
         assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 1);
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
@@ -881,7 +881,7 @@ mod tests {
         let mock = Arc::new(MockChannel::with_read_receipts());
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let dispatcher = test_activity_dispatcher();
+        let activity_service = test_activity_service();
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
@@ -915,10 +915,10 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
-            &dispatcher,
+            &activity_service,
         )
         .await;
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
@@ -932,7 +932,7 @@ mod tests {
         let mock = Arc::new(MockChannel::with_read_receipts());
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let dispatcher = test_activity_dispatcher();
+        let activity_service = test_activity_service();
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
@@ -961,10 +961,10 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
-            &dispatcher,
+            &activity_service,
         )
         .await;
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
@@ -983,7 +983,7 @@ mod tests {
         });
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let dispatcher = test_activity_dispatcher();
+        let activity_service = test_activity_service();
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
@@ -1019,7 +1019,7 @@ mod tests {
                     to_jid: None,
                     poll_id: None,
                 }),
-                &dispatcher,
+                &activity_service,
             ),
         )
         .await
@@ -1029,7 +1029,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
             .await
             .expect("read receipt should complete asynchronously after delivery result returns");
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
     }
 

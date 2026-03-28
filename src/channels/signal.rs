@@ -166,7 +166,7 @@ impl SignalChannel {
             .send()
         {
             Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => Err(signal_http_call_error_from_response(
+            Ok(resp) => Err(signal_http_status_call_error_from_response(
                 "signal typing indicator",
                 resp,
             )),
@@ -198,7 +198,7 @@ impl SignalChannel {
             .send()
         {
             Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => Err(signal_http_call_error_from_response(
+            Ok(resp) => Err(signal_http_status_call_error_from_response(
                 "signal read receipt",
                 resp,
             )),
@@ -210,15 +210,15 @@ impl SignalChannel {
     }
 }
 
-fn signal_http_call_error_from_response(
+fn signal_http_status_call_error_from_response(
     operation: &str,
     resp: reqwest::blocking::Response,
 ) -> BindingError {
-    let status = resp.status();
-    let body_text = resp.text().unwrap_or_default();
-    BindingError::CallError(signal_http_error_message_with_body_prefix(
-        operation, status, &body_text,
-    ))
+    BindingError::CallError(signal_http_status_error_message(operation, resp.status()))
+}
+
+fn signal_http_status_error_message(operation: &str, status: StatusCode) -> String {
+    format!("{operation} HTTP {status}")
 }
 
 fn signal_http_error_message_with_body_prefix(
@@ -766,6 +766,13 @@ mod tests {
         assert!(message.starts_with("signal send HTTP 400 Bad Request: "));
         assert!(message.ends_with("..."));
         assert!(message.len() < 320);
+    }
+
+    #[test]
+    fn test_signal_activity_error_message_omits_remote_body() {
+        let message =
+            signal_http_status_error_message("signal read receipt", StatusCode::BAD_REQUEST);
+        assert_eq!(message, "signal read receipt HTTP 400 Bad Request");
     }
 
     #[test]

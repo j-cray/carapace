@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc as sync_mpsc;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,9 +98,6 @@ impl UnsupportedActivityWarningRegistry {
         self.seen_at.clear();
     }
 }
-
-static UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS: LazyLock<Mutex<UnsupportedActivityWarningRegistry>> =
-    LazyLock::new(|| Mutex::new(UnsupportedActivityWarningRegistry::default()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -182,6 +179,89 @@ struct StopTypingDispatchRequest {
     channel_id: String,
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
+}
+
+pub struct ActivityService {
+    dispatcher: Arc<ActivityDispatcher>,
+    unsupported_feature_warnings: Mutex<UnsupportedActivityWarningRegistry>,
+}
+
+impl Default for ActivityService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActivityService {
+    pub fn new() -> Self {
+        Self {
+            dispatcher: Arc::new(ActivityDispatcher::new()),
+            unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_backlog_warning_threshold(backlog_warning_threshold: usize) -> Self {
+        Self {
+            dispatcher: Arc::new(ActivityDispatcher::with_backlog_warning_threshold(
+                backlog_warning_threshold,
+            )),
+            unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
+        }
+    }
+
+    pub fn dispatcher(&self) -> &Arc<ActivityDispatcher> {
+        &self.dispatcher
+    }
+
+    pub async fn dispatch_verified_read_receipt(
+        &self,
+        plugin: Arc<dyn ChannelPluginInstance>,
+        channel_id: &str,
+        ctx: ReadReceiptContext,
+    ) {
+        self.dispatcher
+            .dispatch_verified_read_receipt(plugin, channel_id, ctx)
+            .await;
+    }
+
+    pub fn dispatch_stop_typing(
+        &self,
+        plugin: Arc<dyn ChannelPluginInstance>,
+        channel_id: &str,
+        ctx: TypingContext,
+        stop_state: Arc<AtomicU8>,
+    ) {
+        self.dispatcher
+            .dispatch_stop_typing(plugin, channel_id, ctx, stop_state);
+    }
+
+    pub fn warn_unsupported_feature(&self, channel_id: &str, feature: &str) {
+        let key = format!("{channel_id}:{feature}");
+        let should_warn = {
+            let mut registry = self.unsupported_feature_warnings.lock();
+            registry.should_warn(&key, Instant::now())
+        };
+        if should_warn {
+            tracing::warn!(
+                channel = %channel_id,
+                feature,
+                "channel activity feature is enabled in config but unsupported by this channel; ignoring"
+            );
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let dispatcher = self.dispatcher.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || dispatcher.shutdown()).await {
+            tracing::warn!(error = %err, "activity service shutdown worker failed");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_unsupported_activity_feature_warnings_for_test(&self) {
+        self.unsupported_feature_warnings.lock().reset();
+    }
 }
 
 pub struct ActivityDispatcher {
@@ -692,7 +772,7 @@ pub async fn maybe_start_typing_loop(
     channel_id: &str,
     policy: &ChannelActivityPolicy,
     prefetched_capabilities: Option<crate::plugins::ChannelCapabilities>,
-    activity_dispatcher: Arc<ActivityDispatcher>,
+    activity_service: Arc<ActivityService>,
     ctx: TypingContext,
 ) -> Option<TypingLoopHandle> {
     if !policy.typing.enabled {
@@ -705,7 +785,7 @@ pub async fn maybe_start_typing_loop(
         None => get_capabilities(plugin.clone()).await.ok()?,
     };
     if !capabilities.typing_indicators {
-        warn_unsupported_activity_feature(channel_id, "typing");
+        activity_service.warn_unsupported_feature(channel_id, "typing");
         return None;
     }
 
@@ -780,7 +860,7 @@ pub async fn maybe_start_typing_loop(
         ctx: handle_ctx,
         channel_id: handle_channel_id,
         stop_state: handle_stop_state,
-        activity_dispatcher,
+        activity_dispatcher: activity_service.dispatcher().clone(),
     })
 }
 
@@ -1095,26 +1175,6 @@ fn dispatch_stop_typing_blocking(
     }
 }
 
-pub(crate) fn warn_unsupported_activity_feature(channel_id: &str, feature: &str) {
-    let key = format!("{channel_id}:{feature}");
-    let should_warn = {
-        let mut registry = UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock();
-        registry.should_warn(&key, Instant::now())
-    };
-    if should_warn {
-        tracing::warn!(
-            channel = %channel_id,
-            feature,
-            "channel activity feature is enabled in config but unsupported by this channel; ignoring"
-        );
-    }
-}
-
-#[cfg(test)]
-fn reset_unsupported_activity_feature_warnings_for_test() {
-    UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock().reset();
-}
-
 fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
     let payload = payload.as_ref();
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -1140,6 +1200,7 @@ mod tests {
         start_typing_count: AtomicU32,
         stop_typing_count: AtomicU32,
         mark_read_count: AtomicU32,
+        mark_read_started_notify: Option<Arc<Notify>>,
         mark_read_notify: Option<Arc<Notify>>,
         stop_typing_notify: Option<Arc<Notify>>,
         mark_read_delay: Duration,
@@ -1162,6 +1223,7 @@ mod tests {
                 start_typing_count: AtomicU32::new(0),
                 stop_typing_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
+                mark_read_started_notify: None,
                 mark_read_notify: None,
                 stop_typing_notify,
                 mark_read_delay: Duration::ZERO,
@@ -1210,6 +1272,18 @@ mod tests {
                 ..Self::with_stop_typing_notify(caps, None)
             }
         }
+
+        fn with_mark_read_delay_and_notify(
+            caps: ChannelCapabilities,
+            mark_read_delay: Duration,
+            mark_read_started_notify: Arc<Notify>,
+        ) -> Self {
+            Self {
+                mark_read_delay,
+                mark_read_started_notify: Some(mark_read_started_notify),
+                ..Self::with_stop_typing_notify(caps, None)
+            }
+        }
     }
 
     impl ChannelPluginInstance for MockChannel {
@@ -1254,6 +1328,9 @@ mod tests {
         }
 
         fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
+            if let Some(notify) = &self.mark_read_started_notify {
+                notify.notify_one();
+            }
             if self.panic_mark_read_count.load(Ordering::Relaxed) > 0 {
                 self.panic_mark_read_count.fetch_sub(1, Ordering::Relaxed);
                 panic!("mock mark_read panic");
@@ -1476,13 +1553,13 @@ mod tests {
             ..Default::default()
         };
 
-        let dispatcher = Arc::new(ActivityDispatcher::new());
+        let activity_service = Arc::new(ActivityService::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
-            dispatcher.clone(),
+            activity_service.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1496,7 +1573,7 @@ mod tests {
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
     }
 
     #[tokio::test]
@@ -1520,13 +1597,13 @@ mod tests {
             ..Default::default()
         };
 
-        let dispatcher = Arc::new(ActivityDispatcher::new());
+        let activity_service = Arc::new(ActivityService::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
-            dispatcher.clone(),
+            activity_service.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1542,7 +1619,7 @@ mod tests {
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1566,13 +1643,13 @@ mod tests {
             ..Default::default()
         };
 
-        let dispatcher = Arc::new(ActivityDispatcher::new());
+        let activity_service = Arc::new(ActivityService::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
-            dispatcher.clone(),
+            activity_service.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1589,7 +1666,7 @@ mod tests {
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1614,13 +1691,13 @@ mod tests {
             ..Default::default()
         };
 
-        let dispatcher = Arc::new(ActivityDispatcher::new());
+        let activity_service = Arc::new(ActivityService::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
-            dispatcher.clone(),
+            activity_service.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1639,7 +1716,7 @@ mod tests {
             .await
             .expect("drop should still schedule stop_typing asynchronously");
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1663,13 +1740,13 @@ mod tests {
             ..Default::default()
         };
 
-        let dispatcher = Arc::new(ActivityDispatcher::new());
+        let activity_service = Arc::new(ActivityService::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
-            dispatcher.clone(),
+            activity_service.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1688,7 +1765,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
-        dispatcher.shutdown();
+        activity_service.shutdown().await;
     }
 
     #[tokio::test]
@@ -1913,13 +1990,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_activity_dispatcher_drop_joins_workers_without_explicit_shutdown() {
+        let mark_read_started_notify = Arc::new(Notify::new());
         let dispatcher = ActivityDispatcher::with_options(8, READ_RECEIPT_DISPATCH_QUEUE_CAPACITY);
-        let plugin = Arc::new(MockChannel::with_mark_read_delay(
+        let plugin = Arc::new(MockChannel::with_mark_read_delay_and_notify(
             ChannelCapabilities {
                 read_receipts: true,
                 ..Default::default()
             },
             Duration::from_millis(25),
+            mark_read_started_notify.clone(),
         ));
 
         dispatcher
@@ -1934,6 +2013,9 @@ mod tests {
             )
             .await;
 
+        tokio::time::timeout(Duration::from_secs(1), mark_read_started_notify.notified())
+            .await
+            .expect("worker should start the in-flight read receipt before dispatcher drop");
         let started_at = std::time::Instant::now();
         drop(dispatcher);
 
@@ -2161,15 +2243,18 @@ mod tests {
 
     #[test]
     fn test_reset_unsupported_activity_feature_warnings_for_test_clears_seen_keys() {
-        reset_unsupported_activity_feature_warnings_for_test();
-        warn_unsupported_activity_feature("signal", "typing");
-        assert!(UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS
+        let service = ActivityService::new();
+        service.reset_unsupported_activity_feature_warnings_for_test();
+        service.warn_unsupported_feature("signal", "typing");
+        assert!(service
+            .unsupported_feature_warnings
             .lock()
             .seen_at
             .contains_key("signal:typing"));
 
-        reset_unsupported_activity_feature_warnings_for_test();
-        assert!(UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS
+        service.reset_unsupported_activity_feature_warnings_for_test();
+        assert!(service
+            .unsupported_feature_warnings
             .lock()
             .seen_at
             .is_empty());

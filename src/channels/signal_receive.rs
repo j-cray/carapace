@@ -190,7 +190,7 @@ async fn maybe_dispatch_read_receipt_for_ignored_signal_message(
     };
 
     state
-        .activity_dispatcher()
+        .activity_service()
         .dispatch_verified_read_receipt(plugin, "signal", read_receipt_context)
         .await;
 }
@@ -1304,6 +1304,6 @@ mod tests {
             state.agent_run_registry.lock().snapshot_runs().is_empty(),
             "ignored non-text messages should not create agent runs"
         );
-        state.shutdown_activity_service();
+        state.shutdown_activity_service().await;
     }
 }
