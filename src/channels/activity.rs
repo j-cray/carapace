@@ -47,6 +47,7 @@ const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
 const ACTIVITY_BLOCKING_IO_MAX_SECS: u64 = 5;
 const READ_RECEIPT_RETRY_DELAY_MS: u64 = 5_000;
+const READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK: usize = 10_000;
 const READ_RECEIPT_PENDING_REASON: &str = "waiting for successful response delivery";
 pub(crate) const READ_RECEIPT_WITHHELD_REASON: &str =
     "withholding explicit read receipt because after-response policy requires a successful response delivery";
@@ -242,6 +243,7 @@ pub struct ActivityService {
     dispatcher: Arc<ActivityDispatcher>,
     read_receipt_queue: Arc<TaskQueue>,
     unsupported_feature_warnings: Mutex<UnsupportedActivityWarningRegistry>,
+    read_receipt_ownership_high_watermark: usize,
 }
 
 impl Default for ActivityService {
@@ -266,17 +268,30 @@ impl ActivityService {
             dispatcher: Arc::new(ActivityDispatcher::new()),
             read_receipt_queue,
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
+            read_receipt_ownership_high_watermark: READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_backlog_warning_threshold(backlog_warning_threshold: usize) -> Self {
+        Self::with_limits_for_test(
+            backlog_warning_threshold,
+            READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits_for_test(
+        backlog_warning_threshold: usize,
+        read_receipt_ownership_high_watermark: usize,
+    ) -> Self {
         Self {
             dispatcher: Arc::new(ActivityDispatcher::with_backlog_warning_threshold(
                 backlog_warning_threshold,
             )),
             read_receipt_queue: Arc::new(TaskQueue::in_memory_unbounded()),
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
+            read_receipt_ownership_high_watermark,
         }
     }
 
@@ -409,6 +424,33 @@ impl ActivityService {
                 "channel activity feature is enabled in config but unsupported by this channel; ignoring"
             );
         }
+    }
+
+    fn read_receipt_obligation_count(&self) -> usize {
+        let stats = self.read_receipt_queue.stats();
+        stats.queued + stats.running + stats.blocked + stats.retry_wait
+    }
+
+    pub fn can_accept_read_receipt_ownership(&self, channel_id: &str) -> bool {
+        let outstanding = self.read_receipt_obligation_count();
+        if outstanding < self.read_receipt_ownership_high_watermark {
+            return true;
+        }
+
+        let key = format!("{channel_id}:read_receipts_backpressure");
+        let should_warn = {
+            let mut registry = self.unsupported_feature_warnings.lock();
+            registry.should_warn(&key, Instant::now())
+        };
+        if should_warn {
+            tracing::warn!(
+                channel = %channel_id,
+                outstanding,
+                high_watermark = self.read_receipt_ownership_high_watermark,
+                "read receipt backlog reached the high-water mark; leaving upstream auto-receipts enabled for new messages until the durable queue drains"
+            );
+        }
+        false
     }
 
     pub async fn shutdown(&self) {
@@ -2488,5 +2530,39 @@ mod tests {
         assert!(unsupported.contains(&("custom".to_string(), "typing")));
         assert!(unsupported.contains(&("custom".to_string(), "read_receipts")));
         crate::config::clear_cache();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_can_accept_read_receipt_ownership_disables_new_obligations_at_high_watermark() {
+        let service = ActivityService::with_limits_for_test(8, 2);
+        assert!(service.can_accept_read_receipt_ownership("signal"));
+
+        let first = service
+            .enqueue_after_response_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551230001".to_string(),
+                    timestamp: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let second = service
+            .enqueue_after_response_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551230002".to_string(),
+                    timestamp: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(first.is_some());
+        assert!(second.is_some());
+        assert!(
+            !service.can_accept_read_receipt_ownership("signal"),
+            "new ownership should stop once the durable backlog reaches the high-water mark"
+        );
     }
 }

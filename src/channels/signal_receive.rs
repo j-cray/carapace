@@ -239,8 +239,10 @@ fn snapshot_signal_receive_poll(
     base_url: &url::Url,
     phone_number: &str,
     activity_policy: &crate::channels::activity::ChannelActivityPolicy,
+    activity_service: &crate::channels::activity::ActivityService,
 ) -> SignalReceivePollSnapshot {
-    let carapace_manages_read_receipts = activity_policy.read_receipts.enabled;
+    let carapace_manages_read_receipts = activity_policy.read_receipts.enabled
+        && activity_service.can_accept_read_receipt_ownership("signal");
     SignalReceivePollSnapshot {
         receive_url: build_receive_url(base_url, phone_number, carapace_manages_read_receipts),
         carapace_manages_read_receipts,
@@ -303,8 +305,12 @@ pub async fn signal_receive_loop(
             break;
         }
 
-        let poll_snapshot =
-            snapshot_signal_receive_poll(&base_url, &phone_number, &activity_policy);
+        let poll_snapshot = snapshot_signal_receive_poll(
+            &base_url,
+            &phone_number,
+            &activity_policy,
+            state.activity_service(),
+        );
 
         match client.get(poll_snapshot.receive_url.clone()).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -943,6 +949,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_signal_receive_poll_uses_single_policy_view() {
+        let activity_service = crate::channels::activity::ActivityService::new();
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
             read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
                 enabled: true,
@@ -955,12 +962,50 @@ mod tests {
             &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
             "+15551234567",
             &activity_policy,
+            &activity_service,
         );
 
         assert!(snapshot.carapace_manages_read_receipts);
         assert_eq!(
             snapshot.receive_url.as_str(),
             "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_when_backlog_is_high() {
+        let activity_service =
+            crate::channels::activity::ActivityService::with_limits_for_test(8, 1);
+        activity_service
+            .enqueue_after_response_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("backlog setup should persist a durable read receipt obligation");
+        let activity_policy = crate::channels::activity::ChannelActivityPolicy {
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let snapshot = snapshot_signal_receive_poll(
+            &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
+            "+15551234567",
+            &activity_policy,
+            &activity_service,
+        );
+
+        assert!(!snapshot.carapace_manages_read_receipts);
+        assert_eq!(
+            snapshot.receive_url.as_str(),
+            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1"
         );
     }
 
