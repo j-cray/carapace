@@ -214,6 +214,9 @@ fn signal_http_status_call_error_from_response(
     operation: &str,
     resp: reqwest::blocking::Response,
 ) -> BindingError {
+    // Activity-side effects treat remote response bodies as untrusted operator
+    // diagnostics. Keep this path status-only so typing/read-receipt errors do
+    // not widen the log-leak surface with attacker-controlled response text.
     BindingError::CallError(signal_http_status_error_message(operation, resp.status()))
 }
 
@@ -324,7 +327,7 @@ fn sanitize_signal_error_text(body_text: &str) -> String {
     static GENERIC_LABELED_PHONE_RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| {
             regex::Regex::new(
-                r"(?i)\b([A-Za-z][A-Za-z0-9_-]{0,31})([:=])(\+?\d(?:[\d().:\-\s]{8,}\d))",
+                r"(?i)\b([A-Za-z][A-Za-z0-9_-]{0,31})([:=])(\+?\d(?:[\d().:\-\s]{5,}\d))",
             )
             .expect("valid generic labeled phone regex")
         });
@@ -392,7 +395,7 @@ fn looks_like_phoneish_value_under_safe_label(value: &str) -> bool {
 fn looks_like_phoneish_value(value: &str) -> bool {
     let trimmed = value.trim();
     let digit_count = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
-    digit_count >= 8
+    digit_count >= 7
         && trimmed
             .chars()
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '(' | ')' | '.' | ':' | '-' | ' '))
@@ -834,6 +837,19 @@ mod tests {
         assert!(message.contains("account=[redacted]"));
         assert!(!message.contains("16175550123"));
         assert!(!message.contains("16175550124"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_generic_labeled_seven_digit_phone_values() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "to:5551234 account=5559876 rejected by upstream",
+        );
+        assert!(message.contains("to:[redacted]"));
+        assert!(message.contains("account=[redacted]"));
+        assert!(!message.contains("5551234"));
+        assert!(!message.contains("5559876"));
     }
 
     #[test]

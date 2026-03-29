@@ -1363,10 +1363,6 @@ pub async fn execute_run(
             &config.output_sanitizer.csp_policy,
         );
 
-        if let Some(handle) = typing_handle.take() {
-            handle.stop().await;
-        }
-
         // 5. Deliver response to originating channel if requested
         if let Some(text) = delivery_text {
             if !text.is_empty() {
@@ -1464,6 +1460,10 @@ pub async fn execute_run(
                 .await;
         }
 
+        if let Some(handle) = typing_handle.take() {
+            handle.stop().await;
+        }
+
         Ok(())
     }
     .await;
@@ -1475,28 +1475,25 @@ pub async fn execute_run(
     if execution_result.is_err() {
         let (_, read_receipt_context, read_receipt_task_id) =
             delivery_context_from_registry(&state, &run_id);
-        if let (Some(channel_id), Some(policy), Some(read_receipt_context), Some(task_id)) = (
+        if let (Some(channel_id), Some(read_receipt_context), Some(task_id)) = (
             delivery_channel_id,
-            channel_activity_policy.as_ref(),
             read_receipt_context.as_ref(),
             read_receipt_task_id.as_deref(),
         ) {
-            if policy.read_receipts.enabled {
-                state
-                    .activity_service()
-                    .withhold_read_receipt(
-                        task_id,
-                        crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
-                    )
-                    .await;
-                tracing::warn!(
-                    run_id = %run_id,
-                    channel = %channel_id,
-                    recipient = %read_receipt_context.recipient,
-                    timestamp = ?read_receipt_context.timestamp,
-                    "withholding explicit read receipt because after-response policy requires a successful response delivery"
-                );
-            }
+            state
+                .activity_service()
+                .withhold_read_receipt(
+                    task_id,
+                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                )
+                .await;
+            tracing::warn!(
+                run_id = %run_id,
+                channel = %channel_id,
+                recipient = %read_receipt_context.recipient,
+                timestamp = ?read_receipt_context.timestamp,
+                "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
+            );
         }
     }
 
@@ -2546,6 +2543,58 @@ mod tests {
             queued.message.metadata.read_receipt.is_some(),
             "receive-time read receipt context should be preserved even if the later capability probe fails"
         );
+
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_channel_activity_withholds_receive_time_read_receipt_when_run_errors_after_policy_disables_later(
+    ) {
+        crate::config::clear_cache();
+        crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
+
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-channel-activity-error-disabled";
+        let session_key = "test-channel-activity-error-disabled";
+        let chat_id = "+15551234567";
+        let (_session, read_receipt_task_id) = setup_session_and_run_with_channel_activity(
+            &state,
+            session_key,
+            run_id,
+            "signal",
+            chat_id,
+        )
+        .await;
+
+        let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Error {
+            message: "provider failed".to_string(),
+        }]]));
+        let config = AgentConfig {
+            max_turns: 5,
+            deliver: true,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "execute_run should surface provider failure"
+        );
+
+        let withheld_task = state
+            .activity_service()
+            .read_receipt_queue()
+            .get(&read_receipt_task_id)
+            .expect("run error should preserve the durable read receipt task");
+        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
 
         crate::config::clear_cache();
     }

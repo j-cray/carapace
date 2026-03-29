@@ -400,6 +400,44 @@ impl ActivityService {
         }
     }
 
+    pub async fn cleanup_orphaned_blocked_read_receipts_after_restart(
+        &self,
+    ) -> Result<usize, String> {
+        let queue = self.read_receipt_queue.clone();
+        let cancelled = tokio::task::spawn_blocking(move || {
+            let blocked = queue.list_filtered(Some(crate::tasks::TaskState::Blocked), None).1;
+            let mut cancelled = 0usize;
+            for task in blocked {
+                let is_after_response_pending = task.blocked_reason
+                    == Some(TaskBlockedReason::ExternalDependency)
+                    && task.last_error.as_deref() == Some(READ_RECEIPT_PENDING_REASON)
+                    && ReadReceiptTaskPayload::from_value(task.payload.clone()).is_ok();
+                if is_after_response_pending
+                    && queue.mark_cancelled(
+                        &task.id,
+                        Some("discarding blocked read receipt orphaned by restart before response delivery"),
+                    )
+                {
+                    cancelled += 1;
+                }
+            }
+            cancelled
+        })
+        .await
+        .map_err(|err| {
+            format!("read receipt orphan cleanup worker failed during startup: {err}")
+        })?;
+
+        if cancelled > 0 {
+            tracing::warn!(
+                cancelled,
+                "cancelled blocked read receipt obligations orphaned by restart before response delivery"
+            );
+        }
+
+        Ok(cancelled)
+    }
+
     pub fn dispatch_stop_typing(
         &self,
         plugin: Arc<dyn ChannelPluginInstance>,
@@ -2564,5 +2602,60 @@ mod tests {
             !service.can_accept_read_receipt_ownership("signal"),
             "new ownership should stop once the durable backlog reaches the high-water mark"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cleanup_orphaned_blocked_read_receipts_after_restart_cancels_pending_tasks() {
+        let service = ActivityService::new();
+        let orphaned = service
+            .read_receipt_queue()
+            .enqueue_blocked_async_with_policy(
+                serde_json::to_value(ReadReceiptTaskPayload::new(
+                    "signal",
+                    ReadReceiptContext {
+                        recipient: "+15551234567".to_string(),
+                        timestamp: Some(123),
+                        ..Default::default()
+                    },
+                ))
+                .expect("read receipt task payload should serialize"),
+                READ_RECEIPT_PENDING_REASON,
+                TaskBlockedReason::ExternalDependency,
+                crate::tasks::TaskPolicy::default(),
+            )
+            .await;
+        let retained = service
+            .read_receipt_queue()
+            .enqueue_async(
+                serde_json::to_value(ReadReceiptTaskPayload::new(
+                    "signal",
+                    ReadReceiptContext {
+                        recipient: "+15557654321".to_string(),
+                        timestamp: Some(456),
+                        ..Default::default()
+                    },
+                ))
+                .expect("read receipt task payload should serialize"),
+                None,
+            )
+            .await;
+
+        let cancelled = service
+            .cleanup_orphaned_blocked_read_receipts_after_restart()
+            .await
+            .expect("startup orphan cleanup should succeed");
+        assert_eq!(cancelled, 1);
+
+        let orphaned_task = service
+            .read_receipt_queue()
+            .get(&orphaned.id)
+            .expect("orphaned task should still be present for audit");
+        assert_eq!(orphaned_task.state, crate::tasks::TaskState::Cancelled);
+
+        let retained_task = service
+            .read_receipt_queue()
+            .get(&retained.id)
+            .expect("queued task should remain present");
+        assert_eq!(retained_task.state, crate::tasks::TaskState::Queued);
     }
 }
