@@ -933,6 +933,45 @@ fn delivery_context_from_registry(
         })
 }
 
+async fn withhold_owned_read_receipt_on_failed_run(
+    state: &Arc<WsServerState>,
+    run_id: &str,
+    channel_id: Option<&str>,
+) {
+    let (_, read_receipt_context, read_receipt_task_id) =
+        delivery_context_from_registry(state, run_id);
+    let (Some(read_receipt_context), Some(task_id)) = (
+        read_receipt_context.as_ref(),
+        read_receipt_task_id.as_deref(),
+    ) else {
+        return;
+    };
+
+    state
+        .activity_service()
+        .withhold_read_receipt(
+            task_id,
+            crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+        )
+        .await;
+
+    match channel_id {
+        Some(channel_id) => tracing::warn!(
+            run_id = %run_id,
+            channel = %channel_id,
+            recipient = %read_receipt_context.recipient,
+            timestamp = ?read_receipt_context.timestamp,
+            "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
+        ),
+        None => tracing::warn!(
+            run_id = %run_id,
+            recipient = %read_receipt_context.recipient,
+            timestamp = ?read_receipt_context.timestamp,
+            "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
+        ),
+    }
+}
+
 /// Execute a single LLM turn: call the provider, stream the response,
 /// record usage, persist the assistant message, and optionally execute tools.
 ///
@@ -1059,378 +1098,379 @@ pub async fn execute_run(
         }
     }
 
-    broadcast_agent_event(
-        &state,
-        &run_id,
-        seq.fetch_add(1, Ordering::Relaxed),
-        "started",
-        json!({ "sessionKey": &session_key, "model": &config.model }),
-    );
+    let mut error_channel_id: Option<String> = None;
+    let result = async {
+        broadcast_agent_event(
+            &state,
+            &run_id,
+            seq.fetch_add(1, Ordering::Relaxed),
+            "started",
+            json!({ "sessionKey": &session_key, "model": &config.model }),
+        );
 
-    // 2. Load or create session
-    let session = crate::sessions::get_session_by_key_blocking(
-        state.session_store().clone(),
-        session_key.clone(),
-    )
-    .await
-    .map_err(|e| AgentError::SessionNotFound(format!("{session_key}: {e}")))?;
-    let message_channel = session.metadata.channel.clone();
+        // 2. Load or create session
+        let session = crate::sessions::get_session_by_key_blocking(
+            state.session_store().clone(),
+            session_key.clone(),
+        )
+        .await
+        .map_err(|e| AgentError::SessionNotFound(format!("{session_key}: {e}")))?;
+        let message_channel = session.metadata.channel.clone();
+        error_channel_id = message_channel.clone();
 
-    if let Some(result) = dispatch_plugin_hook(
-        &state,
-        "before_agent_start",
-        &json!({
-            "runId": run_id,
-            "sessionKey": session_key,
-            "model": &config.model,
-            "system": &config.system,
-            "maxTokens": config.max_tokens,
-            "temperature": config.temperature,
-            "deliver": config.deliver,
-            "messageChannel": &message_channel,
-            "extra": &config.extra,
-        }),
-    ) {
-        if result.cancelled {
-            return Err(AgentError::Cancelled);
-        }
-        if let Some(payload) = parse_hook_payload(&result, "before_agent_start") {
-            apply_agent_hook_overrides(&mut config, &payload);
-        }
-    }
-
-    // 2b. Pre-flight system prompt check
-    if config.prompt_guard.enabled && config.prompt_guard.preflight.enabled {
-        if let Some(ref system) = config.system {
-            let preflight_result =
-                preflight::analyze_system_prompt(system, &config.prompt_guard.preflight);
-            if preflight_result.has_critical() {
-                let reasons: Vec<String> = preflight_result
-                    .findings
-                    .iter()
-                    .map(|f| f.description.clone())
-                    .collect();
-                let reason = reasons.join("; ");
-                tracing::warn!(
-                    run_id = %run_id,
-                    findings = %reason,
-                    "prompt guard pre-flight blocked system prompt"
-                );
-                crate::logging::audit::audit(
-                    crate::logging::audit::AuditEvent::PromptGuardBlocked {
-                        layer: "preflight".to_string(),
-                        reason: reason.clone(),
-                        run_id: run_id.clone(),
-                    },
-                );
-                return Err(AgentError::Provider(format!(
-                    "Prompt guard pre-flight blocked: {reason}"
-                )));
+        if let Some(result) = dispatch_plugin_hook(
+            &state,
+            "before_agent_start",
+            &json!({
+                "runId": run_id,
+                "sessionKey": session_key,
+                "model": &config.model,
+                "system": &config.system,
+                "maxTokens": config.max_tokens,
+                "temperature": config.temperature,
+                "deliver": config.deliver,
+                "messageChannel": &message_channel,
+                "extra": &config.extra,
+            }),
+        ) {
+            if result.cancelled {
+                return Err(AgentError::Cancelled);
+            }
+            if let Some(payload) = parse_hook_payload(&result, "before_agent_start") {
+                apply_agent_hook_overrides(&mut config, &payload);
             }
         }
-    }
 
-    // 2c. Classifier (optional, fail-open)
-    if let Some(ref clf_config) = config.classifier {
-        if clf_config.enabled && clf_config.mode != crate::agent::classifier::ClassifierMode::Off {
-            // Get the last user message from session history for classification
-            let last_user_msg = crate::sessions::get_history_blocking(
+        // 2b. Pre-flight system prompt check
+        if config.prompt_guard.enabled && config.prompt_guard.preflight.enabled {
+            if let Some(ref system) = config.system {
+                let preflight_result =
+                    preflight::analyze_system_prompt(system, &config.prompt_guard.preflight);
+                if preflight_result.has_critical() {
+                    let reasons: Vec<String> = preflight_result
+                        .findings
+                        .iter()
+                        .map(|f| f.description.clone())
+                        .collect();
+                    let reason = reasons.join("; ");
+                    tracing::warn!(
+                        run_id = %run_id,
+                        findings = %reason,
+                        "prompt guard pre-flight blocked system prompt"
+                    );
+                    crate::logging::audit::audit(
+                        crate::logging::audit::AuditEvent::PromptGuardBlocked {
+                            layer: "preflight".to_string(),
+                            reason: reason.clone(),
+                            run_id: run_id.clone(),
+                        },
+                    );
+                    return Err(AgentError::Provider(format!(
+                        "Prompt guard pre-flight blocked: {reason}"
+                    )));
+                }
+            }
+        }
+
+        // 2c. Classifier (optional, fail-open)
+        if let Some(ref clf_config) = config.classifier {
+            if clf_config.enabled && clf_config.mode != crate::agent::classifier::ClassifierMode::Off
+            {
+                let last_user_msg = crate::sessions::get_history_blocking(
+                    state.session_store().clone(),
+                    session.id.clone(),
+                    None,
+                    None,
+                )
+                .await
+                .ok()
+                .and_then(|history| {
+                    history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == MessageRole::User)
+                        .map(|m| m.content.clone())
+                });
+
+                if let Some(user_message) = last_user_msg {
+                    match crate::agent::classifier::classify_message(
+                        &user_message,
+                        clf_config,
+                        provider.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(verdict) if verdict.should_block(clf_config) => {
+                            crate::logging::audit::audit(
+                                crate::logging::audit::AuditEvent::ClassifierBlocked {
+                                    category: verdict.category.to_string(),
+                                    confidence: verdict.confidence as f64,
+                                    reasoning: verdict.reasoning.clone(),
+                                    run_id: run_id.clone(),
+                                },
+                            );
+                            return Err(AgentError::ClassifierBlocked(
+                                verdict.category.to_string(),
+                                verdict.reasoning,
+                            ));
+                        }
+                        Ok(verdict) if verdict.should_warn(clf_config) => {
+                            crate::logging::audit::audit(
+                                crate::logging::audit::AuditEvent::ClassifierWarned {
+                                    category: verdict.category.to_string(),
+                                    confidence: verdict.confidence as f64,
+                                    reasoning: verdict.reasoning.clone(),
+                                    run_id: run_id.clone(),
+                                },
+                            );
+                            tracing::warn!(
+                                run_id = %run_id,
+                                category = %verdict.category,
+                                confidence = verdict.confidence,
+                                "classifier warned: {}",
+                                verdict.reasoning
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                error = %e,
+                                "classifier error (fail-open)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let delivery_channel_id = if config.deliver {
+            message_channel.as_deref()
+        } else {
+            None
+        };
+        let channel_activity_policy = if let Some(channel_id) = delivery_channel_id {
+            Some(crate::channels::activity::load_channel_activity_policy_async(channel_id).await)
+        } else {
+            None
+        };
+        let (channel_capabilities, capability_probe_failed) =
+            if let (Some(channel_id), Some(plugin_registry)) =
+                (delivery_channel_id, state.plugin_registry())
+            {
+                if let Some(plugin) = plugin_registry.get_channel(channel_id) {
+                    match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
+                        Ok(Ok(capabilities)) => (Some(capabilities), false),
+                        Ok(Err(err)) => {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                channel = %channel_id,
+                                error = %err,
+                                "failed to load channel capabilities for activity features"
+                            );
+                            (None, true)
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                channel = %channel_id,
+                                error = %err,
+                                "activity capability worker failed"
+                            );
+                            (None, true)
+                        }
+                    }
+                } else {
+                    (None, false)
+                }
+            } else {
+                (None, false)
+            };
+
+        let mut typing_handle = if let (Some(channel_id), Some(plugin_registry), Some(policy)) = (
+            delivery_channel_id,
+            state.plugin_registry(),
+            channel_activity_policy.as_ref(),
+        ) {
+            if !channel_capabilities
+                .as_ref()
+                .map(|capabilities| capabilities.typing_indicators)
+                .unwrap_or(false)
+            {
+                if policy.typing.enabled {
+                    state
+                        .activity_service()
+                        .warn_unsupported_feature(channel_id, "typing");
+                }
+                None
+            } else {
+                let typing_context = {
+                    let registry = state.agent_run_registry.lock();
+                    registry
+                        .get(&run_id)
+                        .and_then(|run| run.typing_context.clone())
+                        .or_else(|| {
+                            session.metadata.chat_id.clone().map(|to| crate::plugins::TypingContext {
+                                to,
+                                ..Default::default()
+                            })
+                        })
+                };
+
+                match typing_context {
+                    Some(ctx) => {
+                        // Typing policy is snapshotted for the lifetime of this
+                        // run. Reload only affects future runs; do not re-check the
+                        // policy mid-run and break the receive-time snapshot
+                        // contract for activity side effects.
+                        crate::channels::activity::maybe_start_typing_loop(
+                            plugin_registry.clone(),
+                            channel_id,
+                            policy,
+                            channel_capabilities.clone(),
+                            state.activity_service().clone(),
+                            ctx,
+                        )
+                        .await
+                    }
+                    None => None,
+                }
+            }
+        } else {
+            None
+        };
+
+        let execution_result = async {
+            // 3. Main agentic loop
+            let mut accumulated_text = String::new();
+            let mut total_input_tokens: u64 = 0;
+            let mut total_output_tokens: u64 = 0;
+            let mut final_stop_reason = StopReason::EndTurn;
+
+            let mut history = crate::sessions::get_history_blocking(
                 state.session_store().clone(),
                 session.id.clone(),
                 None,
                 None,
             )
             .await
-            .ok()
-            .and_then(|history| {
-                history
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == MessageRole::User)
-                    .map(|m| m.content.clone())
-            });
+            .map_err(|e| AgentError::SessionStore(e.to_string()))?;
 
-            if let Some(user_message) = last_user_msg {
-                match crate::agent::classifier::classify_message(
-                    &user_message,
-                    clf_config,
-                    provider.as_ref(),
+            for _turn in 0..config.max_turns {
+                let should_continue = execute_single_turn(
+                    &config,
+                    &state,
+                    &provider,
+                    &cancel_token,
+                    &run_id,
+                    &session_key,
+                    &session.id,
+                    message_channel.as_deref(),
+                    &seq,
+                    &mut history,
+                    &mut accumulated_text,
+                    &mut total_input_tokens,
+                    &mut total_output_tokens,
+                    &mut final_stop_reason,
                 )
-                .await
-                {
-                    Ok(verdict) if verdict.should_block(clf_config) => {
-                        crate::logging::audit::audit(
-                            crate::logging::audit::AuditEvent::ClassifierBlocked {
-                                category: verdict.category.to_string(),
-                                confidence: verdict.confidence as f64,
-                                reasoning: verdict.reasoning.clone(),
-                                run_id: run_id.clone(),
-                            },
-                        );
-                        return Err(AgentError::ClassifierBlocked(
-                            verdict.category.to_string(),
-                            verdict.reasoning,
-                        ));
-                    }
-                    Ok(verdict) if verdict.should_warn(clf_config) => {
-                        crate::logging::audit::audit(
-                            crate::logging::audit::AuditEvent::ClassifierWarned {
-                                category: verdict.category.to_string(),
-                                confidence: verdict.confidence as f64,
-                                reasoning: verdict.reasoning.clone(),
-                                run_id: run_id.clone(),
-                            },
-                        );
-                        tracing::warn!(
-                            run_id = %run_id,
-                            category = %verdict.category,
-                            confidence = verdict.confidence,
-                            "classifier warned: {}",
-                            verdict.reasoning
-                        );
-                        // Continue execution — warning is logged
-                    }
-                    Ok(_) => { /* clean, proceed */ }
-                    Err(e) => {
-                        tracing::warn!(
-                            run_id = %run_id,
-                            error = %e,
-                            "classifier error (fail-open)"
-                        );
-                    }
+                .await?;
+
+                if !should_continue {
+                    break;
                 }
             }
-        }
-    }
 
-    let delivery_channel_id = if config.deliver {
-        message_channel.as_deref()
-    } else {
-        None
-    };
-    let channel_activity_policy = if let Some(channel_id) = delivery_channel_id {
-        Some(crate::channels::activity::load_channel_activity_policy_async(channel_id).await)
-    } else {
-        None
-    };
-    let (channel_capabilities, capability_probe_failed) =
-        if let (Some(channel_id), Some(plugin_registry)) =
-            (delivery_channel_id, state.plugin_registry())
-        {
-            if let Some(plugin) = plugin_registry.get_channel(channel_id) {
-                match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
-                    Ok(Ok(capabilities)) => (Some(capabilities), false),
-                    Ok(Err(err)) => {
-                        tracing::warn!(
-                            run_id = %run_id,
-                            channel = %channel_id,
-                            error = %err,
-                            "failed to load channel capabilities for activity features"
-                        );
-                        (None, true)
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            run_id = %run_id,
-                            channel = %channel_id,
-                            error = %err,
-                            "activity capability worker failed"
-                        );
-                        (None, true)
-                    }
-                }
+            let delivery_text = if config.deliver {
+                Some(accumulated_text.clone())
             } else {
-                (None, false)
-            }
-        } else {
-            (None, false)
-        };
+                None
+            };
+            let (delivery_recipient_id, read_receipt_context, read_receipt_task_id) =
+                delivery_context_from_registry(&state, &run_id);
 
-    let mut typing_handle = if let (Some(channel_id), Some(plugin_registry), Some(policy)) = (
-        delivery_channel_id,
-        state.plugin_registry(),
-        channel_activity_policy.as_ref(),
-    ) {
-        if !channel_capabilities
-            .as_ref()
-            .map(|capabilities| capabilities.typing_indicators)
-            .unwrap_or(false)
-        {
-            if policy.typing.enabled {
-                state
-                    .activity_service()
-                    .warn_unsupported_feature(channel_id, "typing");
-            }
-            None
-        } else {
-            let typing_context =
-                {
-                    let registry = state.agent_run_registry.lock();
-                    registry
-                        .get(&run_id)
-                        .and_then(|run| run.typing_context.clone())
-                        .or_else(|| {
-                            session.metadata.chat_id.clone().map(|to| {
-                                crate::plugins::TypingContext {
-                                    to,
-                                    ..Default::default()
-                                }
-                            })
-                        })
-                };
-
-            match typing_context {
-                Some(ctx) => {
-                    // Typing policy is snapshotted for the lifetime of this
-                    // run. Reload only affects future runs; do not re-check the
-                    // policy mid-run and break the receive-time snapshot
-                    // contract for activity side effects.
-                    crate::channels::activity::maybe_start_typing_loop(
-                        plugin_registry.clone(),
-                        channel_id,
-                        policy,
-                        channel_capabilities.clone(),
-                        state.activity_service().clone(),
-                        ctx,
-                    )
-                    .await
-                }
-                None => None,
-            }
-        }
-    } else {
-        None
-    };
-
-    let execution_result = async {
-        // 3. Main agentic loop
-        let mut accumulated_text = String::new();
-        let mut total_input_tokens: u64 = 0;
-        let mut total_output_tokens: u64 = 0;
-        let mut final_stop_reason = StopReason::EndTurn;
-
-        let mut history = crate::sessions::get_history_blocking(
-            state.session_store().clone(),
-            session.id.clone(),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| AgentError::SessionStore(e.to_string()))?;
-
-        for _turn in 0..config.max_turns {
-            let should_continue = execute_single_turn(
-                &config,
+            finalize_run(
                 &state,
-                &provider,
-                &cancel_token,
                 &run_id,
                 &session_key,
-                &session.id,
-                message_channel.as_deref(),
                 &seq,
-                &mut history,
-                &mut accumulated_text,
-                &mut total_input_tokens,
-                &mut total_output_tokens,
-                &mut final_stop_reason,
-            )
-            .await?;
+                final_stop_reason,
+                total_input_tokens,
+                total_output_tokens,
+                accumulated_text,
+                &config.output_sanitizer.csp_policy,
+            );
 
-            if !should_continue {
-                break;
-            }
-        }
-
-        // 4. Broadcast completion and mark run done
-        let delivery_text = if config.deliver {
-            Some(accumulated_text.clone())
-        } else {
-            None
-        };
-        let (delivery_recipient_id, read_receipt_context, read_receipt_task_id) =
-            delivery_context_from_registry(&state, &run_id);
-
-        finalize_run(
-            &state,
-            &run_id,
-            &session_key,
-            &seq,
-            final_stop_reason,
-            total_input_tokens,
-            total_output_tokens,
-            accumulated_text,
-            &config.output_sanitizer.csp_policy,
-        );
-
-        // 5. Deliver response to originating channel if requested
-        if let Some(text) = delivery_text {
-            if !text.is_empty() {
-                let recipient_id =
-                    delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
-                if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
-                    if channel_activity_policy
-                        .as_ref()
-                        .map(|policy| policy.read_receipts.enabled)
-                        .unwrap_or(false)
-                        && read_receipt_context.is_none()
-                        && !channel_capabilities
+            if let Some(text) = delivery_text {
+                if !text.is_empty() {
+                    let recipient_id =
+                        delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
+                    if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
+                        if channel_activity_policy
                             .as_ref()
-                            .map(|capabilities| capabilities.read_receipts)
+                            .map(|policy| policy.read_receipts.enabled)
                             .unwrap_or(false)
-                    {
-                        state
-                            .activity_service()
-                            .warn_unsupported_feature(channel_id, "read_receipts");
-                    }
-                    let read_receipt = if read_receipt_context.is_some() {
-                        if capability_probe_failed {
+                            && read_receipt_context.is_none()
+                            && !channel_capabilities
+                                .as_ref()
+                                .map(|capabilities| capabilities.read_receipts)
+                                .unwrap_or(false)
+                        {
+                            state
+                                .activity_service()
+                                .warn_unsupported_feature(channel_id, "read_receipts");
+                        }
+                        let read_receipt = if read_receipt_context.is_some() {
+                            if capability_probe_failed {
+                                tracing::warn!(
+                                    run_id = %run_id,
+                                    channel = %channel_id,
+                                    "preserving explicit read receipt after capability probe failure because upstream auto-receipts were already suppressed at receive time"
+                                );
+                            }
+                            read_receipt_task_id.clone().map(|task_id| {
+                                crate::messages::outbound::PendingReadReceipt { task_id }
+                            })
+                        } else {
+                            None
+                        };
+                        let metadata = crate::messages::outbound::MessageMetadata {
+                            recipient_id: Some(chat_id),
+                            read_receipt,
+                            ..Default::default()
+                        };
+                        let outbound = crate::messages::outbound::OutboundMessage::new(
+                            channel_id.clone(),
+                            crate::messages::outbound::MessageContent::text(text),
+                        )
+                        .with_metadata(metadata);
+                        let ctx = crate::messages::outbound::OutboundContext::new()
+                            .with_trace_id(&run_id)
+                            .with_source("agent");
+                        if let Err(err) = state.message_pipeline().queue(outbound, ctx) {
                             tracing::warn!(
                                 run_id = %run_id,
                                 channel = %channel_id,
-                                "preserving explicit read receipt after capability probe failure because upstream auto-receipts were already suppressed at receive time"
+                                error = %err,
+                                "failed to queue agent response for delivery"
                             );
+                            if let Some(task_id) = read_receipt_task_id.as_deref() {
+                                state
+                                    .activity_service()
+                                    .withhold_read_receipt(
+                                        task_id,
+                                        crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                                    )
+                                    .await;
+                            }
                         }
-                        // Presence of read_receipt_context snapshots the receive-time
-                        // decision that Carapace owns the explicit ack for this
-                        // message. Preserve that context across later config changes
-                        // and later capability-probe failures so we do not drop
-                        // acknowledgements after auto-receipts were already suppressed upstream.
-                        read_receipt_task_id.clone().map(|task_id| {
-                            crate::messages::outbound::PendingReadReceipt { task_id }
-                        })
-                    } else {
-                        None
-                    };
-                    let metadata = crate::messages::outbound::MessageMetadata {
-                        recipient_id: Some(chat_id),
-                        read_receipt,
-                        ..Default::default()
-                    };
-                    let outbound = crate::messages::outbound::OutboundMessage::new(
-                        channel_id.clone(),
-                        crate::messages::outbound::MessageContent::text(text),
-                    )
-                    .with_metadata(metadata);
-                    let ctx = crate::messages::outbound::OutboundContext::new()
-                        .with_trace_id(&run_id)
-                        .with_source("agent");
-                    if let Err(err) = state.message_pipeline().queue(outbound, ctx) {
-                        tracing::warn!(
-                            run_id = %run_id,
-                            channel = %channel_id,
-                            error = %err,
-                            "failed to queue agent response for delivery"
-                        );
-                        if let Some(task_id) = read_receipt_task_id.as_deref() {
-                            state
-                                .activity_service()
-                                .withhold_read_receipt(
-                                    task_id,
-                                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
-                                )
-                                .await;
-                        }
+                    } else if let Some(task_id) = read_receipt_task_id.as_deref() {
+                        state
+                            .activity_service()
+                            .withhold_read_receipt(
+                                task_id,
+                                crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                            )
+                            .await;
                     }
                 } else if let Some(task_id) = read_receipt_task_id.as_deref() {
                     state
@@ -1450,54 +1490,29 @@ pub async fn execute_run(
                     )
                     .await;
             }
-        } else if let Some(task_id) = read_receipt_task_id.as_deref() {
-            state
-                .activity_service()
-                .withhold_read_receipt(
-                    task_id,
-                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
-                )
-                .await;
-        }
 
-        if let Some(handle) = typing_handle.take() {
+            if let Some(handle) = typing_handle.take() {
+                handle.stop().await;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Some(handle) = typing_handle {
             handle.stop().await;
         }
 
-        Ok(())
+        execution_result
     }
     .await;
 
-    if let Some(handle) = typing_handle {
-        handle.stop().await;
+    if result.is_err() {
+        withhold_owned_read_receipt_on_failed_run(&state, &run_id, error_channel_id.as_deref())
+            .await;
     }
 
-    if execution_result.is_err() {
-        let (_, read_receipt_context, read_receipt_task_id) =
-            delivery_context_from_registry(&state, &run_id);
-        if let (Some(channel_id), Some(read_receipt_context), Some(task_id)) = (
-            delivery_channel_id,
-            read_receipt_context.as_ref(),
-            read_receipt_task_id.as_deref(),
-        ) {
-            state
-                .activity_service()
-                .withhold_read_receipt(
-                    task_id,
-                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
-                )
-                .await;
-            tracing::warn!(
-                run_id = %run_id,
-                channel = %channel_id,
-                recipient = %read_receipt_context.recipient,
-                timestamp = ?read_receipt_context.timestamp,
-                "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
-            );
-        }
-    }
-
-    execution_result
+    result
 }
 
 /// Sanitize a provider error message before sending to clients.
@@ -2597,6 +2612,169 @@ mod tests {
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
 
         crate::config::clear_cache();
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_withholds_receive_time_read_receipt_on_session_lookup_failure() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-channel-activity-missing-session";
+        let session_key = "missing-session-for-activity";
+        let chat_id = "+15551234567";
+        let read_receipt_task_id = state
+            .activity_service()
+            .enqueue_after_response_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: chat_id.to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test should persist a durable read receipt obligation");
+
+        {
+            use crate::server::ws::{AgentRun, AgentRunStatus};
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(AgentRun {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                delivery_recipient_id: Some(chat_id.to_string()),
+                typing_context: Some(TypingContext {
+                    to: chat_id.to_string(),
+                    ..Default::default()
+                }),
+                read_receipt_context: Some(ReadReceiptContext {
+                    recipient: chat_id.to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                read_receipt_task_id: Some(read_receipt_task_id.clone()),
+                status: AgentRunStatus::Queued,
+                message: "Hello".to_string(),
+                response: String::new(),
+                error: None,
+                created_at: now,
+                started_at: None,
+                completed_at: None,
+                cancel_token: CancellationToken::new(),
+                waiters: Vec::new(),
+            });
+        }
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            AgentConfig::default(),
+            state.clone(),
+            Arc::new(MockProvider::text("unused")),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AgentError::SessionNotFound(_))),
+            "missing session should fail before delivery setup, got {:?}",
+            result
+        );
+
+        let withheld_task = state
+            .activity_service()
+            .read_receipt_queue()
+            .get(&read_receipt_task_id)
+            .expect("session lookup failure should preserve the durable read receipt task");
+        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_delivers_without_pending_receipt_when_context_exists_but_task_id_is_missing(
+    ) {
+        let plugin = Arc::new(ActivityRecordingChannel::new());
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin);
+        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry);
+        state.channel_registry().register(
+            crate::channels::ChannelInfo::new("signal", "Signal")
+                .with_status(crate::channels::ChannelStatus::Connected),
+        );
+
+        let run_id = "run-channel-activity-missing-task-id";
+        let session_key = "test-channel-activity-missing-task-id";
+        let chat_id = "+15551234567";
+        let metadata = sessions::SessionMetadata {
+            channel: Some("signal".to_string()),
+            chat_id: Some(chat_id.to_string()),
+            ..Default::default()
+        };
+        let session = state
+            .session_store()
+            .get_or_create_session(session_key, metadata)
+            .expect("test should create a session");
+        state
+            .session_store()
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .expect("test should append a user message");
+        {
+            use crate::server::ws::{AgentRun, AgentRunStatus};
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(AgentRun {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                delivery_recipient_id: Some(chat_id.to_string()),
+                typing_context: Some(TypingContext {
+                    to: chat_id.to_string(),
+                    ..Default::default()
+                }),
+                read_receipt_context: Some(ReadReceiptContext {
+                    recipient: chat_id.to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                read_receipt_task_id: None,
+                status: AgentRunStatus::Queued,
+                message: "Hello".to_string(),
+                response: String::new(),
+                error: None,
+                created_at: now,
+                started_at: None,
+                completed_at: None,
+                cancel_token: CancellationToken::new(),
+                waiters: Vec::new(),
+            });
+        }
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            AgentConfig {
+                deliver: true,
+                ..Default::default()
+            },
+            state.clone(),
+            Arc::new(MockProvider::text("Hello world!")),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let queued = state.message_pipeline().next_for_channel("signal").expect(
+            "execute_run should still queue delivery when receipt persistence previously failed",
+        );
+        assert_eq!(
+            queued.message.metadata.recipient_id.as_deref(),
+            Some(chat_id)
+        );
+        assert!(
+            queued.message.metadata.read_receipt.is_none(),
+            "delivery metadata should not invent a pending receipt link when no durable task id exists"
+        );
     }
 
     #[tokio::test]

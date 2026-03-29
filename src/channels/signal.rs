@@ -170,9 +170,9 @@ impl SignalChannel {
                 "signal typing indicator",
                 resp,
             )),
-            Err(err) => Err(BindingError::CallError(format!(
-                "failed to update signal typing indicator: {}",
-                err
+            Err(err) => Err(BindingError::CallError(signal_transport_error_message(
+                "failed to update signal typing indicator",
+                err,
             ))),
         }
     }
@@ -202,12 +202,16 @@ impl SignalChannel {
                 "signal read receipt",
                 resp,
             )),
-            Err(err) => Err(BindingError::CallError(format!(
-                "failed to send signal read receipt: {}",
-                err
+            Err(err) => Err(BindingError::CallError(signal_transport_error_message(
+                "failed to send signal read receipt",
+                err,
             ))),
         }
     }
+}
+
+fn signal_transport_error_message(operation: &str, err: reqwest::Error) -> String {
+    format!("{operation}: {}", err.without_url())
 }
 
 fn signal_http_status_call_error_from_response(
@@ -536,7 +540,10 @@ impl ChannelPluginInstance for SignalChannel {
                         return Ok(DeliveryResult {
                             ok: false,
                             message_id: None,
-                            error: Some(format!("failed to read media bytes: {}", e)),
+                            error: Some(signal_transport_error_message(
+                                "failed to read media bytes",
+                                e,
+                            )),
                             retryable: true,
                             conversation_id: None,
                             to_jid: None,
@@ -560,7 +567,7 @@ impl ChannelPluginInstance for SignalChannel {
                 return Ok(DeliveryResult {
                     ok: false,
                     message_id: None,
-                    error: Some(format!("media fetch failed: {}", e)),
+                    error: Some(signal_transport_error_message("media fetch failed", e)),
                     retryable: true,
                     conversation_id: None,
                     to_jid: None,
@@ -653,7 +660,10 @@ impl SignalChannel {
             Err(e) => Ok(DeliveryResult {
                 ok: false,
                 message_id: None,
-                error: Some(e.to_string()),
+                error: Some(signal_transport_error_message(
+                    "signal send transport failed",
+                    e,
+                )),
                 retryable: true,
                 conversation_id: None,
                 to_jid: None,
@@ -719,9 +729,26 @@ mod tests {
                 ..Default::default()
             })
             .expect_err("typing update to unreachable endpoint should fail");
-        assert!(err
-            .to_string()
-            .contains("failed to update signal typing indicator"));
+        let err_text = err.to_string();
+        assert!(err_text.contains("failed to update signal typing indicator"));
+        assert!(!err_text.contains("%2B15551234567"));
+        assert!(!err_text.contains("+15551234567"));
+    }
+
+    #[test]
+    fn test_signal_mark_read_connection_failure_strips_phone_number_from_error() {
+        let ch = SignalChannel::new("http://127.0.0.1:1".to_string(), "+15551234567".to_string());
+        let err = ch
+            .mark_read(ReadReceiptContext {
+                recipient: "+15559876543".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            })
+            .expect_err("read receipt to unreachable endpoint should fail");
+        let err_text = err.to_string();
+        assert!(err_text.contains("failed to send signal read receipt"));
+        assert!(!err_text.contains("%2B15551234567"));
+        assert!(!err_text.contains("+15551234567"));
     }
 
     #[test]

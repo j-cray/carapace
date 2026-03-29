@@ -4,6 +4,8 @@ use serde_json::Value;
 
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
 
+const MAX_REASONABLE_TYPING_INTERVAL_SECONDS: u64 = 3600;
+
 /// Severity of a schema validation issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -534,7 +536,7 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
             }
 
             if let Some(interval) = typing_obj.get("intervalSeconds") {
-                check_positive_integer(
+                check_typing_interval_seconds(
                     interval,
                     &format!("{}.intervalSeconds", typing_path),
                     issues,
@@ -1001,7 +1003,7 @@ fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
     }
 
     if let Some(typing_interval) = legacy_session.and_then(|s| s.get("typingIntervalSeconds")) {
-        check_positive_integer(typing_interval, ".session.typingIntervalSeconds", issues);
+        check_typing_interval_seconds(typing_interval, ".session.typingIntervalSeconds", issues);
     }
 }
 
@@ -1770,6 +1772,22 @@ fn check_positive_integer(value: &Value, path: &str, issues: &mut Vec<SchemaIssu
     }
 }
 
+fn check_typing_interval_seconds(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    check_positive_integer(value, path, issues);
+    if let Some(n) = value.as_u64() {
+        if n > MAX_REASONABLE_TYPING_INTERVAL_SECONDS {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: path.to_string(),
+                message: format!(
+                    "typing interval above {} seconds is unusually large and may delay or suppress visible typing feedback",
+                    MAX_REASONABLE_TYPING_INTERVAL_SECONDS
+                ),
+            });
+        }
+    }
+}
+
 /// Check that a value is a positive number (> 0).
 fn check_positive_number(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
     match value.as_f64() {
@@ -2420,6 +2438,29 @@ mod tests {
     }
 
     #[test]
+    fn test_channels_features_typing_interval_warns_when_unusually_large() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true,
+                            "intervalSeconds": 9999999
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.signal.features.typing.intervalSeconds"
+                && issue
+                    .message
+                    .contains("typing interval above 3600 seconds is unusually large")
+        }));
+    }
+
+    #[test]
     fn test_unknown_channel_config_entry_is_accepted_for_forward_compatibility() {
         let cfg = json!({
             "channels": {
@@ -2545,6 +2586,22 @@ mod tests {
             .iter()
             .any(|issue| issue.path == ".session.typingMode"
                 && issue.message.contains("typingMode must be \"thinking\"")));
+    }
+
+    #[test]
+    fn test_legacy_session_typing_interval_warns_when_unusually_large() {
+        let cfg = json!({
+            "session": {
+                "typingIntervalSeconds": 9999999
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".session.typingIntervalSeconds"
+                && issue
+                    .message
+                    .contains("typing interval above 3600 seconds is unusually large")
+        }));
     }
 
     #[test]

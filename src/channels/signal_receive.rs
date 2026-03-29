@@ -197,6 +197,10 @@ fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static s
     }
 }
 
+fn sanitize_signal_receive_transport_error(error: reqwest::Error) -> String {
+    error.without_url().to_string()
+}
+
 fn build_receive_url(
     base_url: &url::Url,
     phone_number: &str,
@@ -382,14 +386,15 @@ pub async fn signal_receive_loop(
             }
             Err(e) => {
                 consecutive_errors += 1;
+                let sanitized_error = sanitize_signal_receive_transport_error(e);
                 if consecutive_errors <= 3 {
-                    warn!("Signal receive error: {}", e);
+                    warn!("Signal receive error: {}", sanitized_error);
                 } else if consecutive_errors == 4 {
                     warn!(
                         "Signal receive errors continuing (suppressing further logs until recovery)"
                     );
                 }
-                channel_registry.set_error("signal", e.to_string());
+                channel_registry.set_error("signal", sanitized_error);
             }
         }
 
@@ -945,6 +950,19 @@ mod tests {
             .as_str(),
             "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sanitize_signal_receive_transport_error_strips_phone_number_from_url() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/v1/receive/%2B15551234567?send_read_receipts=false")
+            .send()
+            .await
+            .expect_err("transport request should fail against unreachable port");
+        let sanitized = sanitize_signal_receive_transport_error(err);
+        assert!(!sanitized.contains("%2B15551234567"));
+        assert!(!sanitized.contains("+15551234567"));
+        assert!(!sanitized.contains("send_read_receipts=false"));
     }
 
     #[test]
