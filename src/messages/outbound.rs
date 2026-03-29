@@ -133,7 +133,7 @@ impl MessageContent {
 }
 
 /// Metadata for message delivery context
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingReadReceipt {
     pub task_id: String,
 }
