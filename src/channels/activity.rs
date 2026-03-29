@@ -46,6 +46,7 @@ const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
 const ACTIVITY_BLOCKING_IO_MAX_SECS: u64 = 5;
+const ACTIVITY_DISPATCH_SHUTDOWN_HEADROOM_MS: u64 = 500;
 const READ_RECEIPT_RETRY_DELAY_MS: u64 = 5_000;
 const READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK: usize = 10_000;
 const READ_RECEIPT_PENDING_REASON: &str = "waiting for successful response delivery";
@@ -76,13 +77,22 @@ const READ_RECEIPT_TASK_KIND: &str = "activityReadReceipt";
 // timeout so graceful shutdown drains already-queued work instead of routinely
 // dropping it. Built-in channel activity implementations must keep their own
 // blocking I/O bounded within this shared ceiling.
-const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 = ACTIVITY_BLOCKING_IO_MAX_SECS * 1000;
+const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 =
+    ACTIVITY_BLOCKING_IO_MAX_SECS * 1000 + ACTIVITY_DISPATCH_SHUTDOWN_HEADROOM_MS;
 const _: () = {
     assert!(
         ACTIVITY_BLOCKING_IO_MAX_SECS >= crate::channels::signal::SIGNAL_HTTP_TYPING_TIMEOUT_SECS
     );
     assert!(
         ACTIVITY_BLOCKING_IO_MAX_SECS >= crate::channels::signal::SIGNAL_HTTP_RECEIPT_TIMEOUT_SECS
+    );
+    assert!(
+        ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS
+            > crate::channels::signal::SIGNAL_HTTP_TYPING_TIMEOUT_SECS * 1000
+    );
+    assert!(
+        ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS
+            > crate::channels::signal::SIGNAL_HTTP_RECEIPT_TIMEOUT_SECS * 1000
     );
 };
 const UNSUPPORTED_ACTIVITY_WARNING_COOLDOWN_SECS: u64 = 300;
@@ -420,8 +430,6 @@ impl ActivityService {
         } else {
             tracing::warn!(
                 channel = %channel_id,
-                recipient = %ctx.recipient,
-                timestamp = ?ctx.timestamp,
                 "failed to durably persist the after-response read receipt obligation at receive time; carrying an ephemeral owned receipt through dispatch and delivery instead"
             );
             OwnedReadReceipt::EphemeralAfterResponse {
@@ -472,8 +480,6 @@ impl ActivityService {
 
         tracing::warn!(
             channel = %channel_id,
-            recipient = %ctx.recipient,
-            timestamp = ?ctx.timestamp,
             "failed to persist an immediate read receipt obligation; attempting direct explicit receipt send"
         );
         send_read_receipt_immediately(state, channel_id, ctx).await
@@ -531,12 +537,10 @@ impl ActivityService {
             }
             OwnedReadReceipt::EphemeralAfterResponse {
                 channel_id,
-                context,
+                context: _,
             } => {
                 tracing::warn!(
                     channel = %channel_id,
-                    recipient = %context.recipient,
-                    timestamp = ?context.timestamp,
                     reason,
                     "withholding an ephemeral owned read receipt because the response lifecycle did not complete successfully"
                 );
@@ -563,8 +567,6 @@ impl ActivityService {
                 {
                     tracing::error!(
                         channel = %channel_id,
-                        recipient = %context.recipient,
-                        timestamp = ?context.timestamp,
                         error = %err,
                         "failed to complete an ephemeral owned read receipt after successful delivery"
                     );
@@ -592,8 +594,6 @@ impl ActivityService {
                 {
                     tracing::error!(
                         channel = %channel_id,
-                        recipient = %context.recipient,
-                        timestamp = ?context.timestamp,
                         error = %err,
                         "failed to complete an ephemeral owned read receipt when no run was spawned"
                     );
@@ -1587,9 +1587,9 @@ fn should_drop_activity_work(
 }
 
 fn log_dropped_stop_typing_after_shutdown(channel_id: &str, ctx: &TypingContext) {
+    let _ = ctx;
     tracing::warn!(
         channel = %channel_id,
-        recipient = %ctx.to,
         "dropped queued stop-typing cleanup after activity shutdown deadline"
     );
 }

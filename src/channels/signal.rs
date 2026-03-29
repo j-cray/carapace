@@ -459,7 +459,7 @@ fn redact_sensitive_signal_token(token: &str) -> String {
     // remain visible in operator logs. Shorter sensitive numerics should be
     // caught by the contextual/labeled redaction passes above.
     let sensitive_numeric =
-        (phone_like_numeric && digit_count >= 4) || (bare_numeric && digit_count >= 7);
+        (phone_like_numeric && digit_count >= 4) || (bare_numeric && digit_count >= 10);
     if sensitive_numeric || looks_like_uuid || looks_like_hex_secret || looks_like_opaque_token {
         "[redacted]".to_string()
     } else {
@@ -850,12 +850,22 @@ mod tests {
         let message = signal_http_error_message_with_body_prefix(
             "signal send",
             StatusCode::BAD_REQUEST,
-            "Unregistered user +15551234567 for account 1234567",
+            "Unregistered user +15551234567 for account 1234567890",
         );
         assert!(message.contains("Unregistered user"));
         assert!(message.contains("[redacted]"));
         assert!(!message.contains("15551234567"));
-        assert!(!message.contains("1234567"));
+        assert!(!message.contains("1234567890"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_preserves_unlabeled_seven_digit_diagnostics() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "upstream returned ref 1234567 while retrying",
+        );
+        assert!(message.contains("1234567"));
     }
 
     #[test]

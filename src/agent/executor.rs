@@ -948,14 +948,10 @@ async fn withhold_owned_read_receipt_on_failed_run(
         Some(channel_id) => tracing::warn!(
             run_id = %run_id,
             channel = %channel_id,
-            recipient = %read_receipt.context().recipient,
-            timestamp = ?read_receipt.context().timestamp,
             "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
         ),
         None => tracing::warn!(
             run_id = %run_id,
-            recipient = %read_receipt.context().recipient,
-            timestamp = ?read_receipt.context().timestamp,
             "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
         ),
     }
