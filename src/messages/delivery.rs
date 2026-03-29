@@ -93,6 +93,12 @@ pub(crate) async fn process_channel_messages(
                     );
                     let _ = pipeline.mark_failed(&message_id, "message cancelled by hook");
                 }
+                withhold_pending_read_receipt(
+                    activity_service,
+                    &message.metadata,
+                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                )
+                .await;
                 continue;
             }
 
@@ -117,6 +123,12 @@ pub(crate) async fn process_channel_messages(
             Some(p) => p,
             None => {
                 let _ = pipeline.mark_failed(&message_id, "no plugin registered for channel");
+                withhold_pending_read_receipt(
+                    activity_service,
+                    &message.metadata,
+                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                )
+                .await;
                 continue;
             }
         };
@@ -168,6 +180,18 @@ pub(crate) async fn process_channel_messages(
             activity_service,
         )
         .await;
+    }
+}
+
+async fn withhold_pending_read_receipt(
+    activity_service: &crate::channels::activity::ActivityService,
+    metadata: &crate::messages::outbound::MessageMetadata,
+    reason: &str,
+) {
+    if let Some(read_receipt) = metadata.read_receipt.as_ref() {
+        activity_service
+            .withhold_read_receipt(&read_receipt.task_id, reason)
+            .await;
     }
 }
 
@@ -334,8 +358,8 @@ mod tests {
         MessageContent, OutboundContext as MsgOutboundContext, OutboundMessage,
     };
     use crate::plugins::{
-        BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, OutboundContext,
-        ReadReceiptContext,
+        BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, HookEvent,
+        HookPluginInstance, HookResult, OutboundContext, ReadReceiptContext,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -353,6 +377,8 @@ mod tests {
         retryable: bool,
         transient_failures: AtomicU32,
     }
+
+    struct CancellingHook;
 
     impl MockChannel {
         fn new() -> Self {
@@ -476,6 +502,20 @@ mod tests {
                 notify.notify_one();
             }
             Ok(())
+        }
+    }
+
+    impl HookPluginInstance for CancellingHook {
+        fn get_hooks(&self) -> Result<Vec<String>, BindingError> {
+            Ok(vec!["message_sending".to_string()])
+        }
+
+        fn handle(&self, _event: HookEvent) -> Result<HookResult, BindingError> {
+            Ok(HookResult {
+                handled: true,
+                cancel: true,
+                modified_payload: None,
+            })
         }
     }
 
@@ -941,6 +981,90 @@ mod tests {
             .get(&read_receipt.task_id)
             .expect("delivery success should activate the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
+        activity_service.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_channel_messages_withholds_read_receipt_on_hook_cancellation() {
+        let mock = Arc::new(MockChannel::with_read_receipts());
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("signal", Some(mock.clone()), true);
+        plugin_reg.register_hook("cancel-hook".to_string(), Arc::new(CancellingHook));
+        let activity_service = test_activity_service();
+        let read_receipt =
+            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
+
+        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(read_receipt.clone()),
+                ..Default::default()
+            },
+        );
+        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+
+        process_channel_messages(
+            &["signal".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+            &activity_service,
+        )
+        .await;
+
+        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            pipeline.get_status(&queued.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Cancelled)
+        );
+        let withheld_task = activity_service
+            .read_receipt_queue()
+            .get(&read_receipt.task_id)
+            .expect("hook cancellation should preserve the durable read receipt task");
+        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        activity_service.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_channel_messages_withholds_read_receipt_when_plugin_missing() {
+        let activity_service = test_activity_service();
+        let read_receipt =
+            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
+        let pipeline = Arc::new(MessagePipeline::new());
+        let plugin_reg = Arc::new(PluginRegistry::new());
+        let channel_reg = Arc::new(ChannelRegistry::new());
+        channel_reg.register(
+            crate::channels::ChannelInfo::new("signal", "signal")
+                .with_status(crate::channels::ChannelStatus::Connected),
+        );
+
+        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(read_receipt.clone()),
+                ..Default::default()
+            },
+        );
+        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+
+        process_channel_messages(
+            &["signal".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+            &activity_service,
+        )
+        .await;
+
+        assert_eq!(
+            pipeline.get_status(&queued.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Failed)
+        );
+        let withheld_task = activity_service
+            .read_receipt_queue()
+            .get(&read_receipt.task_id)
+            .expect("missing plugin should preserve the durable read receipt task");
+        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         activity_service.shutdown().await;
     }
 

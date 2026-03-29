@@ -749,12 +749,11 @@ impl TaskExecutor for ReadReceiptTaskExecutor {
                 self.state
                     .activity_service()
                     .warn_unsupported_feature(&payload.channel_id, "read_receipts");
-                return TaskExecutionOutcome::Blocked {
-                    reason: format!(
-                        "channel '{}' does not support read receipts",
+                return TaskExecutionOutcome::Failed {
+                    error: format!(
+                        "channel '{}' does not support read receipts after activation",
                         payload.channel_id
                     ),
-                    category: TaskBlockedReason::ConfigMissing,
                 };
             }
             Err(err) => {
@@ -2368,6 +2367,57 @@ mod tests {
             "direct read receipt dispatch should reflect the underlying slow I/O"
         );
         assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_receipt_task_executor_fails_when_capability_disappears_after_activation() {
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel(
+            "signal".to_string(),
+            Arc::new(MockChannel::new(ChannelCapabilities::default())),
+        );
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_plugin_registry(plugin_registry),
+        );
+        let executor = ReadReceiptTaskExecutor {
+            state: state.clone(),
+        };
+
+        let task = state
+            .activity_service()
+            .read_receipt_queue()
+            .enqueue_async(
+                serde_json::to_value(ReadReceiptTaskPayload::new(
+                    "signal",
+                    ReadReceiptContext {
+                        recipient: "+15551234567".to_string(),
+                        timestamp: Some(123),
+                        ..Default::default()
+                    },
+                ))
+                .expect("read receipt payload should serialize"),
+                None,
+            )
+            .await;
+        let claimed = state
+            .activity_service()
+            .read_receipt_queue()
+            .claim_due(crate::time::unix_now_ms_u64(), 1);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, task.id);
+
+        let outcome = executor.execute(claimed[0].clone()).await;
+
+        match outcome {
+            TaskExecutionOutcome::Failed { error } => {
+                assert!(
+                    error.contains("does not support read receipts after activation"),
+                    "unexpected failure message: {error}"
+                );
+            }
+            other => panic!("expected terminal failure, got {other:?}"),
+        }
     }
 
     #[test]
