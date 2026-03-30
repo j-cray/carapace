@@ -601,7 +601,8 @@ async fn process_envelope(
     };
     let (sender, peer_id) = resolve_signal_sender_and_peer(&sender, data_message)
         .expect("normalized sender should remain valid after ignored group checks");
-    let read_receipt = read_receipt_context.map(|ctx| acquire_signal_read_receipt_ownership(state, ctx));
+    let read_receipt =
+        read_receipt_context.map(|ctx| acquire_signal_read_receipt_ownership(state, ctx));
 
     debug!(
         sender = %sender,
@@ -1807,8 +1808,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_process_envelope_completes_claimed_receipt_when_provider_disappears_after_poll()
-    {
+    async fn test_process_envelope_completes_claimed_receipt_when_provider_disappears_after_poll() {
         let notify = Arc::new(Notify::new());
         let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
         let plugin_registry = Arc::new(PluginRegistry::new());

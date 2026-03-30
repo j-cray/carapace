@@ -2140,7 +2140,10 @@ mod tests {
         run_id: &str,
         channel: &str,
         chat_id: &str,
-    ) -> (sessions::Session, crate::channels::activity::ClaimedReadReceipt) {
+    ) -> (
+        sessions::Session,
+        crate::channels::activity::ClaimedReadReceipt,
+    ) {
         let metadata = sessions::SessionMetadata {
             channel: Some(channel.to_string()),
             chat_id: Some(chat_id.to_string()),
@@ -2582,7 +2585,11 @@ mod tests {
         );
 
         assert!(
-            state.activity_service().read_receipt_queue().list().is_empty(),
+            state
+                .activity_service()
+                .read_receipt_queue()
+                .list()
+                .is_empty(),
             "run errors before delivery should not persist a durable read receipt task"
         );
 
@@ -2646,21 +2653,24 @@ mod tests {
         );
 
         assert!(
-            state.activity_service().read_receipt_queue().list().is_empty(),
+            state
+                .activity_service()
+                .read_receipt_queue()
+                .list()
+                .is_empty(),
             "session lookup failure should not persist a durable read receipt task"
         );
     }
 
     #[tokio::test]
-    async fn test_execute_run_skips_delivery_when_after_response_receipt_cannot_be_persisted(
-    ) {
+    async fn test_execute_run_skips_delivery_when_after_response_receipt_cannot_be_persisted() {
         let plugin = Arc::new(ActivityRecordingChannel::new());
         let plugin_registry = Arc::new(PluginRegistry::new());
         plugin_registry.register_channel("signal".to_string(), plugin);
         let activity_service = Arc::new(
-            crate::channels::activity::ActivityService::with_read_receipt_queue_for_test(
-                Arc::new(crate::tasks::TaskQueue::with_capacity_limit(None, Some(0))),
-            ),
+            crate::channels::activity::ActivityService::with_read_receipt_queue_for_test(Arc::new(
+                crate::tasks::TaskQueue::with_capacity_limit(None, Some(0)),
+            )),
         );
         let state = Arc::new(
             crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
@@ -2742,7 +2752,11 @@ mod tests {
             "delivery should be skipped when the after-response receipt cannot be persisted durably"
         );
         assert!(
-            state.activity_service().read_receipt_queue().list().is_empty(),
+            state
+                .activity_service()
+                .read_receipt_queue()
+                .list()
+                .is_empty(),
             "failed receipt preparation should not leave a durable receipt task behind"
         );
     }
@@ -2818,7 +2832,11 @@ mod tests {
             "deliver=false should not emit typing or read-receipt channel activity"
         );
         assert!(
-            state.activity_service().read_receipt_queue().list().is_empty(),
+            state
+                .activity_service()
+                .read_receipt_queue()
+                .list()
+                .is_empty(),
             "deliver=false should not persist a durable read receipt task"
         );
 

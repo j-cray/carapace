@@ -544,10 +544,7 @@ impl ActivityService {
         self.withhold_read_receipt(receipt.task_id(), reason).await;
     }
 
-    pub async fn complete_owned_read_receipt_after_delivery(
-        &self,
-        receipt: &OwnedReadReceipt,
-    ) {
+    pub async fn complete_owned_read_receipt_after_delivery(&self, receipt: &OwnedReadReceipt) {
         self.activate_read_receipt(receipt.task_id()).await;
     }
 
@@ -557,11 +554,7 @@ impl ActivityService {
         claim: &ClaimedReadReceipt,
     ) {
         if let Err(err) = self
-            .acknowledge_read_receipt_now(
-                state,
-                claim.channel_id(),
-                claim.context().clone(),
-            )
+            .acknowledge_read_receipt_now(state, claim.channel_id(), claim.context().clone())
             .await
         {
             tracing::error!(

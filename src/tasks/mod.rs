@@ -466,8 +466,11 @@ impl TaskQueue {
             Err(err) => {
                 warn!(error = %err, "enqueue worker failed");
                 warn!("falling back to a dedicated enqueue thread after enqueue worker failure");
-                let fallback_task =
-                    self.build_failed_enqueue_task(payload_fallback.clone(), policy_fallback.clone(), None);
+                let fallback_task = self.build_failed_enqueue_task(
+                    payload_fallback.clone(),
+                    policy_fallback.clone(),
+                    None,
+                );
                 self.enqueue_via_dedicated_thread(
                     "task-queue-enqueue-fallback",
                     move |queue_fallback| {
