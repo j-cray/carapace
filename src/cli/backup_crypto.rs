@@ -278,9 +278,10 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_key_matches_reference_pbkdf2() {
-        // Keep this test fast: compare crate and reference implementations
-        // using a reduced iteration count, not production cost.
+    fn test_derive_key_cross_stack_consistency() {
+        // Keep this test fast: compare the production and cross-stack
+        // reference implementations using a reduced iteration count, not
+        // production cost. The known-answer vector below anchors correctness.
         let iterations = 10_000;
         let passphrase = random_bytes::<24>();
         let salt = random_bytes::<SALT_LEN>();

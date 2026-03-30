@@ -78,6 +78,8 @@ pub enum IntegrityError {
 ///
 /// Uses `KEY_DERIVATION_TAG` as the salt and `b"hmac-key"` as the info parameter.
 pub fn derive_hmac_key(server_secret: &[u8]) -> [u8; 32] {
+    // `hkdf 0.12` still requires the legacy `digest 0.10` stack here; the
+    // derived SHA-256 output bytes are identical to the newer digest stack.
     let hk = Hkdf::<Sha256Legacy>::new(Some(KEY_DERIVATION_TAG), server_secret);
     let mut key: [u8; 32] = Default::default();
     hk.expand(b"hmac-key", &mut key)
