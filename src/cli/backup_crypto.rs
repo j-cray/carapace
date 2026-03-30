@@ -198,7 +198,7 @@ pub fn decrypt_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmac::{Hmac, KeyInit, Mac};
+    use hmac::{Hmac, KeyInit as _, Mac};
     use sha2::Sha256 as HmacSha256Digest;
     use tempfile::TempDir;
 
@@ -229,6 +229,9 @@ mod tests {
     ) -> [u8; KEY_LEN] {
         type HmacSha256 = Hmac<HmacSha256Digest>;
 
+        // This reference helper validates the PBKDF2-HMAC-SHA256 algorithm.
+        // It stays on the current `hmac 0.13` stack, while the known-answer
+        // vector below independently pins the production `pbkdf2` output.
         // This reference path derives exactly one PBKDF2 block. It is valid
         // because KEY_LEN is fixed to the SHA-256 output size (32 bytes).
         assert_eq!(KEY_LEN, 32, "reference PBKDF2 assumes one output block");

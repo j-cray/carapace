@@ -12,6 +12,8 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+// `hkdf 0.12` is still on the legacy `digest 0.10` stack, so key derivation
+// must stay on `sha2_10` until the KDF dependencies can move in lockstep.
 use sha2_10::Sha256 as Sha256Legacy;
 
 type HmacSha256 = Hmac<Sha256>;
