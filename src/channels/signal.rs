@@ -312,7 +312,7 @@ fn should_redact_signal_json_string(label: Option<&str>, value: &str) -> bool {
             return true;
         }
         if preserves_numeric_label(label) {
-            return looks_like_phoneish_value_under_safe_label(value);
+            return !preserves_safe_labeled_value(label, value);
         }
     }
     looks_like_phoneish_value(value)
@@ -325,7 +325,7 @@ fn should_redact_signal_json_number(label: Option<&str>, number: &serde_json::Nu
             return true;
         }
         if preserves_numeric_label(label) {
-            return looks_like_phoneish_value_under_safe_label(&rendered);
+            return !preserves_safe_labeled_value(label, &rendered);
         }
     }
     looks_like_phoneish_value(&rendered)
@@ -370,10 +370,7 @@ fn sanitize_signal_error_text(body_text: &str) -> String {
         .replace_all(&collapsed, |captures: &regex::Captures<'_>| {
             let label = &captures[1];
             let value = &captures[3];
-            if looks_like_ipv4_address(value)
-                || (preserves_numeric_label(label)
-                    && !looks_like_phoneish_value_under_safe_label(value))
-            {
+            if looks_like_ipv4_address(value) || preserves_safe_labeled_value(label, value) {
                 captures[0].to_string()
             } else {
                 format!("{}{}[redacted]", label, &captures[2])
@@ -389,8 +386,33 @@ fn sanitize_signal_error_text(body_text: &str) -> String {
 fn preserves_numeric_label(label: &str) -> bool {
     matches!(
         label.to_ascii_lowercase().as_str(),
-        "port" | "status" | "ref" | "bytes" | "count" | "size" | "timeout" | "offset" | "delay"
+        "port"
+            | "status"
+            | "ref"
+            | "bytes"
+            | "count"
+            | "size"
+            | "timeout"
+            | "offset"
+            | "delay"
+            | "timestamp"
     )
+}
+
+fn preserves_safe_labeled_value(label: &str, value: &str) -> bool {
+    if !preserves_numeric_label(label) {
+        return false;
+    }
+
+    if is_timestamp_label(label) && looks_like_epoch_timestamp(value) {
+        return true;
+    }
+
+    !looks_like_phoneish_value_under_safe_label(value)
+}
+
+fn is_timestamp_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("timestamp")
 }
 
 fn is_secret_numeric_label(label: &str) -> bool {
@@ -412,6 +434,28 @@ fn looks_like_phoneish_value_under_safe_label(value: &str) -> bool {
         && trimmed
             .chars()
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '(' | ')' | '.' | ':' | '-' | ' '))
+}
+
+fn looks_like_epoch_timestamp(value: &str) -> bool {
+    const MIN_EPOCH_SECONDS_2000: u64 = 946_684_800;
+    const MAX_EPOCH_SECONDS_2100: u64 = 4_102_444_800;
+    const MIN_EPOCH_MILLIS_2000: u64 = 946_684_800_000;
+    const MAX_EPOCH_MILLIS_2100: u64 = 4_102_444_800_000;
+
+    let trimmed = value.trim();
+    if !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+
+    let Ok(parsed) = trimmed.parse::<u64>() else {
+        return false;
+    };
+
+    match trimmed.len() {
+        10 => (MIN_EPOCH_SECONDS_2000..=MAX_EPOCH_SECONDS_2100).contains(&parsed),
+        13 => (MIN_EPOCH_MILLIS_2000..=MAX_EPOCH_MILLIS_2100).contains(&parsed),
+        _ => false,
+    }
 }
 
 fn looks_like_ipv4_address(value: &str) -> bool {
@@ -1041,6 +1085,41 @@ mod tests {
         assert!(message.contains(r#""bytes":12345678"#));
         assert!(message.contains(r#""count":87654321"#));
         assert!(message.contains(r#""delay":99999999"#));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_preserves_json_timestamp_diagnostics() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            r#"{"timestamp":1706745600000,"detail":"invalid receipt"}"#,
+        );
+        assert!(message.contains("1706745600000"));
+        assert!(message.contains("invalid receipt"));
+        assert!(!message.contains(r#""timestamp":"[redacted]""#));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_preserves_labeled_text_timestamp_diagnostics() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "timestamp:1706745600000 detail=invalid receipt",
+        );
+        assert!(message.contains("timestamp:1706745600000"));
+        assert!(message.contains("detail=invalid receipt"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_phone_like_timestamp_impostors() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            r#"{"timestamp":"+15551234567","detail":"invalid receipt"}"#,
+        );
+        assert!(message.contains(r#""timestamp":"[redacted]""#));
+        assert!(message.contains("invalid receipt"));
+        assert!(!message.contains("+15551234567"));
     }
 
     #[test]

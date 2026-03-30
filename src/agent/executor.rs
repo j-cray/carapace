@@ -934,10 +934,10 @@ async fn withhold_claimed_read_receipt_on_failed_run(
     let Some(claimed_read_receipt) = delivery_context_from_registry(state, run_id).1 else {
         return;
     };
-    if !state.activity_service().withhold_claimed_read_receipt(
-        &claimed_read_receipt,
-        "withholding explicit read receipt because the response was not delivered successfully",
-    ) {
+    if !state
+        .activity_service()
+        .withhold_claimed_read_receipt(&claimed_read_receipt)
+    {
         return;
     }
 
@@ -1457,10 +1457,9 @@ pub async fn execute_run(
                         }
                     } else if read_receipt.is_some() {
                         if let Some(read_receipt) = read_receipt.as_ref() {
-                            state.activity_service().withhold_claimed_read_receipt(
-                                read_receipt,
-                                "withholding explicit read receipt because no outbound delivery target was available",
-                            );
+                            state
+                                .activity_service()
+                                .withhold_claimed_read_receipt(read_receipt);
                         }
                         tracing::warn!(
                             run_id = %run_id,
@@ -1469,10 +1468,9 @@ pub async fn execute_run(
                     }
                 } else if read_receipt.is_some() {
                     if let Some(read_receipt) = read_receipt.as_ref() {
-                        state.activity_service().withhold_claimed_read_receipt(
-                            read_receipt,
-                            "withholding explicit read receipt because the agent produced no deliverable response text",
-                        );
+                        state
+                            .activity_service()
+                            .withhold_claimed_read_receipt(read_receipt);
                     }
                     tracing::warn!(
                         run_id = %run_id,
@@ -1481,10 +1479,9 @@ pub async fn execute_run(
                 }
             } else if read_receipt.is_some() {
                 if let Some(read_receipt) = read_receipt.as_ref() {
-                    state.activity_service().withhold_claimed_read_receipt(
-                        read_receipt,
-                        "withholding explicit read receipt because outbound delivery was disabled for this run",
-                    );
+                    state
+                        .activity_service()
+                        .withhold_claimed_read_receipt(read_receipt);
                 }
                 tracing::warn!(
                     run_id = %run_id,

@@ -274,6 +274,59 @@ impl ClaimedReadReceipt {
     }
 }
 
+/// Poll-scoped reservation of bounded read-receipt ownership capacity.
+///
+/// Signal receive reserves ownership slots before it suppresses upstream
+/// auto-read-receipts. Each inbound message that Carapace chooses to own
+/// consumes one reserved slot into a `ClaimedReadReceipt`, and any unused slots
+/// are released automatically when the reservation is dropped at the end of the
+/// poll.
+pub struct ReadReceiptOwnershipReservation {
+    channel_id: String,
+    reservation_ids: Vec<String>,
+    reserved_read_receipt_ownership: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ReadReceiptOwnershipReservation {
+    fn new(
+        channel_id: impl Into<String>,
+        reservation_ids: Vec<String>,
+        reserved_read_receipt_ownership: Arc<Mutex<HashSet<String>>>,
+    ) -> Self {
+        Self {
+            channel_id: channel_id.into(),
+            reservation_ids,
+            reserved_read_receipt_ownership,
+        }
+    }
+
+    pub fn reserved_capacity(&self) -> usize {
+        self.reservation_ids.len()
+    }
+
+    pub fn claim(&mut self, context: ReadReceiptContext) -> Option<ClaimedReadReceipt> {
+        let reservation_id = self.reservation_ids.pop()?;
+        Some(ClaimedReadReceipt::tracked(
+            self.channel_id.clone(),
+            context,
+            reservation_id,
+        ))
+    }
+}
+
+impl Drop for ReadReceiptOwnershipReservation {
+    fn drop(&mut self) {
+        if self.reservation_ids.is_empty() {
+            return;
+        }
+
+        let mut reserved_read_receipt_ownership = self.reserved_read_receipt_ownership.lock();
+        for reservation_id in self.reservation_ids.drain(..) {
+            reserved_read_receipt_ownership.remove(&reservation_id);
+        }
+    }
+}
+
 /// Durable after-response read-receipt obligation attached to queued delivery.
 #[derive(Debug, Clone)]
 pub struct OwnedReadReceipt {
@@ -350,7 +403,7 @@ impl StopTypingDispatchKey {
 pub struct ActivityService {
     dispatcher: Arc<ActivityDispatcher>,
     read_receipt_queue: Arc<TaskQueue>,
-    claimed_read_receipts: Mutex<HashSet<String>>,
+    reserved_read_receipt_ownership: Arc<Mutex<HashSet<String>>>,
     unsupported_feature_warnings: Mutex<UnsupportedActivityWarningRegistry>,
     read_receipt_ownership_high_watermark: usize,
 }
@@ -380,7 +433,7 @@ impl ActivityService {
         Self {
             dispatcher: Arc::new(ActivityDispatcher::new()),
             read_receipt_queue,
-            claimed_read_receipts: Mutex::new(HashSet::new()),
+            reserved_read_receipt_ownership: Arc::new(Mutex::new(HashSet::new())),
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
             read_receipt_ownership_high_watermark: READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK,
         }
@@ -412,7 +465,7 @@ impl ActivityService {
                 None,
                 Some(read_receipt_ownership_high_watermark),
             )),
-            claimed_read_receipts: Mutex::new(HashSet::new()),
+            reserved_read_receipt_ownership: Arc::new(Mutex::new(HashSet::new())),
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
             read_receipt_ownership_high_watermark,
         }
@@ -458,29 +511,64 @@ impl ActivityService {
         channel_id: &str,
         ctx: ReadReceiptContext,
     ) -> Option<ClaimedReadReceipt> {
+        let mut reservation = self.reserve_read_receipt_ownership_slots(channel_id, 1)?;
+        reservation.claim(ctx)
+    }
+
+    pub fn reserve_available_read_receipt_ownership(
+        &self,
+        channel_id: &str,
+    ) -> Option<ReadReceiptOwnershipReservation> {
+        self.reserve_read_receipt_ownership_slots(
+            channel_id,
+            self.read_receipt_ownership_high_watermark,
+        )
+    }
+
+    fn reserve_read_receipt_ownership_slots(
+        &self,
+        channel_id: &str,
+        requested_slots: usize,
+    ) -> Option<ReadReceiptOwnershipReservation> {
+        if requested_slots == 0 {
+            return None;
+        }
+
         let outstanding_queue = self.read_receipt_queue_outstanding_count();
-        let mut claimed_read_receipts = self.claimed_read_receipts.lock();
-        let outstanding = outstanding_queue + claimed_read_receipts.len();
+        let mut reserved_read_receipt_ownership = self.reserved_read_receipt_ownership.lock();
+        let outstanding = outstanding_queue + reserved_read_receipt_ownership.len();
         if outstanding >= self.read_receipt_ownership_high_watermark {
-            drop(claimed_read_receipts);
+            drop(reserved_read_receipt_ownership);
             self.maybe_warn_read_receipt_backpressure(channel_id, outstanding);
             return None;
         }
 
-        let reservation_id = Uuid::new_v4().to_string();
-        claimed_read_receipts.insert(reservation_id.clone());
-        Some(ClaimedReadReceipt::tracked(channel_id, ctx, reservation_id))
+        let available_slots = self.read_receipt_ownership_high_watermark - outstanding;
+        let reserved_slots = available_slots.min(requested_slots);
+        let reservation_ids = (0..reserved_slots)
+            .map(|_| {
+                let reservation_id = Uuid::new_v4().to_string();
+                reserved_read_receipt_ownership.insert(reservation_id.clone());
+                reservation_id
+            })
+            .collect();
+        Some(ReadReceiptOwnershipReservation::new(
+            channel_id,
+            reservation_ids,
+            self.reserved_read_receipt_ownership.clone(),
+        ))
     }
 
     fn release_claimed_read_receipt_reservation(&self, claim: &ClaimedReadReceipt) -> bool {
         let Some(reservation_id) = claim.reservation_id() else {
             return false;
         };
-        self.claimed_read_receipts.lock().remove(reservation_id)
+        self.reserved_read_receipt_ownership
+            .lock()
+            .remove(reservation_id)
     }
 
-    pub fn withhold_claimed_read_receipt(&self, claim: &ClaimedReadReceipt, reason: &str) -> bool {
-        let _ = reason;
+    pub fn withhold_claimed_read_receipt(&self, claim: &ClaimedReadReceipt) -> bool {
         self.release_claimed_read_receipt_reservation(claim)
     }
 
@@ -635,8 +723,8 @@ impl ActivityService {
             for task in blocked {
                 let is_after_response_pending = task.blocked_reason
                     == Some(TaskBlockedReason::ExternalDependency)
-                    && task.last_error.as_deref() == Some(READ_RECEIPT_PENDING_REASON)
-                    && ReadReceiptTaskPayload::from_value(task.payload.clone()).is_ok();
+                    && ReadReceiptTaskPayload::from_value(task.payload.clone())
+                        .is_ok_and(|payload| payload.kind == READ_RECEIPT_TASK_KIND);
                 if is_after_response_pending
                     && queue.mark_cancelled(
                         &task.id,
@@ -695,7 +783,8 @@ impl ActivityService {
     }
 
     fn read_receipt_obligation_count(&self) -> usize {
-        self.read_receipt_queue_outstanding_count() + self.claimed_read_receipts.lock().len()
+        self.read_receipt_queue_outstanding_count()
+            + self.reserved_read_receipt_ownership.lock().len()
     }
 
     fn maybe_warn_read_receipt_backpressure(&self, channel_id: &str, outstanding: usize) {
@@ -3049,13 +3138,44 @@ mod tests {
             "tracked receive-time claims should count against the ownership high-water mark"
         );
 
-        assert!(service.withhold_claimed_read_receipt(
-            &claim,
-            "test should release claimed receipt ownership",
-        ));
+        assert!(service.withhold_claimed_read_receipt(&claim));
         assert!(
             service.can_accept_read_receipt_ownership("signal"),
             "withholding a tracked claim should release its ownership reservation"
+        );
+    }
+
+    #[test]
+    fn test_poll_reservation_releases_unused_capacity_on_drop() {
+        let service = ActivityService::with_limits_for_test(8, 2);
+        let mut reservation = service
+            .reserve_available_read_receipt_ownership("signal")
+            .expect("poll reservation should reserve the available ownership capacity");
+        assert_eq!(reservation.reserved_capacity(), 2);
+        assert!(
+            !service.can_accept_read_receipt_ownership("signal"),
+            "reserved poll capacity should count against the ownership high-water mark"
+        );
+
+        let claimed = reservation
+            .claim(ReadReceiptContext {
+                recipient: "+15551230001".to_string(),
+                timestamp: Some(1),
+                ..Default::default()
+            })
+            .expect("claim should consume one reserved slot");
+        assert_eq!(reservation.reserved_capacity(), 1);
+
+        drop(reservation);
+        assert!(
+            service.can_accept_read_receipt_ownership("signal"),
+            "dropping the reservation should release unused poll slots immediately while keeping claimed slots reserved"
+        );
+
+        assert!(service.withhold_claimed_read_receipt(&claimed));
+        assert!(
+            service.can_accept_read_receipt_ownership("signal"),
+            "releasing the claimed slot should restore the now-unused reserved capacity"
         );
     }
 
@@ -3112,5 +3232,7 @@ mod tests {
             .get(&retained.id)
             .expect("queued task should remain present");
         assert_eq!(retained_task.state, crate::tasks::TaskState::Queued);
+
+        service.shutdown().await;
     }
 }
