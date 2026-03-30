@@ -600,21 +600,7 @@ async fn process_envelope(
         }
     };
     let Some((sender, peer_id)) = resolve_signal_sender_and_peer(&sender, data_message) else {
-        if signal_group_id(data_message).is_some() {
-            maybe_dispatch_read_receipt_for_ignored_signal_message(
-                state,
-                Some(sender.as_str()),
-                read_receipt_context.clone(),
-                carapace_manages_read_receipts,
-                "ignored unsupported Signal group message",
-            )
-            .await;
-            warn!(
-                "Ignoring Signal group message: Signal outbound currently supports direct messages only"
-            );
-        } else {
-            warn!("Ignoring Signal envelope because sender normalization failed");
-        }
+        warn!("Ignoring Signal envelope because sender normalization failed");
         return;
     };
     let read_receipt =

@@ -926,15 +926,14 @@ fn delivery_context_from_registry(
         })
 }
 
-async fn withhold_owned_read_receipt_on_failed_run(
+async fn log_claimed_read_receipt_withheld_on_failed_run(
     state: &Arc<WsServerState>,
     run_id: &str,
     channel_id: Option<&str>,
 ) {
-    let (_, claimed_read_receipt) = delivery_context_from_registry(state, run_id);
-    let Some(_claimed_read_receipt) = claimed_read_receipt.as_ref() else {
+    if delivery_context_from_registry(state, run_id).1.is_none() {
         return;
-    };
+    }
 
     match channel_id {
         Some(channel_id) => tracing::warn!(
@@ -1073,7 +1072,7 @@ pub async fn execute_run(
         registry.mark_started(&run_id)
     };
     if !run_started {
-        withhold_owned_read_receipt_on_failed_run(&state, &run_id, None).await;
+        log_claimed_read_receipt_withheld_on_failed_run(&state, &run_id, None).await;
         return Err(AgentError::Cancelled);
     }
 
@@ -1495,8 +1494,12 @@ pub async fn execute_run(
     .await;
 
     if result.is_err() {
-        withhold_owned_read_receipt_on_failed_run(&state, &run_id, error_channel_id.as_deref())
-            .await;
+        log_claimed_read_receipt_withheld_on_failed_run(
+            &state,
+            &run_id,
+            error_channel_id.as_deref(),
+        )
+        .await;
     }
 
     result
