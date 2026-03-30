@@ -208,6 +208,15 @@ fn sanitize_signal_receive_transport_error(error: reqwest::Error) -> String {
     error.without_url().to_string()
 }
 
+fn build_signal_receive_http_client(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, String> {
+    builder
+        .timeout(RECEIVE_TIMEOUT)
+        .build()
+        .map_err(|err| format!("failed to build Signal receive HTTP client: {err}"))
+}
+
 fn build_receive_url(
     base_url: &url::Url,
     phone_number: &str,
@@ -400,10 +409,19 @@ pub async fn signal_receive_loop(
         }
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(RECEIVE_TIMEOUT)
-        .build()
-        .expect("failed to build Signal receive HTTP client");
+    let client = match build_signal_receive_http_client(reqwest::Client::builder()) {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                phone_number = %phone_number,
+                error = %err,
+                "Signal receive loop HTTP client initialization failed"
+            );
+            channel_registry.set_error("signal", err);
+            channel_registry.update_status("signal", ChannelStatus::Error);
+            return;
+        }
+    };
     info!(phone_number = %phone_number, "Signal receive loop started");
     let mut config_rx = crate::config::subscribe_config_changes();
     config_rx.borrow_and_update();
@@ -1257,6 +1275,13 @@ mod tests {
         assert!(!sanitized.contains("%2B15551234567"));
         assert!(!sanitized.contains("+15551234567"));
         assert!(!sanitized.contains("send_read_receipts=false"));
+    }
+
+    #[test]
+    fn test_build_signal_receive_http_client_reports_builder_errors() {
+        let err = build_signal_receive_http_client(reqwest::Client::builder().user_agent("\n"))
+            .expect_err("invalid user agent should fail client construction");
+        assert!(err.contains("failed to build Signal receive HTTP client"));
     }
 
     #[tokio::test(flavor = "current_thread")]
