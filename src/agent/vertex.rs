@@ -24,7 +24,7 @@ pub enum VertexSetupValidationError {
     InvalidLocation,
     MissingDefaultModel,
     UnsupportedModel,
-    ClientInit,
+    ClientInit(String),
     AuthUnavailable,
     AccessDenied,
     ProbeRejected,
@@ -36,35 +36,47 @@ pub enum VertexSetupValidationError {
 
 impl std::fmt::Display for VertexSetupValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::InvalidProjectId => "Vertex project ID is invalid.",
-            Self::InvalidLocation => "Vertex location is invalid.",
-            Self::MissingDefaultModel => {
+        match self {
+            Self::InvalidProjectId => write!(f, "Vertex project ID is invalid."),
+            Self::InvalidLocation => write!(f, "Vertex location is invalid."),
+            Self::MissingDefaultModel => write!(
+                f,
                 "Missing required model parameter and no default model is configured."
-            }
-            Self::UnsupportedModel => {
+            ),
+            Self::UnsupportedModel => write!(
+                f,
                 "Unsupported Vertex model. This provider currently supports Google Gemini models only."
+            ),
+            Self::ClientInit(detail) => {
+                if detail.is_empty() {
+                    write!(f, "Vertex validation could not initialize the local HTTP client.")
+                } else {
+                    write!(
+                        f,
+                        "Vertex validation could not initialize the local HTTP client: {detail}"
+                    )
+                }
             }
-            Self::ClientInit => {
-                "Vertex validation could not initialize the local HTTP client."
-            }
-            Self::AuthUnavailable => {
+            Self::AuthUnavailable => write!(
+                f,
                 "Vertex authentication is unavailable from both gcloud and the metadata server."
-            }
-            Self::AccessDenied => {
+            ),
+            Self::AccessDenied => write!(
+                f,
                 "Vertex rejected access to the configured project, location, or model."
-            }
-            Self::ProbeRejected => {
+            ),
+            Self::ProbeRejected => write!(
+                f,
                 "Vertex rejected the validation request before model lookup completed."
-            }
-            Self::Unavailable => {
+            ),
+            Self::Unavailable => write!(
+                f,
                 "Vertex could not find the configured project, location, or model."
-            }
-            Self::Rejected => "Vertex rejected the configuration.",
-            Self::RateLimited => "Vertex validation is being rate limited.",
-            Self::Transport => "Vertex validation could not reach the provider.",
-        };
-        write!(f, "{message}")
+            ),
+            Self::Rejected => write!(f, "Vertex rejected the configuration."),
+            Self::RateLimited => write!(f, "Vertex validation is being rate limited."),
+            Self::Transport => write!(f, "Vertex validation could not reach the provider."),
+        }
     }
 }
 
@@ -74,22 +86,12 @@ impl std::error::Error for VertexSetupValidationError {}
 enum VertexProviderInitError {
     InvalidProjectId,
     InvalidLocation,
-    ClientInit,
+    ClientInit(String),
 }
 
 impl From<VertexProviderInitError> for AgentError {
     fn from(err: VertexProviderInitError) -> Self {
-        match err {
-            VertexProviderInitError::InvalidProjectId => {
-                AgentError::Provider(VertexSetupValidationError::InvalidProjectId.to_string())
-            }
-            VertexProviderInitError::InvalidLocation => {
-                AgentError::Provider(VertexSetupValidationError::InvalidLocation.to_string())
-            }
-            VertexProviderInitError::ClientInit => {
-                AgentError::Provider(VertexSetupValidationError::ClientInit.to_string())
-            }
-        }
+        AgentError::Provider(VertexSetupValidationError::from(err).to_string())
     }
 }
 
@@ -98,7 +100,7 @@ impl From<VertexProviderInitError> for VertexSetupValidationError {
         match err {
             VertexProviderInitError::InvalidProjectId => Self::InvalidProjectId,
             VertexProviderInitError::InvalidLocation => Self::InvalidLocation,
-            VertexProviderInitError::ClientInit => Self::ClientInit,
+            VertexProviderInitError::ClientInit(detail) => Self::ClientInit(detail),
         }
     }
 }
@@ -160,7 +162,7 @@ impl MetadataProvider {
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
             .build()
-            .map_err(|_| VertexProviderInitError::ClientInit)?;
+            .map_err(|e| VertexProviderInitError::ClientInit(e.to_string()))?;
         Ok(Self { client })
     }
 }
@@ -464,7 +466,7 @@ impl VertexProvider {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .build()
-            .map_err(|_| VertexProviderInitError::ClientInit)?;
+            .map_err(|e| VertexProviderInitError::ClientInit(e.to_string()))?;
 
         Ok(Self {
             client,
@@ -627,8 +629,10 @@ pub async fn validate_vertex_setup(
         .send()
         .await
         .map_err(|_| VertexSetupValidationError::Transport)?;
+    let status = response.status();
+    let _ = response.bytes().await;
 
-    classify_vertex_validation_probe_status(response.status())
+    classify_vertex_validation_probe_status(status)
 }
 
 fn classify_vertex_validation_probe_status(
@@ -642,6 +646,7 @@ fn classify_vertex_validation_probe_status(
         StatusCode::BAD_REQUEST => Err(VertexSetupValidationError::ProbeRejected),
         StatusCode::NOT_FOUND => Err(VertexSetupValidationError::Unavailable),
         StatusCode::TOO_MANY_REQUESTS => Err(VertexSetupValidationError::RateLimited),
+        status if status.is_redirection() => Err(VertexSetupValidationError::Transport),
         status if status.is_server_error() => Err(VertexSetupValidationError::Transport),
         _ => Err(VertexSetupValidationError::Rejected),
     }
@@ -1138,8 +1143,21 @@ mod tests {
             VertexSetupValidationError::InvalidLocation
         );
         assert_eq!(
-            VertexSetupValidationError::from(VertexProviderInitError::ClientInit),
-            VertexSetupValidationError::ClientInit
+            VertexSetupValidationError::from(VertexProviderInitError::ClientInit(
+                "builder failed".to_string()
+            )),
+            VertexSetupValidationError::ClientInit("builder failed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_vertex_setup_validation_client_init_preserves_detail() {
+        let err = VertexSetupValidationError::from(VertexProviderInitError::ClientInit(
+            "tls backend unavailable".to_string(),
+        ));
+        assert_eq!(
+            err.to_string(),
+            "Vertex validation could not initialize the local HTTP client: tls backend unavailable"
         );
     }
 
@@ -1191,6 +1209,10 @@ mod tests {
         );
         assert_eq!(
             classify_vertex_validation_probe_status(StatusCode::SERVICE_UNAVAILABLE),
+            Err(VertexSetupValidationError::Transport)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::TEMPORARY_REDIRECT),
             Err(VertexSetupValidationError::Transport)
         );
         assert_eq!(

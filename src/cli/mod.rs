@@ -4356,9 +4356,16 @@ fn vertex_provider_guidance(cfg: &Value) -> String {
         || config_path_has_usable_value(cfg, &["vertex", "projectId"]);
     let location = env_var_present("VERTEX_LOCATION")
         || config_path_has_usable_value(cfg, &["vertex", "location"]);
-    let requires_default_model = matches!(local_chat_model(cfg).as_str(), "vertex:default");
+    let local_route = local_chat_model(cfg);
+    let requires_default_model = crate::agent::vertex::is_vertex_model(&local_route)
+        && crate::agent::vertex::strip_vertex_prefix(&local_route) == "default";
     let default_model =
         env_var_present("VERTEX_MODEL") || config_path_has_usable_value(cfg, &["vertex", "model"]);
+
+    if project && location && requires_default_model && !default_model {
+        return "set `VERTEX_MODEL` in the same shell you use for `cara start` and `cara verify`, or configure `vertex.model`, then retry `cara verify --outcome local-chat`"
+            .to_string();
+    }
 
     if project && location && (!requires_default_model || default_model) {
         return "check Vertex auth, project, location, and selected model, then retry `cara verify --outcome local-chat`"
@@ -5120,7 +5127,7 @@ fn vertex_validation_failure_remediation(
             "choose a supported Google Gemini model such as `vertex:gemini-2.5-flash`, then rerun `cara setup --force --provider vertex`"
                 .to_string()
         }
-        crate::agent::vertex::VertexSetupValidationError::ClientInit => {
+        crate::agent::vertex::VertexSetupValidationError::ClientInit(_) => {
             "check local HTTP client and TLS runtime availability, then rerun `cara setup --force --provider vertex`"
                 .to_string()
         }
@@ -10797,6 +10804,23 @@ mod tests {
         assert_eq!(
             local_chat_verify_next_step(&cfg),
             "check Vertex auth, project, location, and selected model, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_vertex_default_alias_missing_model() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_MODEL");
+        let cfg = serde_json::json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1"
+            },
+            "agents": { "defaults": { "model": "vertex/default" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `VERTEX_MODEL` in the same shell you use for `cara start` and `cara verify`, or configure `vertex.model`, then retry `cara verify --outcome local-chat`"
         );
     }
 
