@@ -4901,6 +4901,15 @@ async fn validate_channel_credentials_owned(channel: String, token: String) -> R
     validate_channel_credentials(&channel, &token).await
 }
 
+fn setup_rerun_command(
+    provider: SetupProvider,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
+) -> String {
+    crate::onboarding::setup::SetupProvider::from(provider)
+        .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
+        .unwrap_or_else(|| crate::onboarding::setup::LOCAL_CHAT_VERIFY_COMMAND.to_string())
+}
+
 fn validate_provider_credentials_interactive(
     provider: SetupProvider,
     api_key: &str,
@@ -4933,11 +4942,7 @@ fn validate_provider_credentials_interactive(
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                let rerun_command = crate::onboarding::setup::SetupProvider::from(provider)
-                    .setup_command(setup_provider_auth_mode_hint(provider, None))
-                    .unwrap_or_else(|| {
-                        crate::onboarding::setup::LOCAL_CHAT_VERIFY_COMMAND.to_string()
-                    });
+                let rerun_command = setup_rerun_command(provider, None);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
@@ -6350,9 +6355,7 @@ fn handle_setup_validation_failure(
     err: crate::agent::AgentError,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
-    let rerun = crate::onboarding::setup::SetupProvider::from(provider)
-        .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
-        .unwrap_or_else(|| crate::onboarding::setup::LOCAL_CHAT_VERIFY_COMMAND.to_string());
+    let rerun = setup_rerun_command(provider, requested_auth_mode);
     eprintln!("Next step: fix the value and rerun `{rerun}`.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
         Ok(crate::onboarding::setup::SetupCheck::validation_fail(

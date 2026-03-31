@@ -627,6 +627,8 @@ fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<
 }
 
 fn vertex_route_requires_default_model(cfg: &Value) -> bool {
+    // An unset route still means "use the provider default route"; for Vertex that default is
+    // `vertex:default`, so the shared onboarding contract continues to require `vertex.model`.
     matches!(
         config_string(cfg, &["agents", "defaults", "model"])
             .unwrap_or_else(|| SetupProvider::Vertex.default_model().to_string())
@@ -1209,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assess_provider_setup_vertex_requires_explicit_project_and_location() {
+    fn test_assess_provider_setup_vertex_requires_explicit_location() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
             "agents": { "defaults": { "model": "vertex:default" } },
@@ -1221,6 +1223,22 @@ mod tests {
         assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
         assert!(assessment.checks.iter().any(|check| {
             check.name == "Vertex location" && check.status == SetupCheckStatus::Fail
+        }));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_vertex_requires_explicit_project_id() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "vertex:default" } },
+            "vertex": { "location": "us-central1" }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Vertex, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Vertex project ID" && check.status == SetupCheckStatus::Fail
         }));
     }
 
