@@ -3782,6 +3782,7 @@ enum SetupProviderChoice {
     OpenAi,
     Ollama,
     Gemini,
+    Vertex,
     Venice,
     Bedrock,
 }
@@ -3793,6 +3794,7 @@ impl SetupProviderChoice {
             Self::OpenAi => "openai",
             Self::Ollama => "ollama",
             Self::Gemini => "gemini",
+            Self::Vertex => "vertex",
             Self::Venice => "venice",
             Self::Bedrock => "bedrock",
         }
@@ -3804,6 +3806,7 @@ impl SetupProviderChoice {
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
+            Self::Vertex => "Vertex",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -3815,6 +3818,7 @@ impl SetupProviderChoice {
             "openai" | "gpt" => Some(Self::OpenAi),
             "ollama" => Some(Self::Ollama),
             "gemini" => Some(Self::Gemini),
+            "vertex" => Some(Self::Vertex),
             "venice" => Some(Self::Venice),
             "bedrock" => Some(Self::Bedrock),
             _ => None,
@@ -3900,6 +3904,8 @@ pub enum SetupProvider {
     Ollama,
     #[value(name = "gemini")]
     Gemini,
+    #[value(name = "vertex")]
+    Vertex,
     #[value(name = "venice")]
     Venice,
     #[value(name = "bedrock")]
@@ -3914,6 +3920,7 @@ impl SetupProvider {
             Self::OpenAi => "openai",
             Self::Ollama => "ollama",
             Self::Gemini => "gemini",
+            Self::Vertex => "vertex",
             Self::Venice => "venice",
             Self::Bedrock => "bedrock",
         }
@@ -3926,6 +3933,7 @@ impl SetupProvider {
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
+            Self::Vertex => "Vertex",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -3937,6 +3945,7 @@ impl SetupProvider {
             Self::Codex => None,
             Self::OpenAi => Some("OPENAI_API_KEY"),
             Self::Gemini => Some("GOOGLE_API_KEY"),
+            Self::Vertex => None,
             Self::Venice => Some("VENICE_API_KEY"),
             Self::Ollama | Self::Bedrock => None,
         }
@@ -3949,6 +3958,7 @@ impl SetupProvider {
             Self::OpenAi => "gpt-4o",
             Self::Ollama => "ollama:llama3",
             Self::Gemini => "gemini-2.0-flash",
+            Self::Vertex => "vertex:default",
             Self::Venice => "venice:llama-3.3-70b",
             Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
         }
@@ -3971,6 +3981,7 @@ impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
             SetupProvider::OpenAi => Self::OpenAi,
             SetupProvider::Ollama => Self::Ollama,
             SetupProvider::Gemini => Self::Gemini,
+            SetupProvider::Vertex => Self::Vertex,
             SetupProvider::Venice => Self::Venice,
             SetupProvider::Bedrock => Self::Bedrock,
         }
@@ -3995,6 +4006,7 @@ enum ModelProviderRoute {
     OpenAi,
     Ollama,
     Gemini,
+    Vertex,
     Bedrock,
     Venice,
 }
@@ -4035,6 +4047,9 @@ fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     if env_var_present("GOOGLE_API_KEY") {
         providers.push(SetupProvider::Gemini);
     }
+    if env_var_present("VERTEX_PROJECT_ID") {
+        providers.push(SetupProvider::Vertex);
+    }
     if env_var_present("VENICE_API_KEY") {
         providers.push(SetupProvider::Venice);
     }
@@ -4067,6 +4082,9 @@ fn detect_setup_provider_choice_env_hints() -> Vec<SetupProviderChoice> {
     }
     if env_var_present("GOOGLE_API_KEY") {
         choices.push(SetupProviderChoice::Gemini);
+    }
+    if env_var_present("VERTEX_PROJECT_ID") {
+        choices.push(SetupProviderChoice::Vertex);
     }
     if env_var_present("VENICE_API_KEY") {
         choices.push(SetupProviderChoice::Venice);
@@ -4171,6 +4189,19 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     {
         labels.push("Gemini");
     }
+    let vertex_project = env_var_present("VERTEX_PROJECT_ID")
+        || config_path_has_usable_value(cfg, &["vertex", "projectId"]);
+    let vertex_location = env_var_present("VERTEX_LOCATION")
+        || config_path_has_usable_value(cfg, &["vertex", "location"]);
+    let vertex_model =
+        env_var_present("VERTEX_MODEL") || config_path_has_usable_value(cfg, &["vertex", "model"]);
+    let vertex_route = local_chat_model(cfg);
+    if vertex_project
+        && vertex_location
+        && (!matches!(vertex_route.as_str(), "vertex:default") || vertex_model)
+    {
+        labels.push("Vertex");
+    }
     if env_var_present("VENICE_API_KEY") || config_path_has_usable_value(cfg, &["venice", "apiKey"])
     {
         labels.push("Venice");
@@ -4260,6 +4291,8 @@ fn local_chat_provider_route(model: &str) -> ModelProviderRoute {
         ModelProviderRoute::Venice
     } else if crate::agent::gemini::is_gemini_model(model) {
         ModelProviderRoute::Gemini
+    } else if crate::agent::vertex::is_vertex_model(model) {
+        ModelProviderRoute::Vertex
     } else if crate::agent::codex::is_codex_model(model) {
         ModelProviderRoute::Codex
     } else if crate::agent::openai::is_openai_model(model) {
@@ -4317,6 +4350,34 @@ fn bedrock_provider_guidance(cfg: &Value) -> String {
     )
 }
 
+fn vertex_provider_guidance(cfg: &Value) -> String {
+    let project = env_var_present("VERTEX_PROJECT_ID")
+        || config_path_has_usable_value(cfg, &["vertex", "projectId"]);
+    let location = env_var_present("VERTEX_LOCATION")
+        || config_path_has_usable_value(cfg, &["vertex", "location"]);
+    let requires_default_model = matches!(local_chat_model(cfg).as_str(), "vertex:default");
+    let default_model =
+        env_var_present("VERTEX_MODEL") || config_path_has_usable_value(cfg, &["vertex", "model"]);
+
+    if project && location && (!requires_default_model || default_model) {
+        return "check Vertex auth, project, location, and selected model, then retry `cara verify --outcome local-chat`"
+            .to_string();
+    }
+
+    if let Some(env_var) = unresolved_placeholder_env_var(cfg, &["vertex", "projectId"])
+        .or_else(|| unresolved_placeholder_env_var(cfg, &["vertex", "location"]))
+        .or_else(|| unresolved_placeholder_env_var(cfg, &["vertex", "model"]))
+    {
+        return missing_placeholder_guidance(&env_var);
+    }
+
+    provider_route_fallback_guidance(
+        cfg,
+        "Vertex",
+        Some("`VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL` or `vertex.*`"),
+    )
+}
+
 fn codex_provider_guidance(cfg: &Value) -> String {
     if config_path_has_usable_value(cfg, &["codex", "authProfile"]) {
         if env_var_present("CARAPACE_CONFIG_PASSWORD") {
@@ -4351,6 +4412,7 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
             "check Gemini API key/model and retry `cara verify --outcome local-chat`",
             Some("`GOOGLE_API_KEY` or `google.apiKey`"),
         ),
+        ModelProviderRoute::Vertex => vertex_provider_guidance(cfg),
         ModelProviderRoute::Venice => single_credential_provider_guidance(
             cfg,
             "Venice",
@@ -5035,6 +5097,129 @@ fn validate_bedrock_credentials_interactive(
     }
 
     Ok(checks)
+}
+
+fn vertex_validation_failure_remediation(
+    err: &crate::agent::vertex::VertexSetupValidationError,
+) -> String {
+    match err {
+        crate::agent::vertex::VertexSetupValidationError::InvalidProjectId => {
+            "enter a valid GCP project ID and rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+        crate::agent::vertex::VertexSetupValidationError::InvalidLocation => {
+            "enter a valid GCP location such as `us-central1` and rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+        crate::agent::vertex::VertexSetupValidationError::MissingDefaultModel => {
+            "set `vertex.model`, or choose an explicit Vertex model route, then rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+        crate::agent::vertex::VertexSetupValidationError::UnsupportedModel => {
+            "choose a supported Google Gemini model such as `vertex:gemini-2.5-flash`, then rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+        crate::agent::vertex::VertexSetupValidationError::AuthUnavailable => {
+            "run `gcloud auth application-default login` or use a metadata-backed Google Cloud service account, then rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+        crate::agent::vertex::VertexSetupValidationError::AccessDenied => {
+            "check Vertex IAM/API access for the configured project, location, and model, then rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+        crate::agent::vertex::VertexSetupValidationError::Unavailable => {
+            "check the Vertex project ID, location, and model name, then rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+        crate::agent::vertex::VertexSetupValidationError::Rejected => {
+            "check the Vertex project, location, model, and provider access, then rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+        crate::agent::vertex::VertexSetupValidationError::Transport => {
+            "check network connectivity to Vertex AI and rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
+    }
+}
+
+fn validate_vertex_provider_interactive(
+    input: &crate::onboarding::vertex::VertexSetupInput,
+) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
+    let validate_now = prompt_yes_no("Validate Vertex configuration now?", true)?;
+    if !validate_now {
+        return Ok(crate::onboarding::setup::SetupCheck::validation_skip(
+            "Live provider validation",
+            "Vertex live validation was skipped",
+            Some(
+                "run `cara verify` after setup to exercise the configured Vertex path".to_string(),
+            ),
+        ));
+    }
+
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
+        return match result {
+            Ok(()) => Ok(crate::onboarding::setup::SetupCheck::validation_pass(
+                "Live provider validation",
+                "Vertex auth, project, location, and model access validated",
+            )),
+            Err(detail) => {
+                eprintln!("Credential check failed: {detail}");
+                if prompt_yes_no("Continue setup and write config anyway?", false)? {
+                    Ok(crate::onboarding::setup::SetupCheck::validation_fail(
+                        "Live provider validation",
+                        detail,
+                        "check Vertex auth, project, location, and model access, then rerun `cara setup --force --provider vertex`".to_string(),
+                    ))
+                } else {
+                    Err("setup aborted after provider configuration validation failure".into())
+                }
+            }
+        };
+    }
+
+    println!("Checking Vertex configuration...");
+    match run_sync_blocking_send(crate::agent::vertex::validate_vertex_setup(
+        input.project_id.clone(),
+        input.location.clone(),
+        input.route_model(),
+        input.default_model(),
+    )) {
+        Ok(()) => {
+            println!("Credential check succeeded.");
+            Ok(crate::onboarding::setup::SetupCheck::validation_pass(
+                "Live provider validation",
+                "Vertex auth, project, location, and model access validated",
+            ))
+        }
+        Err(crate::runtime_bridge::BridgeError::Inner(err)) => {
+            let detail = err.to_string();
+            eprintln!("Credential check failed: {detail}");
+            if prompt_yes_no("Continue setup and write config anyway?", false)? {
+                Ok(crate::onboarding::setup::SetupCheck::validation_fail(
+                    "Live provider validation",
+                    detail,
+                    vertex_validation_failure_remediation(&err),
+                ))
+            } else {
+                Err("setup aborted after provider configuration validation failure".into())
+            }
+        }
+        Err(err) => {
+            let detail = format!("Vertex validation runtime failed: {err}");
+            eprintln!("Credential check failed: {detail}");
+            if prompt_yes_no("Continue setup and write config anyway?", false)? {
+                Ok(crate::onboarding::setup::SetupCheck::validation_fail(
+                    "Live provider validation",
+                    detail,
+                    "check local runtime availability and rerun `cara setup --force --provider vertex`"
+                        .to_string(),
+                ))
+            } else {
+                Err("setup aborted after provider configuration validation failure".into())
+            }
+        }
+    }
 }
 
 fn validate_channel_credentials_interactive(
@@ -6043,7 +6228,7 @@ fn prompt_setup_provider_interactive(
     let default_provider = default_setup_provider_choice(&provider_hints).prompt_key();
     loop {
         let selection = prompt_with_default(
-            "Select provider for first run (anthropic/openai/ollama/gemini/venice/bedrock)",
+            "Select provider for first run (anthropic/openai/ollama/gemini/vertex/venice/bedrock)",
             default_provider,
         )?;
         if let Some(provider) = SetupProviderChoice::parse_prompt(&selection) {
@@ -6052,11 +6237,14 @@ fn prompt_setup_provider_interactive(
                 SetupProviderChoice::OpenAi => prompt_openai_setup_provider_variant(),
                 SetupProviderChoice::Ollama => Ok(SetupProvider::Ollama),
                 SetupProviderChoice::Gemini => Ok(SetupProvider::Gemini),
+                SetupProviderChoice::Vertex => Ok(SetupProvider::Vertex),
                 SetupProviderChoice::Venice => Ok(SetupProvider::Venice),
                 SetupProviderChoice::Bedrock => Ok(SetupProvider::Bedrock),
             };
         }
-        eprintln!("Please enter one of: anthropic, openai, ollama, gemini, venice, bedrock.");
+        eprintln!(
+            "Please enter one of: anthropic, openai, ollama, gemini, vertex, venice, bedrock."
+        );
     }
 }
 
@@ -6097,6 +6285,7 @@ fn setup_provider_auth_mode_hint(
             Some(crate::onboarding::setup::SetupAuthMode::ApiKey)
         }
         SetupProvider::Ollama => Some(crate::onboarding::setup::SetupAuthMode::BaseUrl),
+        SetupProvider::Vertex => None,
         SetupProvider::Bedrock => Some(crate::onboarding::setup::SetupAuthMode::StaticCredentials),
     }
 }
@@ -6121,6 +6310,85 @@ fn prompt_gemini_setup_auth_mode(
                 eprintln!("Please choose either `oauth` or `api-key`.");
             }
         }
+    }
+}
+
+fn prompt_vertex_setup_route(
+) -> Result<crate::onboarding::vertex::VertexModelRoute, Box<dyn std::error::Error>> {
+    loop {
+        let selection = prompt_choice(
+            "How should Vertex choose the model? (default-route/explicit-model)",
+            "default-route",
+            &["default-route", "explicit-model"],
+        )?;
+        match selection.as_str() {
+            "default-route" => return Ok(crate::onboarding::vertex::VertexModelRoute::Default),
+            "explicit-model" => return Ok(crate::onboarding::vertex::VertexModelRoute::Explicit),
+            _ => {
+                eprintln!("Please choose either `default-route` or `explicit-model`.");
+            }
+        }
+    }
+}
+
+fn prompt_required_visible_env_backed_config_value(
+    env_vars: &[&'static str],
+    placeholder_env_var: &'static str,
+    label: &str,
+    default_value: Option<&str>,
+) -> Result<SetupConfigValue, Box<dyn std::error::Error>> {
+    if let Some((env_name, env_value)) = first_present_env_var(env_vars) {
+        if prompt_yes_no(&format!("Use {label} from ${env_name}?"), true)? {
+            return Ok(SetupConfigValue {
+                config_value: env_placeholder(env_name),
+                effective_value: Some(env_value),
+            });
+        }
+
+        let entered = prompt_with_default(label, &env_value)?;
+        let trimmed = entered.trim();
+        if trimmed.is_empty() {
+            return Ok(SetupConfigValue {
+                config_value: env_placeholder(placeholder_env_var),
+                effective_value: None,
+            });
+        }
+        return Ok(SetupConfigValue {
+            config_value: trimmed.to_string(),
+            effective_value: Some(trimmed.to_string()),
+        });
+    }
+
+    let entered = match default_value {
+        Some(default) => prompt_with_default(label, default)?,
+        None => prompt_line(&format!(
+            "Enter {label} (leave blank to use ${placeholder_env_var} later): "
+        ))?,
+    };
+    let trimmed = entered.trim();
+    if trimmed.is_empty() {
+        return Ok(SetupConfigValue {
+            config_value: env_placeholder(placeholder_env_var),
+            effective_value: None,
+        });
+    }
+    Ok(SetupConfigValue {
+        config_value: trimmed.to_string(),
+        effective_value: Some(trimmed.to_string()),
+    })
+}
+
+fn prompt_vertex_explicit_model_id() -> Result<String, Box<dyn std::error::Error>> {
+    let default_model =
+        env_var_value("VERTEX_MODEL").unwrap_or_else(|| "gemini-2.5-flash".to_string());
+    loop {
+        let entered = prompt_with_default("Vertex model ID", &default_model)?;
+        let normalized = crate::onboarding::vertex::normalize_vertex_model_id(&entered);
+        if normalized.is_empty() || normalized == "default" {
+            eprintln!("Enter a concrete Vertex model ID such as `gemini-2.5-flash`.");
+            continue;
+        }
+        return Ok(normalized);
     }
 }
 
@@ -6428,6 +6696,80 @@ fn configure_codex_provider_interactive(
     })
 }
 
+fn configure_vertex_provider_interactive(
+    config: &mut Value,
+) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
+    let project_id = prompt_required_visible_env_backed_config_value(
+        &["VERTEX_PROJECT_ID"],
+        "VERTEX_PROJECT_ID",
+        "GCP project ID",
+        None,
+    )?;
+    let location = prompt_required_visible_env_backed_config_value(
+        &["VERTEX_LOCATION"],
+        "VERTEX_LOCATION",
+        "GCP location",
+        Some("us-central1"),
+    )?;
+    let route = prompt_vertex_setup_route()?;
+    let model = match route {
+        crate::onboarding::vertex::VertexModelRoute::Default => {
+            let configured = prompt_required_visible_env_backed_config_value(
+                &["VERTEX_MODEL"],
+                "VERTEX_MODEL",
+                "Vertex default model",
+                None,
+            )?;
+            if configured.effective_value.is_none() {
+                print_missing_setup_value_notice("VERTEX_MODEL", "Vertex default model");
+            }
+            Some(configured)
+        }
+        crate::onboarding::vertex::VertexModelRoute::Explicit => {
+            let explicit_model = prompt_vertex_explicit_model_id()?;
+            Some(SetupConfigValue {
+                config_value: explicit_model.clone(),
+                effective_value: Some(explicit_model),
+            })
+        }
+    };
+
+    if project_id.effective_value.is_none() {
+        print_missing_setup_value_notice("VERTEX_PROJECT_ID", "Vertex project ID");
+    }
+
+    let config_input = crate::onboarding::vertex::VertexSetupInput {
+        project_id: project_id.config_value.clone(),
+        location: location.config_value.clone(),
+        route,
+        model: model.as_ref().map(|value| value.config_value.clone()),
+    };
+    crate::onboarding::vertex::write_vertex_config(config, &config_input);
+
+    let mut result = ProviderSetupResult::default();
+    let validation_input = project_id
+        .effective_value
+        .clone()
+        .zip(location.effective_value.clone())
+        .map(
+            |(project_id, location)| crate::onboarding::vertex::VertexSetupInput {
+                project_id,
+                location,
+                route,
+                model: model
+                    .as_ref()
+                    .and_then(|value| value.effective_value.clone()),
+            },
+        );
+    if let Some(validation_input) = validation_input {
+        result
+            .observed_checks
+            .push(validate_vertex_provider_interactive(&validation_input)?);
+    }
+
+    Ok(result)
+}
+
 fn handle_setup_validation_failure(
     provider: SetupProvider,
     requested_auth_mode: Option<GeminiSetupAuthMode>,
@@ -6559,6 +6901,9 @@ fn configure_provider_interactive(
                 hide_sensitive_input,
                 requested_auth_mode,
             )?;
+        }
+        SetupProvider::Vertex => {
+            result = configure_vertex_provider_interactive(config)?;
         }
         SetupProvider::Venice => {
             let api_key = prompt_required_secret_config_value(
@@ -6754,6 +7099,21 @@ fn configure_provider_noninteractive(
                 );
             }
         },
+        SetupProvider::Vertex => {
+            crate::onboarding::vertex::write_vertex_config(
+                config,
+                &crate::onboarding::vertex::VertexSetupInput {
+                    project_id: env_placeholder("VERTEX_PROJECT_ID"),
+                    location: if env_var_present("VERTEX_LOCATION") {
+                        env_placeholder("VERTEX_LOCATION")
+                    } else {
+                        "us-central1".to_string()
+                    },
+                    route: crate::onboarding::vertex::VertexModelRoute::Default,
+                    model: Some(env_placeholder("VERTEX_MODEL")),
+                },
+            );
+        }
         SetupProvider::Venice => {
             config["venice"] = serde_json::json!({
                 "apiKey": env_placeholder("VENICE_API_KEY")
@@ -7715,6 +8075,9 @@ mod tests {
             .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
             .unset("OPENAI_API_KEY")
             .unset("ANTHROPIC_API_KEY")
+            .unset("VERTEX_PROJECT_ID")
+            .unset("VERTEX_LOCATION")
+            .unset("VERTEX_MODEL")
             .unset("TELEGRAM_BOT_TOKEN")
             .unset("DISCORD_BOT_TOKEN");
         let harness_guard = install_setup_interactive_harness(harness);
@@ -10144,6 +10507,7 @@ mod tests {
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             env_guard.unset("OLLAMA_BASE_URL");
             env_guard.unset("GOOGLE_API_KEY");
+            env_guard.unset("VERTEX_PROJECT_ID");
             env_guard.unset("VENICE_API_KEY");
             env_guard.unset("AWS_REGION");
             env_guard.unset("AWS_DEFAULT_REGION");
@@ -10183,6 +10547,7 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+            env_guard.unset("VERTEX_PROJECT_ID");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Gemini]
@@ -10196,9 +10561,24 @@ mod tests {
             env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
             env_guard.set("OPENAI_OAUTH_CLIENT_ID", "openai-client-id");
             env_guard.set("OPENAI_OAUTH_CLIENT_SECRET", "openai-client-secret");
+            env_guard.unset("VERTEX_PROJECT_ID");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Codex]
+            );
+        }
+
+        {
+            env_guard.unset("ANTHROPIC_API_KEY");
+            env_guard.unset("OPENAI_API_KEY");
+            env_guard.unset("GOOGLE_API_KEY");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
+            env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+            env_guard.set("VERTEX_PROJECT_ID", "vertex-project");
+            assert_eq!(
+                detect_setup_provider_env_hints(),
+                vec![SetupProvider::Vertex]
             );
         }
 
@@ -10210,6 +10590,7 @@ mod tests {
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             env_guard.unset("OLLAMA_BASE_URL");
             env_guard.unset("GOOGLE_API_KEY");
+            env_guard.unset("VERTEX_PROJECT_ID");
             env_guard.unset("VENICE_API_KEY");
             env_guard.unset("AWS_REGION");
             env_guard.unset("AWS_DEFAULT_REGION");
@@ -10224,6 +10605,10 @@ mod tests {
 
     #[test]
     fn test_local_chat_verify_next_step_without_provider_config() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({});
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -10300,6 +10685,9 @@ mod tests {
     fn test_local_chat_verify_next_step_for_missing_gemini_provider() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("GOOGLE_API_KEY");
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
             "agents": { "defaults": { "model": "gemini-2.0-flash" } }
         });
@@ -10324,7 +10712,45 @@ mod tests {
     }
 
     #[test]
+    fn test_local_chat_verify_next_step_for_vertex_config() {
+        let cfg = serde_json::json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash"
+            },
+            "agents": { "defaults": { "model": "vertex:default" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "check Vertex auth, project, location, and selected model, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_missing_vertex_project_env_var() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        let cfg = serde_json::json!({
+            "vertex": {
+                "projectId": "${VERTEX_PROJECT_ID}",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash"
+            },
+            "agents": { "defaults": { "model": "vertex:default" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `$VERTEX_PROJECT_ID` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
     fn test_local_chat_verify_next_step_for_model_provider_mismatch() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "sk-openai-inline" }
         });
@@ -10336,6 +10762,10 @@ mod tests {
 
     #[test]
     fn test_usable_provider_labels_ignores_empty_api_keys() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "   " },
             "anthropic": { "apiKey": "sk-anthropic-inline" }
@@ -10349,6 +10779,9 @@ mod tests {
         env_guard.unset("OPENAI_API_KEY");
         env_guard.unset("VENICE_API_KEY");
         env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "${OPENAI_API_KEY}" },
             "venice": { "apiKey": "${VENICE_API_KEY}" }
@@ -10360,6 +10793,9 @@ mod tests {
     fn test_usable_provider_labels_require_config_password_for_codex() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
             "codex": { "authProfile": "openai-abc123" }
         });
@@ -10371,6 +10807,10 @@ mod tests {
 
     #[test]
     fn test_usable_provider_labels_require_complete_bedrock_credentials() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
             "bedrock": {
                 "region": "us-east-1",
@@ -10439,6 +10879,7 @@ mod tests {
         env_guard.unset("AWS_ACCESS_KEY_ID");
         env_guard.unset("AWS_SECRET_ACCESS_KEY");
         env_guard.unset("GOOGLE_API_KEY");
+        env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("OLLAMA_BASE_URL");
         env_guard.unset("VENICE_API_KEY");
 
@@ -10452,6 +10893,7 @@ mod tests {
         env_guard.set("AWS_ACCESS_KEY_ID", "AKIA...");
         env_guard.set("AWS_SECRET_ACCESS_KEY", "secret");
         env_guard.unset("GOOGLE_API_KEY");
+        env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("OLLAMA_BASE_URL");
         env_guard.unset("VENICE_API_KEY");
 
@@ -10717,6 +11159,21 @@ mod tests {
                 assert!(!force);
             }
             other => panic!("Expected Setup with provider, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_setup_with_vertex_provider() {
+        let cli = Cli::try_parse_from(["cara", "setup", "--provider", "vertex"]).unwrap();
+        match cli.command {
+            Some(Command::Setup {
+                force,
+                provider: Some(SetupProvider::Vertex),
+                auth_mode: None,
+            }) => {
+                assert!(!force);
+            }
+            other => panic!("Expected Setup with vertex provider, got {:?}", other),
         }
     }
 
@@ -11034,6 +11491,28 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_setup_noninteractive_provider_flag_writes_vertex_config() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.unset("VERTEX_LOCATION");
+
+        let result = handle_setup(false, Some(SetupProvider::Vertex), None);
+        assert!(
+            result.is_ok(),
+            "non-interactive Vertex setup should succeed"
+        );
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["vertex"]["projectId"], "${VERTEX_PROJECT_ID}");
+        assert_eq!(parsed["vertex"]["location"], "us-central1");
+        assert_eq!(parsed["vertex"]["model"], "${VERTEX_MODEL}");
+        assert_eq!(parsed["agents"]["defaults"]["model"], "vertex:default");
+    }
+
+    #[test]
     fn test_render_setup_validation_failure_redacts_sensitive_input() {
         let rendered = render_setup_validation_failure(&crate::agent::AgentError::InvalidBaseUrl(
             "invalid URL \"https://user:secret@example.com\": bad input".to_string(),
@@ -11044,6 +11523,158 @@ mod tests {
         );
         assert!(!rendered.contains("secret"));
         assert!(!rendered.contains("example.com"));
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_default_route_writes_config_and_validates() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "default-route".to_string(),
+                "gemini-2.5-flash".to_string(),
+                "y".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+                .expect("interactive Vertex setup");
+
+        assert_eq!(config["vertex"]["projectId"], "my-project");
+        assert_eq!(config["vertex"]["location"], "us-central1");
+        assert_eq!(config["vertex"]["model"], "gemini-2.5-flash");
+        assert_eq!(config["agents"]["defaults"]["model"], "vertex:default");
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            result.observed_checks[0].detail,
+            "Vertex auth, project, location, and model access validated"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_explicit_route_omits_vertex_model() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "explicit-model".to_string(),
+                "vertex/google/gemini-1.5-pro".to_string(),
+                "n".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+                .expect("interactive Vertex setup");
+
+        assert_eq!(config["vertex"]["projectId"], "my-project");
+        assert_eq!(config["vertex"]["location"], "us-central1");
+        assert!(
+            config["vertex"].get("model").is_none(),
+            "explicit route should not persist `vertex.model`"
+        );
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            "vertex:google/gemini-1.5-pro"
+        );
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            result.observed_checks[0].detail,
+            "Vertex live validation was skipped"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_validation_failure_can_continue() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "default-route".to_string(),
+                "gemini-2.5-flash".to_string(),
+                "y".to_string(),
+                "y".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Err(
+                "Vertex rejected access to the configured project".to_string(),
+            )]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+                .expect("interactive Vertex setup");
+
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            result.observed_checks[0].status,
+            crate::onboarding::setup::SetupCheckStatus::Fail
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_validation_failure_can_abort() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "default-route".to_string(),
+                "gemini-2.5-flash".to_string(),
+                "y".to_string(),
+                "n".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Err(
+                "Vertex rejected access to the configured project".to_string(),
+            )]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None);
+        assert!(
+            result.is_err(),
+            "setup should abort after validation failure"
+        );
+        assert_eq!(
+            result.expect_err("expected setup abort").to_string(),
+            "setup aborted after provider configuration validation failure"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert!(state.visible_inputs.is_empty());
     }
 
     #[test]

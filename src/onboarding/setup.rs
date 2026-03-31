@@ -94,7 +94,6 @@ impl SetupProvider {
             (Self::Gemini, Some(SetupAuthMode::ApiKey)) => {
                 Some("cara setup --force --provider gemini --auth-mode api-key".to_string())
             }
-            (Self::Vertex, _) => None,
             _ => Some(format!(
                 "cara setup --force --provider {}",
                 self.prompt_key()
@@ -444,7 +443,7 @@ pub fn assess_provider_setup(
                 setup_command.as_deref(),
             ));
             if vertex_route_requires_default_model(cfg) {
-                checks.push(vertex_default_model_check(cfg));
+                checks.push(vertex_default_model_check(cfg, setup_command.as_deref()));
             } else {
                 checks.push(optional_configured_value_check(
                     cfg,
@@ -608,9 +607,11 @@ fn setup_follow_up(follow_up: SetupFollowUp<'_>) -> String {
 
 fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<&str>) -> String {
     let follow_up = match provider {
-        SetupProvider::Vertex => SetupFollowUp::Manual {
-            action: "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
-        },
+        SetupProvider::Vertex => provider_setup_follow_up(
+            setup_command,
+            "to choose `vertex:default` plus `vertex.model`, or an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
+            "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
+        ),
         _ => provider_setup_follow_up(
             setup_command,
             format!(
@@ -637,7 +638,7 @@ fn vertex_route_requires_default_model(cfg: &Value) -> bool {
     )
 }
 
-fn vertex_default_model_check(cfg: &Value) -> SetupCheck {
+fn vertex_default_model_check(cfg: &Value, setup_command: Option<&str>) -> SetupCheck {
     match config_string(cfg, &["vertex", "model"]) {
         Some(value) => {
             let references = env_var_references(&value);
@@ -647,9 +648,11 @@ fn vertex_default_model_check(cfg: &Value) -> SetupCheck {
                 SetupCheck::fail(
                     "Vertex default model",
                     format!("Vertex default model references {env_vars}, but they are not set"),
-                    format!(
-                        "set {env_vars} in the same shell or write `vertex.model` into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
-                    ),
+                    setup_follow_up(provider_setup_follow_up(
+                        setup_command,
+                        format!("after setting {env_vars} or rewriting `vertex.model`"),
+                        format!("set {env_vars} in the same shell or write `vertex.model` into config"),
+                    )),
                 )
             } else if !references.is_empty() {
                 SetupCheck::pass(
@@ -666,9 +669,11 @@ fn vertex_default_model_check(cfg: &Value) -> SetupCheck {
         None => SetupCheck::fail(
             "Vertex default model",
             "`agents.defaults.model` routes to `vertex:default`, but `vertex.model` is not configured",
-            format!(
-                "set `vertex.model`, or switch `agents.defaults.model` to an explicit Vertex model such as `vertex:gemini-2.5-flash`, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
-            ),
+            setup_follow_up(provider_setup_follow_up(
+                setup_command,
+                "after setting `vertex.model` or choosing an explicit Vertex model route".to_string(),
+                "set `vertex.model`, or switch `agents.defaults.model` to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
+            )),
         ),
     }
 }
