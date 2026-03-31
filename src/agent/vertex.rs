@@ -494,9 +494,7 @@ impl VertexProvider {
                     return Err(VertexSetupValidationError::UnsupportedModel);
                 }
                 ("google", model_id)
-            } else if effective_model.contains('/') {
-                return Err(VertexSetupValidationError::UnsupportedModel);
-            } else if !effective_model.starts_with("gemini-") {
+            } else if effective_model.contains('/') || !effective_model.starts_with("gemini-") {
                 return Err(VertexSetupValidationError::UnsupportedModel);
             } else {
                 // Bare Gemini model IDs are treated as Google-published models on Vertex AI.

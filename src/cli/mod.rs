@@ -4196,7 +4196,8 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     let vertex_model =
         env_var_present("VERTEX_MODEL") || config_path_has_usable_value(cfg, &["vertex", "model"]);
     let vertex_route = local_chat_model(cfg);
-    if vertex_project
+    if crate::agent::vertex::is_vertex_model(&vertex_route)
+        && vertex_project
         && vertex_location
         && (!matches!(vertex_route.as_str(), "vertex:default") || vertex_model)
     {
@@ -5179,10 +5180,11 @@ fn validate_vertex_provider_interactive(
     }
 
     println!("Checking Vertex configuration...");
+    let route_model = input.route_model()?;
     match run_sync_blocking_send(crate::agent::vertex::validate_vertex_setup(
         input.project_id.clone(),
         input.location.clone(),
-        input.route_model(),
+        route_model,
         input.default_model(),
     )) {
         Ok(()) => {
@@ -6315,19 +6317,15 @@ fn prompt_gemini_setup_auth_mode(
 
 fn prompt_vertex_setup_route(
 ) -> Result<crate::onboarding::vertex::VertexModelRoute, Box<dyn std::error::Error>> {
-    loop {
-        let selection = prompt_choice(
-            "How should Vertex choose the model? (default-route/explicit-model)",
-            "default-route",
-            &["default-route", "explicit-model"],
-        )?;
-        match selection.as_str() {
-            "default-route" => return Ok(crate::onboarding::vertex::VertexModelRoute::Default),
-            "explicit-model" => return Ok(crate::onboarding::vertex::VertexModelRoute::Explicit),
-            _ => {
-                eprintln!("Please choose either `default-route` or `explicit-model`.");
-            }
-        }
+    let selection = prompt_choice(
+        "How should Vertex choose the model? (default-route/explicit-model)",
+        "default-route",
+        &["default-route", "explicit-model"],
+    )?;
+    match selection.as_str() {
+        "default-route" => Ok(crate::onboarding::vertex::VertexModelRoute::Default),
+        "explicit-model" => Ok(crate::onboarding::vertex::VertexModelRoute::Explicit),
+        _ => Err("prompt_choice returned an unexpected Vertex route".into()),
     }
 }
 
@@ -6347,35 +6345,48 @@ fn prompt_required_visible_env_backed_config_value(
 
         let entered = prompt_with_default(label, &env_value)?;
         let trimmed = entered.trim();
-        if trimmed.is_empty() {
-            return Ok(SetupConfigValue {
-                config_value: env_placeholder(placeholder_env_var),
-                effective_value: None,
-            });
-        }
+        let chosen = if trimmed.is_empty() {
+            env_value
+        } else {
+            trimmed.to_string()
+        };
         return Ok(SetupConfigValue {
-            config_value: trimmed.to_string(),
-            effective_value: Some(trimmed.to_string()),
+            config_value: chosen.clone(),
+            effective_value: Some(chosen),
         });
     }
 
-    let entered = match default_value {
-        Some(default) => prompt_with_default(label, default)?,
-        None => prompt_line(&format!(
-            "Enter {label} (leave blank to use ${placeholder_env_var} later): "
-        ))?,
-    };
-    let trimmed = entered.trim();
-    if trimmed.is_empty() {
-        return Ok(SetupConfigValue {
-            config_value: env_placeholder(placeholder_env_var),
-            effective_value: None,
-        });
+    match default_value {
+        Some(default) => {
+            let entered = prompt_with_default(label, default)?;
+            let trimmed = entered.trim();
+            let chosen = if trimmed.is_empty() {
+                default.to_string()
+            } else {
+                trimmed.to_string()
+            };
+            Ok(SetupConfigValue {
+                config_value: chosen.clone(),
+                effective_value: Some(chosen),
+            })
+        }
+        None => {
+            let entered = prompt_line(&format!(
+                "Enter {label} (leave blank to use ${placeholder_env_var} later): "
+            ))?;
+            let trimmed = entered.trim();
+            if trimmed.is_empty() {
+                return Ok(SetupConfigValue {
+                    config_value: env_placeholder(placeholder_env_var),
+                    effective_value: None,
+                });
+            }
+            Ok(SetupConfigValue {
+                config_value: trimmed.to_string(),
+                effective_value: Some(trimmed.to_string()),
+            })
+        }
     }
-    Ok(SetupConfigValue {
-        config_value: trimmed.to_string(),
-        effective_value: Some(trimmed.to_string()),
-    })
 }
 
 fn prompt_vertex_explicit_model_id() -> Result<String, Box<dyn std::error::Error>> {
@@ -6744,9 +6755,11 @@ fn configure_vertex_provider_interactive(
         route,
         model: model.as_ref().map(|value| value.config_value.clone()),
     };
-    crate::onboarding::vertex::write_vertex_config(config, &config_input);
 
     let mut result = ProviderSetupResult::default();
+    let effective_model = model
+        .as_ref()
+        .and_then(|value| value.effective_value.clone());
     let validation_input = project_id
         .effective_value
         .clone()
@@ -6756,17 +6769,28 @@ fn configure_vertex_provider_interactive(
                 project_id,
                 location,
                 route,
-                model: model
-                    .as_ref()
-                    .and_then(|value| value.effective_value.clone()),
+                model: effective_model.clone(),
             },
         );
     if let Some(validation_input) = validation_input {
-        result
-            .observed_checks
-            .push(validate_vertex_provider_interactive(&validation_input)?);
+        if matches!(route, crate::onboarding::vertex::VertexModelRoute::Default)
+            && effective_model.is_none()
+        {
+            result.observed_checks.push(crate::onboarding::setup::SetupCheck::validation_skip(
+                "Live provider validation",
+                "Vertex live validation was skipped because `vertex:default` still resolves `vertex.model` from `VERTEX_MODEL` later",
+                Some(
+                    "set `VERTEX_MODEL` in the same shell and run `cara verify --outcome local-chat` once the default model is available".to_string(),
+                ),
+            ));
+        } else {
+            result
+                .observed_checks
+                .push(validate_vertex_provider_interactive(&validation_input)?);
+        }
     }
 
+    crate::onboarding::vertex::write_vertex_config(config, &config_input)?;
     Ok(result)
 }
 
@@ -6798,7 +6822,6 @@ fn configure_provider_interactive(
     if provider != SetupProvider::Gemini && requested_auth_mode.is_some() {
         return Err("`--auth-mode` is currently only valid with `--provider gemini`.".into());
     }
-    config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
 
     let mut result = ProviderSetupResult::default();
 
@@ -7035,6 +7058,10 @@ fn configure_provider_interactive(
         }
     }
 
+    if !matches!(provider, SetupProvider::Gemini | SetupProvider::Vertex) {
+        config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
+    }
+
     Ok(result)
 }
 
@@ -7112,7 +7139,7 @@ fn configure_provider_noninteractive(
                     route: crate::onboarding::vertex::VertexModelRoute::Default,
                     model: Some(env_placeholder("VERTEX_MODEL")),
                 },
-            );
+            )?;
         }
         SetupProvider::Venice => {
             config["venice"] = serde_json::json!({
@@ -10821,6 +10848,31 @@ mod tests {
     }
 
     #[test]
+    fn test_usable_provider_labels_ignore_vertex_credentials_for_non_vertex_route() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let cfg = serde_json::json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash"
+            },
+            "openai": {
+                "apiKey": "sk-openai-inline"
+            },
+            "agents": {
+                "defaults": {
+                    "model": "gpt-4o"
+                }
+            }
+        });
+
+        assert_eq!(usable_provider_labels(&cfg), vec!["OpenAI"]);
+    }
+
+    #[test]
     fn test_local_chat_verify_next_step_for_missing_venice_provider_env_var() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("VENICE_API_KEY");
@@ -11641,6 +11693,46 @@ mod tests {
     }
 
     #[test]
+    fn test_configure_provider_interactive_vertex_default_route_with_unresolved_model_skips_validation(
+    ) {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "default-route".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+                .expect("interactive Vertex setup");
+
+        assert_eq!(config["vertex"]["projectId"], "my-project");
+        assert_eq!(config["vertex"]["location"], "us-central1");
+        assert_eq!(config["vertex"]["model"], "${VERTEX_MODEL}");
+        assert_eq!(config["agents"]["defaults"]["model"], "vertex:default");
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            result.observed_checks[0].status,
+            crate::onboarding::setup::SetupCheckStatus::Skip
+        );
+        assert_eq!(
+            result.observed_checks[0].detail,
+            "Vertex live validation was skipped because `vertex:default` still resolves `vertex.model` from `VERTEX_MODEL` later"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
     fn test_configure_provider_interactive_vertex_validation_failure_can_abort() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("VERTEX_PROJECT_ID");
@@ -11671,6 +11763,11 @@ mod tests {
         assert_eq!(
             result.expect_err("expected setup abort").to_string(),
             "setup aborted after provider configuration validation failure"
+        );
+        assert_eq!(
+            config,
+            serde_json::json!({}),
+            "aborting setup should leave the in-memory config untouched"
         );
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 1);

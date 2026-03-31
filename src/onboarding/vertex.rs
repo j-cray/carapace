@@ -14,14 +14,33 @@ pub struct VertexSetupInput {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexSetupInputError;
+
+impl std::fmt::Display for VertexSetupInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "explicit Vertex routes require a concrete non-default model"
+        )
+    }
+}
+
+impl std::error::Error for VertexSetupInputError {}
+
 impl VertexSetupInput {
-    pub fn route_model(&self) -> String {
+    pub fn route_model(&self) -> Result<String, VertexSetupInputError> {
         match self.route {
-            VertexModelRoute::Default => "vertex:default".to_string(),
-            VertexModelRoute::Explicit => format!(
-                "vertex:{}",
-                normalize_vertex_model_id(self.model.as_deref().unwrap_or_default())
-            ),
+            VertexModelRoute::Default => Ok("vertex:default".to_string()),
+            VertexModelRoute::Explicit => {
+                let explicit_model =
+                    normalize_vertex_model_id(self.model.as_deref().unwrap_or_default());
+                if explicit_model.is_empty() || explicit_model == "default" {
+                    Err(VertexSetupInputError)
+                } else {
+                    Ok(format!("vertex:{explicit_model}"))
+                }
+            }
         }
     }
 
@@ -44,13 +63,16 @@ pub fn normalize_vertex_model_id(model: &str) -> String {
         .to_string()
 }
 
-pub fn write_vertex_config(config: &mut Value, input: &VertexSetupInput) {
+pub fn write_vertex_config(
+    config: &mut Value,
+    input: &VertexSetupInput,
+) -> Result<(), VertexSetupInputError> {
     if !config.get("vertex").is_some_and(Value::is_object) {
         config["vertex"] = json!({});
     }
     config["vertex"]["projectId"] = json!(input.project_id.trim());
     config["vertex"]["location"] = json!(input.location.trim());
-    config["agents"]["defaults"]["model"] = json!(input.route_model());
+    config["agents"]["defaults"]["model"] = json!(input.route_model()?);
 
     if let Some(vertex) = config.get_mut("vertex").and_then(Value::as_object_mut) {
         match input.default_model() {
@@ -62,6 +84,7 @@ pub fn write_vertex_config(config: &mut Value, input: &VertexSetupInput) {
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -79,7 +102,8 @@ mod tests {
                 route: VertexModelRoute::Default,
                 model: Some("gemini-2.5-flash".to_string()),
             },
-        );
+        )
+        .expect("default Vertex route should serialize");
 
         assert_eq!(config["vertex"]["projectId"], "my-project");
         assert_eq!(config["vertex"]["location"], "us-central1");
@@ -102,7 +126,8 @@ mod tests {
                 route: VertexModelRoute::Explicit,
                 model: Some("vertex/google/gemini-1.5-pro".to_string()),
             },
-        );
+        )
+        .expect("explicit Vertex route should serialize");
 
         assert_eq!(config["vertex"]["projectId"], "my-project");
         assert_eq!(config["vertex"]["location"], "us-central1");
@@ -114,6 +139,30 @@ mod tests {
             config["agents"]["defaults"]["model"],
             "vertex:google/gemini-1.5-pro"
         );
+    }
+
+    #[test]
+    fn test_route_model_rejects_missing_explicit_model() {
+        let input = VertexSetupInput {
+            project_id: "my-project".to_string(),
+            location: "us-central1".to_string(),
+            route: VertexModelRoute::Explicit,
+            model: None,
+        };
+
+        assert_eq!(input.route_model(), Err(VertexSetupInputError));
+    }
+
+    #[test]
+    fn test_route_model_rejects_default_as_explicit_model() {
+        let input = VertexSetupInput {
+            project_id: "my-project".to_string(),
+            location: "us-central1".to_string(),
+            route: VertexModelRoute::Explicit,
+            model: Some("vertex:default".to_string()),
+        };
+
+        assert_eq!(input.route_model(), Err(VertexSetupInputError));
     }
 
     #[test]
