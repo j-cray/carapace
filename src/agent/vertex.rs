@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,6 +17,93 @@ use tracing::debug;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VertexSetupValidationError {
+    InvalidProjectId,
+    InvalidLocation,
+    MissingDefaultModel,
+    UnsupportedModel,
+    ClientInit(String),
+    AuthUnavailable,
+    AccessDenied,
+    ProbeRejected,
+    Unavailable,
+    Rejected,
+    RateLimited,
+    Transport,
+}
+
+impl std::fmt::Display for VertexSetupValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidProjectId => write!(f, "Vertex project ID is invalid."),
+            Self::InvalidLocation => write!(f, "Vertex location is invalid."),
+            Self::MissingDefaultModel => write!(
+                f,
+                "Missing required model parameter and no default model is configured."
+            ),
+            Self::UnsupportedModel => write!(
+                f,
+                "Unsupported Vertex model. This provider currently supports Google Gemini models only."
+            ),
+            Self::ClientInit(detail) => {
+                if detail.is_empty() {
+                    write!(f, "Vertex validation could not initialize the local HTTP client.")
+                } else {
+                    write!(
+                        f,
+                        "Vertex validation could not initialize the local HTTP client: {detail}"
+                    )
+                }
+            }
+            Self::AuthUnavailable => write!(
+                f,
+                "Vertex authentication is unavailable from both gcloud and the metadata server."
+            ),
+            Self::AccessDenied => write!(
+                f,
+                "Vertex rejected access to the configured project, location, or model."
+            ),
+            Self::ProbeRejected => write!(
+                f,
+                "Vertex rejected the validation request before model lookup completed."
+            ),
+            Self::Unavailable => write!(
+                f,
+                "Vertex could not find the configured project, location, or model."
+            ),
+            Self::Rejected => write!(f, "Vertex rejected the configuration."),
+            Self::RateLimited => write!(f, "Vertex validation is being rate limited."),
+            Self::Transport => write!(f, "Vertex validation could not reach the provider."),
+        }
+    }
+}
+
+impl std::error::Error for VertexSetupValidationError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VertexProviderInitError {
+    InvalidProjectId,
+    InvalidLocation,
+    ClientInit(String),
+}
+
+impl From<VertexProviderInitError> for AgentError {
+    fn from(err: VertexProviderInitError) -> Self {
+        AgentError::Provider(VertexSetupValidationError::from(err).to_string())
+    }
+}
+
+impl From<VertexProviderInitError> for VertexSetupValidationError {
+    fn from(err: VertexProviderInitError) -> Self {
+        match err {
+            VertexProviderInitError::InvalidProjectId => Self::InvalidProjectId,
+            VertexProviderInitError::InvalidLocation => Self::InvalidLocation,
+            VertexProviderInitError::ClientInit(detail) => Self::ClientInit(detail),
+        }
+    }
+}
 
 // =================================================================================================
 // Authentication
@@ -69,12 +157,12 @@ struct MetadataProvider {
 }
 
 impl MetadataProvider {
-    fn new() -> Result<Self, AgentError> {
+    fn new() -> Result<Self, VertexProviderInitError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
             .build()
-            .map_err(|e| AgentError::Provider(format!("failed to build metadata client: {e}")))?;
+            .map_err(|e| VertexProviderInitError::ClientInit(e.to_string()))?;
         Ok(Self { client })
     }
 }
@@ -311,6 +399,48 @@ pub struct VertexProvider {
     default_model: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedVertexModel {
+    endpoint_location: String,
+    publisher: &'static str,
+    model_id: String,
+}
+
+impl ResolvedVertexModel {
+    fn service_endpoint(&self) -> String {
+        if self.endpoint_location == "global" {
+            "https://aiplatform.googleapis.com".to_string()
+        } else {
+            format!(
+                "https://{}-aiplatform.googleapis.com",
+                self.endpoint_location
+            )
+        }
+    }
+
+    fn stream_generate_url(&self, project_id: &str) -> String {
+        format!(
+            "{}/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:streamGenerateContent?alt=sse",
+            self.service_endpoint(),
+            project_id,
+            self.endpoint_location,
+            self.publisher,
+            self.model_id
+        )
+    }
+
+    fn publisher_model_config_url(&self, project_id: &str) -> String {
+        format!(
+            "{}/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:fetchPublisherModelConfig",
+            self.service_endpoint(),
+            project_id,
+            self.endpoint_location,
+            self.publisher,
+            self.model_id
+        )
+    }
+}
+
 impl std::fmt::Debug for VertexProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VertexProvider")
@@ -321,30 +451,13 @@ impl std::fmt::Debug for VertexProvider {
 }
 
 impl VertexProvider {
-    pub fn new(
+    fn try_new(
         project_id: String,
         location: String,
         default_model: Option<String>,
-    ) -> Result<Self, AgentError> {
-        static PROJECT_ID_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let project_id_re = PROJECT_ID_REGEX
-            .get_or_init(|| regex::Regex::new(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$").unwrap());
-        if !project_id_re.is_match(&project_id) {
-            return Err(AgentError::Provider(format!(
-                "Invalid GCP project ID: {}",
-                project_id
-            )));
-        }
-
-        static LOCATION_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let location_re =
-            LOCATION_REGEX.get_or_init(|| regex::Regex::new(r"^[a-z]+(?:-[a-z]+)+\d+$").unwrap());
-        if location != "global" && !location_re.is_match(&location) {
-            return Err(AgentError::Provider(format!(
-                "Invalid GCP location: {}",
-                location
-            )));
-        }
+    ) -> Result<Self, VertexProviderInitError> {
+        validate_project_id(&project_id).map_err(|_| VertexProviderInitError::InvalidProjectId)?;
+        validate_location(&location).map_err(|_| VertexProviderInitError::InvalidLocation)?;
 
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
         let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new()?);
@@ -353,7 +466,7 @@ impl VertexProvider {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .build()
-            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
+            .map_err(|e| VertexProviderInitError::ClientInit(e.to_string()))?;
 
         Ok(Self {
             client,
@@ -363,6 +476,14 @@ impl VertexProvider {
             token_cache: Arc::new(RwLock::new(None)),
             default_model,
         })
+    }
+
+    pub fn new(
+        project_id: String,
+        location: String,
+        default_model: Option<String>,
+    ) -> Result<Self, AgentError> {
+        Self::try_new(project_id, location, default_model).map_err(AgentError::from)
     }
 
     pub async fn get_token(&self) -> Result<String, AgentError> {
@@ -396,14 +517,17 @@ impl VertexProvider {
         Ok(token)
     }
 
-    /// Resolves the API endpoint for Google-published Gemini models on Vertex AI.
+    /// Resolves the Google-published Gemini model target on Vertex AI.
     ///
     /// Rules:
     /// - `vertex/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
     /// - `vertex/google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
     /// - `vertex` / `vertex:default` -> use `default_model`
     /// - non-Gemini model IDs and other publisher namespaces are rejected in this scoped implementation
-    fn resolve_request_config(&self, model_name: &str) -> Result<String, AgentError> {
+    fn resolve_model_target(
+        &self,
+        model_name: &str,
+    ) -> Result<ResolvedVertexModel, VertexSetupValidationError> {
         let clean_model = strip_vertex_prefix(model_name);
 
         // Handle generic fallback
@@ -411,66 +535,122 @@ impl VertexProvider {
             if let Some(ref default) = self.default_model {
                 strip_vertex_prefix(default)
             } else {
-                return Err(AgentError::Provider(
-                    "Missing required model parameter and no default model is configured."
-                        .to_string(),
-                ));
+                return Err(VertexSetupValidationError::MissingDefaultModel);
             }
         } else {
             clean_model
         };
 
-        let (publisher, model_id): (&str, &str) = if let Some(model_id) =
-            effective_model.strip_prefix("google/")
-        {
-            if !model_id.starts_with("gemini-") {
-                return Err(AgentError::Provider(format!(
-                    "Unsupported Vertex model: {effective_model}. This provider currently supports Google Gemini models only."
-                )));
-            }
-            ("google", model_id)
-        } else if effective_model.contains('/') {
-            return Err(AgentError::Provider(format!(
-                "Unsupported Vertex model namespace: {effective_model}. This provider currently supports Google Gemini models only."
-            )));
-        } else if !effective_model.starts_with("gemini-") {
-            return Err(AgentError::Provider(format!(
-                "Unsupported Vertex model: {effective_model}. This provider currently supports Google Gemini models only."
-            )));
-        } else {
-            // Bare Gemini model IDs are treated as Google-published models on Vertex AI.
-            ("google", effective_model)
-        };
+        let (publisher, model_id): (&str, &str) =
+            if let Some(model_id) = effective_model.strip_prefix("google/") {
+                if !model_id.starts_with("gemini-") {
+                    return Err(VertexSetupValidationError::UnsupportedModel);
+                }
+                ("google", model_id)
+            } else if effective_model.contains('/') || !effective_model.starts_with("gemini-") {
+                return Err(VertexSetupValidationError::UnsupportedModel);
+            } else {
+                // Bare Gemini model IDs are treated as Google-published models on Vertex AI.
+                ("google", effective_model)
+            };
         // SSRF / Path Traversal Validation
         if model_id.is_empty()
             || !model_id
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
         {
-            return Err(AgentError::Provider(format!(
-                "Invalid model identifier: {}",
-                model_id
-            )));
+            return Err(VertexSetupValidationError::UnsupportedModel);
         }
-
-        let method = "streamGenerateContent";
 
         // Global endpoints for Gemini 3 and Experimental
         // These models are automatically routed to the global endpoint `aiplatform.googleapis.com`
         // unless overridden.
         if model_id.starts_with("gemini-3") {
-            let url = format!(
-                "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
-                self.project_id, "global", publisher, model_id, method
-            );
-            return Ok(url);
+            return Ok(ResolvedVertexModel {
+                endpoint_location: "global".to_string(),
+                publisher,
+                model_id: model_id.to_string(),
+            });
         }
 
-        let url = format!(
-            "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
-            self.location, self.project_id, self.location, publisher, model_id, method
-        );
-        Ok(url)
+        Ok(ResolvedVertexModel {
+            endpoint_location: self.location.clone(),
+            publisher,
+            model_id: model_id.to_string(),
+        })
+    }
+
+    fn resolve_request_config(&self, model_name: &str) -> Result<String, AgentError> {
+        self.resolve_model_target(model_name)
+            .map(|resolved| resolved.stream_generate_url(&self.project_id))
+            .map_err(|err| AgentError::Provider(err.to_string()))
+    }
+}
+
+fn validate_project_id(project_id: &str) -> Result<(), VertexSetupValidationError> {
+    static PROJECT_ID_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let project_id_re = PROJECT_ID_REGEX
+        .get_or_init(|| regex::Regex::new(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$").unwrap());
+    if project_id_re.is_match(project_id) {
+        Ok(())
+    } else {
+        Err(VertexSetupValidationError::InvalidProjectId)
+    }
+}
+
+fn validate_location(location: &str) -> Result<(), VertexSetupValidationError> {
+    static LOCATION_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let location_re =
+        LOCATION_REGEX.get_or_init(|| regex::Regex::new(r"^[a-z]+(?:-[a-z]+)+\d+$").unwrap());
+    if location == "global" || location_re.is_match(location) {
+        Ok(())
+    } else {
+        Err(VertexSetupValidationError::InvalidLocation)
+    }
+}
+
+pub async fn validate_vertex_setup(
+    project_id: String,
+    location: String,
+    route_model: String,
+    default_model: Option<String>,
+) -> Result<(), VertexSetupValidationError> {
+    let provider = VertexProvider::try_new(project_id, location, default_model)
+        .map_err(VertexSetupValidationError::from)?;
+    let target = provider.resolve_model_target(&route_model)?;
+    let token = provider
+        .get_token()
+        .await
+        .map_err(|_| VertexSetupValidationError::AuthUnavailable)?;
+    let response = provider
+        .client
+        .get(target.publisher_model_config_url(&provider.project_id))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|_| VertexSetupValidationError::Transport)?;
+    let status = response.status();
+    if let Err(err) = response.bytes().await {
+        debug!("failed to drain Vertex validation probe response body: {err}");
+    }
+
+    classify_vertex_validation_probe_status(status)
+}
+
+fn classify_vertex_validation_probe_status(
+    status: StatusCode,
+) -> Result<(), VertexSetupValidationError> {
+    match status {
+        status if status.is_success() => Ok(()),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Err(VertexSetupValidationError::AccessDenied)
+        }
+        StatusCode::BAD_REQUEST => Err(VertexSetupValidationError::ProbeRejected),
+        StatusCode::NOT_FOUND => Err(VertexSetupValidationError::Unavailable),
+        StatusCode::TOO_MANY_REQUESTS => Err(VertexSetupValidationError::RateLimited),
+        status if status.is_redirection() => Err(VertexSetupValidationError::Transport),
+        status if status.is_server_error() => Err(VertexSetupValidationError::Transport),
+        _ => Err(VertexSetupValidationError::Rejected),
     }
 }
 
@@ -481,7 +661,7 @@ struct FallbackTokenProvider {
 }
 
 impl FallbackTokenProvider {
-    fn new() -> Result<Self, AgentError> {
+    fn new() -> Result<Self, VertexProviderInitError> {
         Ok(Self {
             primary: GCloudCliProvider,
             fallback: MetadataProvider::new()?,
@@ -955,6 +1135,35 @@ mod tests {
     }
 
     #[test]
+    fn test_vertex_provider_init_error_maps_to_setup_validation_error() {
+        assert_eq!(
+            VertexSetupValidationError::from(VertexProviderInitError::InvalidProjectId),
+            VertexSetupValidationError::InvalidProjectId
+        );
+        assert_eq!(
+            VertexSetupValidationError::from(VertexProviderInitError::InvalidLocation),
+            VertexSetupValidationError::InvalidLocation
+        );
+        assert_eq!(
+            VertexSetupValidationError::from(VertexProviderInitError::ClientInit(
+                "builder failed".to_string()
+            )),
+            VertexSetupValidationError::ClientInit("builder failed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_vertex_setup_validation_client_init_preserves_detail() {
+        let err = VertexSetupValidationError::from(VertexProviderInitError::ClientInit(
+            "tls backend unavailable".to_string(),
+        ));
+        assert_eq!(
+            err.to_string(),
+            "Vertex validation could not initialize the local HTTP client: tls backend unavailable"
+        );
+    }
+
+    #[test]
     fn test_vertex_provider_rejects_unsupported_namespace() {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
@@ -979,6 +1188,59 @@ mod tests {
             err.to_string()
                 .contains("supports Google Gemini models only"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_vertex_validation_probe_status() {
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::OK),
+            Ok(())
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::UNAUTHORIZED),
+            Err(VertexSetupValidationError::AccessDenied)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::FORBIDDEN),
+            Err(VertexSetupValidationError::AccessDenied)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::TOO_MANY_REQUESTS),
+            Err(VertexSetupValidationError::RateLimited)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::SERVICE_UNAVAILABLE),
+            Err(VertexSetupValidationError::Transport)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::TEMPORARY_REDIRECT),
+            Err(VertexSetupValidationError::Transport)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::BAD_REQUEST),
+            Err(VertexSetupValidationError::ProbeRejected)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::NOT_FOUND),
+            Err(VertexSetupValidationError::Unavailable)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::UNPROCESSABLE_ENTITY),
+            Err(VertexSetupValidationError::Rejected)
+        );
+    }
+
+    #[test]
+    fn test_resolve_model_target_builds_publisher_config_url() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let target = provider
+            .resolve_model_target("vertex:gemini-1.5-pro")
+            .expect("model target");
+        assert_eq!(
+            target.publisher_model_config_url("my-project"),
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-project/locations/us-central1/publishers/google/models/gemini-1.5-pro:fetchPublisherModelConfig"
         );
     }
 
