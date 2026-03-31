@@ -4934,7 +4934,8 @@ fn validate_provider_credentials_interactive(
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
                 let rerun_command = crate::onboarding::setup::SetupProvider::from(provider)
-                    .rerun_command(setup_provider_auth_mode_hint(provider, None));
+                    .setup_command(setup_provider_auth_mode_hint(provider, None))
+                    .unwrap_or_else(|| "cara verify --outcome local-chat".to_string());
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
@@ -6348,7 +6349,8 @@ fn handle_setup_validation_failure(
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
     let rerun = crate::onboarding::setup::SetupProvider::from(provider)
-        .rerun_command(setup_provider_auth_mode_hint(provider, requested_auth_mode));
+        .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
+        .unwrap_or_else(|| "cara verify --outcome local-chat".to_string());
     eprintln!("Next step: fix the value and rerun `{rerun}`.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
         Ok(crate::onboarding::setup::SetupCheck::validation_fail(

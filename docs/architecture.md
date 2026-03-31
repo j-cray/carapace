@@ -268,7 +268,7 @@ Current/frozen write targets for the next guided-provider work:
 | Provider | Persisted targets | Route target |
 |-----------|-------------------|--------------|
 | Bedrock | `bedrock.region`, `bedrock.accessKeyId`, `bedrock.secretAccessKey`, optional `bedrock.sessionToken` | `agents.defaults.model` routes to Bedrock |
-| Vertex | `vertex.projectId`, `vertex.location`, optional `vertex.model` | `agents.defaults.model` routes to `vertex:default` or the chosen explicit Vertex model |
+| Vertex | `vertex.projectId`, `vertex.location`, `vertex.model` (required for `vertex:default`; optional for explicit Vertex models) | `agents.defaults.model` routes to `vertex:default` (using `vertex.model`) or to the chosen explicit Vertex model |
 
 Status semantics are intentionally shared:
 

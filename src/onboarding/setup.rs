@@ -13,8 +13,9 @@
 //! - Bedrock: `bedrock.region`, `bedrock.accessKeyId`,
 //!   `bedrock.secretAccessKey`, optional `bedrock.sessionToken`, and
 //!   `agents.defaults.model`
-//! - Vertex: `vertex.projectId`, `vertex.location`, optional `vertex.model`,
-//!   and `agents.defaults.model`
+//! - Vertex: `vertex.projectId`, `vertex.location`, and `agents.defaults.model`;
+//!   `vertex.model` is required when the route is `vertex:default` and optional
+//!   when `agents.defaults.model` names an explicit Vertex model
 //!
 //! Status contract:
 //! - "written" means the flow persisted its config/auth-profile changes and can
@@ -85,15 +86,19 @@ impl SetupProvider {
         }
     }
 
-    pub fn rerun_command(self, auth_mode: Option<SetupAuthMode>) -> String {
+    pub fn setup_command(self, auth_mode: Option<SetupAuthMode>) -> Option<String> {
         match (self, auth_mode) {
             (Self::Gemini, Some(SetupAuthMode::OAuth)) => {
-                "cara setup --force --provider gemini --auth-mode oauth".to_string()
+                Some("cara setup --force --provider gemini --auth-mode oauth".to_string())
             }
             (Self::Gemini, Some(SetupAuthMode::ApiKey)) => {
-                "cara setup --force --provider gemini --auth-mode api-key".to_string()
+                Some("cara setup --force --provider gemini --auth-mode api-key".to_string())
             }
-            _ => format!("cara setup --force --provider {}", self.prompt_key()),
+            (Self::Vertex, _) => None,
+            _ => Some(format!(
+                "cara setup --force --provider {}",
+                self.prompt_key()
+            )),
         }
     }
 }
@@ -230,12 +235,6 @@ pub struct SetupFlowResult {
     pub observed_checks: Vec<SetupCheck>,
 }
 
-impl SetupFlowResult {
-    pub fn push(&mut self, check: SetupCheck) {
-        self.observed_checks.push(check);
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupAssessmentStatus {
     Ready,
@@ -288,8 +287,8 @@ pub fn assess_provider_setup(
     observed_validations: Vec<SetupCheck>,
 ) -> SetupAssessment {
     let auth_mode = detect_auth_mode(cfg, provider);
-    let rerun_command = provider.rerun_command(auth_mode);
-    let mut checks = vec![model_route_check(cfg, provider, &rerun_command)];
+    let setup_command = provider.setup_command(auth_mode);
+    let mut checks = vec![model_route_check(cfg, provider, setup_command.as_deref())];
     let mut profile_name = None;
     let mut email = None;
 
@@ -299,21 +298,21 @@ pub fn assess_provider_setup(
                 cfg,
                 &["anthropic", "apiKey"],
                 "Anthropic API key",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
         }
         SetupProvider::Codex => {
-            checks.push(auth_profiles_enabled_check(cfg, &rerun_command));
+            checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
             let profile_check = oauth_profile_id_check(
                 cfg,
                 &["codex", "authProfile"],
                 "OpenAI auth profile",
-                &rerun_command,
+                setup_command.as_deref(),
             );
             let profile_id = config_string(cfg, &["codex", "authProfile"]);
             checks.push(profile_check);
             let password_present = profile_store_password_present();
-            checks.push(config_password_check(&rerun_command));
+            checks.push(config_password_check(setup_command.as_deref()));
             if password_present {
                 if let Some(profile_id) = profile_id {
                     let (check, summary) = auth_profile_summary_check(
@@ -321,7 +320,7 @@ pub fn assess_provider_setup(
                         &profile_id,
                         OAuthProvider::OpenAI,
                         "OpenAI auth profile",
-                        &rerun_command,
+                        setup_command.as_deref(),
                     );
                     if let Some(summary) = summary {
                         profile_name = Some(summary.name.clone());
@@ -336,7 +335,7 @@ pub fn assess_provider_setup(
                 cfg,
                 &["openai", "apiKey"],
                 "OpenAI API key",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
         }
         SetupProvider::Ollama => {
@@ -344,13 +343,13 @@ pub fn assess_provider_setup(
                 cfg,
                 &["providers", "ollama", "baseUrl"],
                 "Ollama base URL",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
             checks.push(base_url_validation_check(
                 cfg,
                 &["providers", "ollama", "baseUrl"],
                 "Ollama base URL validation",
-                &rerun_command,
+                setup_command.as_deref(),
                 |url| {
                     agent::ollama::OllamaProvider::new()
                         .and_then(|provider| provider.with_base_url(url.to_string()))
@@ -366,17 +365,17 @@ pub fn assess_provider_setup(
         }
         SetupProvider::Gemini => match auth_mode {
             Some(SetupAuthMode::OAuth) => {
-                checks.push(auth_profiles_enabled_check(cfg, &rerun_command));
+                checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
                 let profile_check = oauth_profile_id_check(
                     cfg,
                     &["google", "authProfile"],
                     "Gemini auth profile",
-                    &rerun_command,
+                    setup_command.as_deref(),
                 );
                 let profile_id = config_string(cfg, &["google", "authProfile"]);
                 checks.push(profile_check);
                 let password_present = profile_store_password_present();
-                checks.push(config_password_check(&rerun_command));
+                checks.push(config_password_check(setup_command.as_deref()));
                 if password_present {
                     if let Some(profile_id) = profile_id {
                         let (check, summary) = auth_profile_summary_check(
@@ -384,7 +383,7 @@ pub fn assess_provider_setup(
                             &profile_id,
                             OAuthProvider::Google,
                             "Gemini auth profile",
-                            &rerun_command,
+                            setup_command.as_deref(),
                         );
                         if let Some(summary) = summary {
                             profile_name = Some(summary.name.clone());
@@ -398,7 +397,7 @@ pub fn assess_provider_setup(
                         cfg,
                         &["google", "baseUrl"],
                         "Gemini base URL validation",
-                        &rerun_command,
+                        setup_command.as_deref(),
                         |url| {
                             crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                                 .map_err(|err| err.to_string())
@@ -411,14 +410,18 @@ pub fn assess_provider_setup(
                     cfg,
                     &["google", "apiKey"],
                     "Gemini API key",
-                    &provider.rerun_command(Some(SetupAuthMode::ApiKey)),
+                    provider
+                        .setup_command(Some(SetupAuthMode::ApiKey))
+                        .as_deref(),
                 ));
                 if config_string(cfg, &["google", "baseUrl"]).is_some() {
                     checks.push(base_url_validation_check(
                         cfg,
                         &["google", "baseUrl"],
                         "Gemini base URL validation",
-                        &provider.rerun_command(Some(SetupAuthMode::ApiKey)),
+                        provider
+                            .setup_command(Some(SetupAuthMode::ApiKey))
+                            .as_deref(),
                         |url| {
                             crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                                 .map_err(|err| err.to_string())
@@ -432,33 +435,37 @@ pub fn assess_provider_setup(
                 cfg,
                 &["vertex", "projectId"],
                 "Vertex project ID",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["vertex", "location"],
                 "Vertex location",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
-            checks.push(optional_configured_value_check(
-                cfg,
-                &["vertex", "model"],
-                "Vertex default model",
-            ));
+            if vertex_route_requires_default_model(cfg) {
+                checks.push(vertex_default_model_check(cfg));
+            } else {
+                checks.push(optional_configured_value_check(
+                    cfg,
+                    &["vertex", "model"],
+                    "Vertex default model",
+                ));
+            }
         }
         SetupProvider::Venice => {
             checks.push(configured_value_check(
                 cfg,
                 &["venice", "apiKey"],
                 "Venice API key",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
             if config_string(cfg, &["venice", "baseUrl"]).is_some() {
                 checks.push(base_url_validation_check(
                     cfg,
                     &["venice", "baseUrl"],
                     "Venice base URL validation",
-                    &rerun_command,
+                    setup_command.as_deref(),
                     |url| {
                         agent::venice::VeniceProvider::new("test-key".to_string())
                             .and_then(|provider| provider.with_base_url(url.to_string()))
@@ -473,19 +480,19 @@ pub fn assess_provider_setup(
                 cfg,
                 &["bedrock", "region"],
                 "AWS Bedrock region",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["bedrock", "accessKeyId"],
                 "AWS access key ID",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["bedrock", "secretAccessKey"],
                 "AWS secret access key",
-                &rerun_command,
+                setup_command.as_deref(),
             ));
             checks.push(optional_configured_value_check(
                 cfg,
@@ -567,7 +574,80 @@ fn detect_auth_mode(cfg: &Value, provider: SetupProvider) -> Option<SetupAuthMod
     }
 }
 
-fn model_route_check(cfg: &Value, provider: SetupProvider, rerun_command: &str) -> SetupCheck {
+const LOCAL_CHAT_VERIFY_COMMAND: &str = "cara verify --outcome local-chat";
+
+fn setup_follow_up(
+    setup_command: Option<&str>,
+    rerun_action: impl AsRef<str>,
+    manual_action: impl AsRef<str>,
+) -> String {
+    match setup_command {
+        Some(command) => format!("rerun `{command}` {}", rerun_action.as_ref()),
+        None => format!(
+            "{}, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`",
+            manual_action.as_ref()
+        ),
+    }
+}
+
+fn vertex_route_remediation() -> String {
+    setup_follow_up(
+        None,
+        "",
+        "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model such as `vertex:gemini-2.5-flash`",
+    )
+}
+
+fn vertex_route_requires_default_model(cfg: &Value) -> bool {
+    matches!(
+        config_string(cfg, &["agents", "defaults", "model"])
+            .unwrap_or_else(|| SetupProvider::Vertex.default_model().to_string())
+            .as_str(),
+        "vertex:default" | "vertex/default"
+    )
+}
+
+fn vertex_default_model_check(cfg: &Value) -> SetupCheck {
+    match config_string(cfg, &["vertex", "model"]) {
+        Some(value) => {
+            let references = env_var_references(&value);
+            let missing = missing_env_var_references(&references);
+            if !missing.is_empty() {
+                let env_vars = format_env_var_list(&missing);
+                SetupCheck::fail(
+                    "Vertex default model",
+                    format!("Vertex default model references {env_vars}, but they are not set"),
+                    format!(
+                        "set {env_vars} in the same shell or write `vertex.model` into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
+                    ),
+                )
+            } else if !references.is_empty() {
+                SetupCheck::pass(
+                    "Vertex default model",
+                    format!(
+                        "Vertex default model resolves from {}",
+                        format_env_var_list(&references)
+                    ),
+                )
+            } else {
+                SetupCheck::pass("Vertex default model", "Vertex default model is written in config")
+            }
+        }
+        None => SetupCheck::fail(
+            "Vertex default model",
+            "`agents.defaults.model` routes to `vertex:default`, but `vertex.model` is not configured",
+            format!(
+                "set `vertex.model`, or switch `agents.defaults.model` to an explicit Vertex model such as `vertex:gemini-2.5-flash`, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
+            ),
+        ),
+    }
+}
+
+fn model_route_check(
+    cfg: &Value,
+    provider: SetupProvider,
+    setup_command: Option<&str>,
+) -> SetupCheck {
     let model = config_string(cfg, &["agents", "defaults", "model"])
         .unwrap_or_else(|| provider.default_model().to_string());
     match model_provider_for_local_chat(&model) {
@@ -582,25 +662,45 @@ fn model_route_check(cfg: &Value, provider: SetupProvider, rerun_command: &str) 
                 actual_provider.label(),
                 provider.label()
             ),
-            format!(
-                "set `agents.defaults.model` to `{}` or rerun `{}`",
-                provider.default_model(),
-                rerun_command
-            ),
+            if provider == SetupProvider::Vertex {
+                vertex_route_remediation()
+            } else {
+                setup_follow_up(
+                    setup_command,
+                    format!(
+                        "to set `agents.defaults.model` to `{}`",
+                        provider.default_model()
+                    ),
+                    format!(
+                        "set `agents.defaults.model` to `{}`",
+                        provider.default_model()
+                    ),
+                )
+            },
         ),
         None => SetupCheck::fail(
             "Default model route",
             format!("`agents.defaults.model` uses an unrecognized provider route: `{model}`"),
-            format!(
-                "set `agents.defaults.model` to `{}` or rerun `{}`",
-                provider.default_model(),
-                rerun_command
-            ),
+            if provider == SetupProvider::Vertex {
+                vertex_route_remediation()
+            } else {
+                setup_follow_up(
+                    setup_command,
+                    format!(
+                        "to set `agents.defaults.model` to `{}`",
+                        provider.default_model()
+                    ),
+                    format!(
+                        "set `agents.defaults.model` to `{}`",
+                        provider.default_model()
+                    ),
+                )
+            },
         ),
     }
 }
 
-fn auth_profiles_enabled_check(cfg: &Value, rerun_command: &str) -> SetupCheck {
+fn auth_profiles_enabled_check(cfg: &Value, setup_command: Option<&str>) -> SetupCheck {
     let enabled = cfg
         .pointer("/auth/profiles/enabled")
         .and_then(Value::as_bool)
@@ -611,7 +711,11 @@ fn auth_profiles_enabled_check(cfg: &Value, rerun_command: &str) -> SetupCheck {
         SetupCheck::fail(
             "Auth profiles",
             "`auth.profiles.enabled` is false",
-            format!("rerun `{rerun_command}` to enable auth profiles"),
+            setup_follow_up(
+                setup_command,
+                "to enable auth profiles",
+                "enable `auth.profiles.enabled` in config",
+            ),
         )
     }
 }
@@ -620,7 +724,7 @@ fn oauth_profile_id_check(
     cfg: &Value,
     path: &[&str],
     label: &str,
-    rerun_command: &str,
+    setup_command: Option<&str>,
 ) -> SetupCheck {
     match config_string(cfg, path) {
         Some(profile_id) => {
@@ -629,24 +733,34 @@ fn oauth_profile_id_check(
         None => SetupCheck::fail(
             label,
             format!("{label} is not configured"),
-            format!("rerun `{rerun_command}` to store a sign-in profile"),
+            setup_follow_up(
+                setup_command,
+                "to store a sign-in profile",
+                format!("write {label} into config"),
+            ),
         ),
     }
 }
 
-fn config_password_check(rerun_command: &str) -> SetupCheck {
+fn config_password_check(setup_command: Option<&str>) -> SetupCheck {
     if env_var_present("CARAPACE_CONFIG_PASSWORD") {
         SetupCheck::pass(
             "Encrypted profile store",
             "`CARAPACE_CONFIG_PASSWORD` is set in the current shell",
         )
     } else {
+        let remediation = match setup_command {
+            Some(command) => format!(
+                "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, or rerun `{command}` after exporting it"
+            ),
+            None => format!(
+                "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
+            ),
+        };
         SetupCheck::fail(
             "Encrypted profile store",
             "`CARAPACE_CONFIG_PASSWORD` is not set in the current shell",
-            format!(
-                "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, or rerun `{rerun_command}` after exporting it"
-            ),
+            remediation,
         )
     }
 }
@@ -656,7 +770,7 @@ fn auth_profile_summary_check(
     profile_id: &str,
     expected_provider: OAuthProvider,
     label: &str,
-    rerun_command: &str,
+    setup_command: Option<&str>,
 ) -> (SetupCheck, Option<AuthProfileSummary>) {
     match load_profile_summary(state_dir, profile_id) {
         Ok(Some(summary)) => {
@@ -668,7 +782,11 @@ fn auth_profile_summary_check(
                             "stored profile `{profile_id}` belongs to {}, not {}",
                             summary.provider, expected_provider
                         ),
-                        format!("rerun `{rerun_command}` to store the correct auth profile"),
+                        setup_follow_up(
+                            setup_command,
+                            "to store the correct auth profile",
+                            format!("write the correct {label} into config"),
+                        ),
                     ),
                     None,
                 )
@@ -684,18 +802,28 @@ fn auth_profile_summary_check(
             SetupCheck::fail(
                 label,
                 format!("stored profile `{profile_id}` was not found in the profile store"),
-                format!("rerun `{rerun_command}` to store a fresh auth profile"),
+                setup_follow_up(
+                    setup_command,
+                    "to store a fresh auth profile",
+                    format!("write a fresh {label} into config"),
+                ),
             ),
             None,
         ),
-        Err(err) => (
-            SetupCheck::fail(
-                label,
-                format!("failed to read the profile store: {err}"),
-                format!("check the profile store and rerun `{rerun_command}`"),
-            ),
-            None,
-        ),
+        Err(err) => {
+            let remediation = match setup_command {
+                Some(command) => format!("check the profile store and rerun `{command}`"),
+                None => format!("check the profile store and rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"),
+            };
+            (
+                SetupCheck::fail(
+                    label,
+                    format!("failed to read the profile store: {err}"),
+                    remediation,
+                ),
+                None,
+            )
+        }
     }
 }
 
@@ -703,7 +831,7 @@ fn configured_value_check(
     cfg: &Value,
     path: &[&str],
     label: &str,
-    rerun_command: &str,
+    setup_command: Option<&str>,
 ) -> SetupCheck {
     match config_string(cfg, path) {
         Some(value) => {
@@ -711,12 +839,18 @@ fn configured_value_check(
             let missing = missing_env_var_references(&references);
             if !missing.is_empty() {
                 let env_vars = format_env_var_list(&missing);
+                let remediation = match setup_command {
+                    Some(command) => format!(
+                        "set {env_vars} in the same shell or rerun `{command}` to rewrite the value"
+                    ),
+                    None => format!(
+                        "set {env_vars} in the same shell or write {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
+                    ),
+                };
                 SetupCheck::fail(
                     label,
                     format!("{label} references {env_vars}, but they are not set"),
-                    format!(
-                        "set {env_vars} in the same shell or rerun `{rerun_command}` to rewrite the value"
-                    ),
+                    remediation,
                 )
             } else if !references.is_empty() {
                 SetupCheck::pass(
@@ -730,7 +864,11 @@ fn configured_value_check(
         None => SetupCheck::fail(
             label,
             format!("{label} is not configured"),
-            format!("rerun `{rerun_command}` to configure {label}"),
+            setup_follow_up(
+                setup_command,
+                format!("to configure {label}"),
+                format!("write {label} into config"),
+            ),
         ),
     }
 }
@@ -764,7 +902,7 @@ fn base_url_validation_check<F>(
     cfg: &Value,
     path: &[&str],
     label: &str,
-    rerun_command: &str,
+    setup_command: Option<&str>,
     validator: F,
 ) -> SetupCheck
 where
@@ -777,12 +915,18 @@ where
     let missing = missing_env_var_references(&references);
     if !missing.is_empty() {
         let env_vars = format_env_var_list(&missing);
+        let remediation = match setup_command {
+            Some(command) => format!(
+                "set {env_vars} in the same shell or rerun `{command}` to rewrite the base URL"
+            ),
+            None => format!(
+                "set {env_vars} in the same shell or write a valid {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
+            ),
+        };
         return SetupCheck::fail(
             label,
             format!("{label} references {env_vars}, but they are not set"),
-            format!(
-                "set {env_vars} in the same shell or rerun `{rerun_command}` to rewrite the base URL"
-            ),
+            remediation,
         );
     }
 
@@ -792,7 +936,11 @@ where
         Err(err) => SetupCheck::fail(
             label,
             format!("{label} failed local validation: {err}"),
-            format!("rerun `{rerun_command}` and correct the base URL"),
+            setup_follow_up(
+                setup_command,
+                "and correct the base URL",
+                format!("write a valid {label} into config"),
+            ),
         ),
     }
 }
@@ -956,7 +1104,7 @@ mod tests {
             &cfg,
             &["venice", "baseUrl"],
             "Venice base URL validation",
-            "cara setup --provider venice",
+            Some("cara setup --provider venice"),
             |url| {
                 assert_eq!(url, "https://api.example.com/v1");
                 Ok(())
@@ -978,7 +1126,7 @@ mod tests {
             &cfg,
             &["venice", "baseUrl"],
             "Venice base URL validation",
-            "cara setup --provider venice",
+            Some("cara setup --provider venice"),
             |_| Ok(()),
         );
 
@@ -1077,6 +1225,25 @@ mod tests {
     }
 
     #[test]
+    fn test_assess_provider_setup_vertex_default_route_requires_default_model() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "vertex:default" } },
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1"
+            }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Vertex, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Vertex default model" && check.status == SetupCheckStatus::Fail
+        }));
+    }
+
+    #[test]
     fn test_assess_provider_setup_vertex_ready_with_validation_pass() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
@@ -1101,6 +1268,28 @@ mod tests {
         assert_eq!(assessment.status, SetupAssessmentStatus::Ready);
         assert!(assessment.checks.iter().any(|check| {
             check.name == "Vertex model access" && check.status == SetupCheckStatus::Pass
+        }));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_vertex_explicit_route_without_validation_is_partial() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "vertex:gemini-2.5-flash" } },
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1"
+            }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Vertex, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Partial);
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Live provider validation" && check.status == SetupCheckStatus::Skip
+        }));
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Vertex default model" && check.status == SetupCheckStatus::Skip
         }));
     }
 
