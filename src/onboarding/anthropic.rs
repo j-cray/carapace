@@ -123,6 +123,13 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_anthropic_setup_token_input_rejects_too_short_token() {
+        let token = format!("{}{}", ANTHROPIC_SETUP_TOKEN_PREFIX, "a".repeat(66));
+        let err = validate_anthropic_setup_token_input(&token).unwrap_err();
+        assert!(err.contains("looks too short"));
+    }
+
+    #[test]
     fn test_ensure_anthropic_setup_token_config_replaces_api_key() {
         let mut config = json!({
             "anthropic": {

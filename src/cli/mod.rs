@@ -153,7 +153,7 @@ pub enum Command {
 
         /// Provider auth mode. Required for non-interactive Gemini and Anthropic setup.
         #[arg(long, value_enum)]
-        auth_mode: Option<GeminiSetupAuthMode>,
+        auth_mode: Option<SetupAuthModeSelection>,
     },
 
     /// Pair with a remote gateway node.
@@ -3975,8 +3975,6 @@ pub enum SetupAuthModeSelection {
     SetupToken,
 }
 
-type GeminiSetupAuthMode = SetupAuthModeSelection;
-
 impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
     fn from(value: SetupProvider) -> Self {
         match value {
@@ -3992,12 +3990,12 @@ impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
     }
 }
 
-impl From<GeminiSetupAuthMode> for crate::onboarding::setup::SetupAuthMode {
-    fn from(value: GeminiSetupAuthMode) -> Self {
+impl From<SetupAuthModeSelection> for crate::onboarding::setup::SetupAuthMode {
+    fn from(value: SetupAuthModeSelection) -> Self {
         match value {
-            GeminiSetupAuthMode::OAuth => Self::OAuth,
-            GeminiSetupAuthMode::ApiKey => Self::ApiKey,
-            GeminiSetupAuthMode::SetupToken => Self::SetupToken,
+            SetupAuthModeSelection::OAuth => Self::OAuth,
+            SetupAuthModeSelection::ApiKey => Self::ApiKey,
+            SetupAuthModeSelection::SetupToken => Self::SetupToken,
         }
     }
 }
@@ -5014,7 +5012,7 @@ async fn validate_channel_credentials_owned(channel: String, token: String) -> R
 
 fn setup_rerun_command(
     provider: SetupProvider,
-    requested_auth_mode: Option<GeminiSetupAuthMode>,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
 ) -> String {
     crate::onboarding::setup::SetupProvider::from(provider)
         .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
@@ -5023,7 +5021,7 @@ fn setup_rerun_command(
 
 fn validate_provider_credentials_interactive(
     provider: SetupProvider,
-    requested_auth_mode: Option<GeminiSetupAuthMode>,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
     api_key: &str,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate provider credentials now?", true)?;
@@ -6339,7 +6337,7 @@ fn prompt_openai_setup_provider_variant() -> Result<SetupProvider, Box<dyn std::
 
 fn setup_provider_auth_mode_hint(
     provider: SetupProvider,
-    requested_auth_mode: Option<GeminiSetupAuthMode>,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
 ) -> Option<crate::onboarding::setup::SetupAuthMode> {
     match provider {
         SetupProvider::Anthropic | SetupProvider::Gemini => requested_auth_mode.map(Into::into),
@@ -6354,10 +6352,10 @@ fn setup_provider_auth_mode_hint(
 }
 
 fn prompt_gemini_setup_auth_mode(
-    requested_mode: Option<GeminiSetupAuthMode>,
-) -> Result<GeminiSetupAuthMode, Box<dyn std::error::Error>> {
+    requested_mode: Option<SetupAuthModeSelection>,
+) -> Result<SetupAuthModeSelection, Box<dyn std::error::Error>> {
     if let Some(mode) = requested_mode {
-        if mode == GeminiSetupAuthMode::SetupToken {
+        if mode == SetupAuthModeSelection::SetupToken {
             return Err(
                 "`--auth-mode setup-token` is only valid with `--provider anthropic`.".into(),
             );
@@ -6372,8 +6370,8 @@ fn prompt_gemini_setup_auth_mode(
             &["oauth", "api-key"],
         )?;
         match selection.as_str() {
-            "oauth" => return Ok(GeminiSetupAuthMode::OAuth),
-            "api-key" => return Ok(GeminiSetupAuthMode::ApiKey),
+            "oauth" => return Ok(SetupAuthModeSelection::OAuth),
+            "api-key" => return Ok(SetupAuthModeSelection::ApiKey),
             _ => {
                 eprintln!("Please choose either `oauth` or `api-key`.");
             }
@@ -6382,12 +6380,12 @@ fn prompt_gemini_setup_auth_mode(
 }
 
 fn prompt_anthropic_setup_auth_mode(
-    requested_mode: Option<GeminiSetupAuthMode>,
-) -> Result<GeminiSetupAuthMode, Box<dyn std::error::Error>> {
+    requested_mode: Option<SetupAuthModeSelection>,
+) -> Result<SetupAuthModeSelection, Box<dyn std::error::Error>> {
     if let Some(mode) = requested_mode {
         return match mode {
-            GeminiSetupAuthMode::ApiKey | GeminiSetupAuthMode::SetupToken => Ok(mode),
-            GeminiSetupAuthMode::OAuth => {
+            SetupAuthModeSelection::ApiKey | SetupAuthModeSelection::SetupToken => Ok(mode),
+            SetupAuthModeSelection::OAuth => {
                 Err("`--auth-mode oauth` is only valid with `--provider gemini`.".into())
             }
         };
@@ -6400,8 +6398,8 @@ fn prompt_anthropic_setup_auth_mode(
             &["api-key", "setup-token"],
         )?;
         match selection.as_str() {
-            "api-key" => return Ok(GeminiSetupAuthMode::ApiKey),
-            "setup-token" => return Ok(GeminiSetupAuthMode::SetupToken),
+            "api-key" => return Ok(SetupAuthModeSelection::ApiKey),
+            "setup-token" => return Ok(SetupAuthModeSelection::SetupToken),
             _ => eprintln!("Please choose either `api-key` or `setup-token`."),
         }
     }
@@ -6678,7 +6676,7 @@ fn prompt_oauth_client_value(
 fn configure_gemini_provider_interactive(
     config: &mut Value,
     hide_sensitive_input: bool,
-    requested_auth_mode: Option<GeminiSetupAuthMode>,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     let auth_mode = prompt_gemini_setup_auth_mode(requested_auth_mode)?;
     let base_url = prompt_optional_base_url_override(
@@ -6689,7 +6687,7 @@ fn configure_gemini_provider_interactive(
     let mut result = ProviderSetupResult::default();
 
     match auth_mode {
-        GeminiSetupAuthMode::ApiKey => {
+        SetupAuthModeSelection::ApiKey => {
             let api_key = prompt_required_secret_config_value(
                 "GOOGLE_API_KEY",
                 "Gemini API key",
@@ -6709,7 +6707,7 @@ fn configure_gemini_provider_interactive(
                 if let Err(err) = validation {
                     result.observed_checks.push(handle_setup_validation_failure(
                         SetupProvider::Gemini,
-                        Some(GeminiSetupAuthMode::ApiKey),
+                        Some(SetupAuthModeSelection::ApiKey),
                         err,
                     )?);
                 }
@@ -6721,7 +6719,7 @@ fn configure_gemini_provider_interactive(
                 base_url.as_ref().map(|value| value.config_value.as_str()),
             );
         }
-        GeminiSetupAuthMode::OAuth => {
+        SetupAuthModeSelection::OAuth => {
             let client_id = prompt_oauth_client_value(
                 "GOOGLE_OAUTH_CLIENT_ID",
                 "Google OAuth client ID",
@@ -6742,7 +6740,7 @@ fn configure_gemini_provider_interactive(
                 {
                     result.observed_checks.push(handle_setup_validation_failure(
                         SetupProvider::Gemini,
-                        Some(GeminiSetupAuthMode::OAuth),
+                        Some(SetupAuthModeSelection::OAuth),
                         err,
                     )?);
                 }
@@ -6775,7 +6773,7 @@ fn configure_gemini_provider_interactive(
                 config["google"]["baseUrl"] = serde_json::json!(base_url.config_value);
             }
         }
-        GeminiSetupAuthMode::SetupToken => {
+        SetupAuthModeSelection::SetupToken => {
             return Err(
                 "`--auth-mode setup-token` is only valid with `--provider anthropic`.".into(),
             );
@@ -6948,7 +6946,7 @@ fn configure_vertex_provider_interactive(
 
 fn handle_setup_validation_failure(
     provider: SetupProvider,
-    requested_auth_mode: Option<GeminiSetupAuthMode>,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
     err: crate::agent::AgentError,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
@@ -6969,7 +6967,7 @@ fn configure_provider_interactive(
     config: &mut Value,
     provider: SetupProvider,
     hide_sensitive_input: bool,
-    requested_auth_mode: Option<GeminiSetupAuthMode>,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
         && requested_auth_mode.is_some()
@@ -6983,7 +6981,7 @@ fn configure_provider_interactive(
         SetupProvider::Anthropic => {
             let auth_mode = prompt_anthropic_setup_auth_mode(requested_auth_mode)?;
             match auth_mode {
-                GeminiSetupAuthMode::ApiKey => {
+                SetupAuthModeSelection::ApiKey => {
                     let api_key = prompt_required_secret_config_value(
                         "ANTHROPIC_API_KEY",
                         "Anthropic API key",
@@ -6994,7 +6992,7 @@ fn configure_provider_interactive(
                             .observed_checks
                             .push(validate_provider_credentials_interactive(
                                 provider,
-                                Some(GeminiSetupAuthMode::ApiKey),
+                                Some(SetupAuthModeSelection::ApiKey),
                                 key,
                             )?);
                     } else {
@@ -7002,7 +7000,7 @@ fn configure_provider_interactive(
                     }
                     config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
                 }
-                GeminiSetupAuthMode::SetupToken => {
+                SetupAuthModeSelection::SetupToken => {
                     let token = prompt_required_secret_value_from_env(
                         "ANTHROPIC_SETUP_TOKEN",
                         "Anthropic setup-token",
@@ -7015,7 +7013,7 @@ fn configure_provider_interactive(
                         .observed_checks
                         .push(validate_provider_credentials_interactive(
                             provider,
-                            Some(GeminiSetupAuthMode::SetupToken),
+                            Some(SetupAuthModeSelection::SetupToken),
                             &token,
                         )?);
                     let state_dir = resolve_state_dir();
@@ -7025,7 +7023,7 @@ fn configure_provider_interactive(
                     )
                     .map_err(std::io::Error::other)?;
                 }
-                GeminiSetupAuthMode::OAuth => {
+                SetupAuthModeSelection::OAuth => {
                     return Err(
                         "`--auth-mode oauth` is only valid with `--provider gemini`.".into(),
                     );
@@ -7261,7 +7259,7 @@ fn configure_provider_interactive(
 fn configure_provider_noninteractive(
     config: &mut Value,
     provider: SetupProvider,
-    requested_auth_mode: Option<GeminiSetupAuthMode>,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
         && requested_auth_mode.is_some()
@@ -7272,7 +7270,7 @@ fn configure_provider_noninteractive(
 
     match provider {
         SetupProvider::Anthropic => match requested_auth_mode {
-            Some(GeminiSetupAuthMode::SetupToken) => {
+            Some(SetupAuthModeSelection::SetupToken) => {
                 let token = env_var_value("ANTHROPIC_SETUP_TOKEN").ok_or_else(|| {
                         std::io::Error::other(
                             "non-interactive Anthropic setup-token mode requires ANTHROPIC_SETUP_TOKEN.",
@@ -7288,7 +7286,7 @@ fn configure_provider_noninteractive(
                 )
                 .map_err(std::io::Error::other)?;
             }
-            Some(GeminiSetupAuthMode::OAuth) => {
+            Some(SetupAuthModeSelection::OAuth) => {
                 return Err(
                         "non-interactive Anthropic setup does not support `--auth-mode oauth`; use `api-key` or `setup-token`."
                             .into(),
@@ -7324,7 +7322,7 @@ fn configure_provider_noninteractive(
             });
         }
         SetupProvider::Gemini => match requested_auth_mode {
-            Some(GeminiSetupAuthMode::ApiKey) => {
+            Some(SetupAuthModeSelection::ApiKey) => {
                 crate::onboarding::gemini::write_gemini_api_key_config(
                     config,
                     &env_placeholder("GOOGLE_API_KEY"),
@@ -7333,13 +7331,13 @@ fn configure_provider_noninteractive(
                         .as_deref(),
                 );
             }
-            Some(GeminiSetupAuthMode::OAuth) => {
+            Some(SetupAuthModeSelection::OAuth) => {
                 return Err(
                         "non-interactive Gemini Google sign-in is not supported; rerun interactively or use `--auth-mode api-key`."
                             .into(),
                     );
             }
-            Some(GeminiSetupAuthMode::SetupToken) => {
+            Some(SetupAuthModeSelection::SetupToken) => {
                 return Err(
                     "non-interactive Gemini setup does not support `--auth-mode setup-token`; use `oauth` or `api-key`."
                         .into(),
@@ -7458,7 +7456,7 @@ fn configure_provider_noninteractive(
 pub fn handle_setup(
     force: bool,
     requested_provider: Option<SetupProvider>,
-    requested_auth_mode: Option<GeminiSetupAuthMode>,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::get_config_path();
 
@@ -11592,7 +11590,7 @@ mod tests {
             Some(Command::Setup {
                 force,
                 provider: Some(SetupProvider::Gemini),
-                auth_mode: Some(GeminiSetupAuthMode::OAuth),
+                auth_mode: Some(SetupAuthModeSelection::OAuth),
             }) => {
                 assert!(!force);
             }
@@ -11731,7 +11729,7 @@ mod tests {
         let result = handle_setup(
             false,
             Some(SetupProvider::Gemini),
-            Some(GeminiSetupAuthMode::ApiKey),
+            Some(SetupAuthModeSelection::ApiKey),
         );
         assert!(
             result.is_ok(),
@@ -11754,7 +11752,7 @@ mod tests {
         let result = handle_setup(
             false,
             Some(SetupProvider::Gemini),
-            Some(GeminiSetupAuthMode::OAuth),
+            Some(SetupAuthModeSelection::OAuth),
         );
         assert!(result.is_err(), "non-interactive Gemini OAuth should fail");
         assert!(
@@ -11933,7 +11931,7 @@ mod tests {
             &mut config,
             SetupProvider::Gemini,
             false,
-            Some(GeminiSetupAuthMode::ApiKey),
+            Some(SetupAuthModeSelection::ApiKey),
         )
         .expect("interactive Gemini setup");
 
@@ -12494,7 +12492,7 @@ mod tests {
 
         let result = handle_setup_validation_failure(
             SetupProvider::Gemini,
-            Some(GeminiSetupAuthMode::ApiKey),
+            Some(SetupAuthModeSelection::ApiKey),
             crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
         );
 

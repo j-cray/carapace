@@ -258,10 +258,12 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                 MediaType::Image => {
                     if openai_key.is_some() {
                         "openai"
-                    } else if anthropic_key.is_some() {
-                        "anthropic"
                     } else {
-                        return Err("no media analysis provider configured".into());
+                        match anthropic_key.as_ref() {
+                            Ok(Some(_)) => "anthropic",
+                            Ok(None) => return Err("no media analysis provider configured".into()),
+                            Err(err) => return Err(err.clone()),
+                        }
                     }
                 }
                 MediaType::Video => {
@@ -297,7 +299,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                 if media_type == MediaType::Audio {
                     return Err("Anthropic does not support audio transcription".into());
                 }
-                let key = anthropic_key.ok_or_else(|| {
+                let key = anthropic_key?.ok_or_else(|| {
                     "Anthropic credential not configured; set ANTHROPIC_API_KEY, anthropic.apiKey, or anthropic.authProfile"
                         .to_string()
                 })?;
@@ -366,8 +368,8 @@ fn resolve_openai_base_url(cfg: &Value) -> Option<String> {
         })
 }
 
-fn resolve_anthropic_media_key(cfg: &Value) -> Option<String> {
-    env::var("ANTHROPIC_API_KEY")
+fn resolve_anthropic_media_key(cfg: &Value) -> Result<Option<String>, String> {
+    if let Some(api_key) = env::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
         .or_else(|| {
@@ -377,28 +379,53 @@ fn resolve_anthropic_media_key(cfg: &Value) -> Option<String> {
                 .filter(|k| !k.is_empty())
                 .map(|k| k.to_string())
         })
-        .or_else(|| {
-            let profile_id = cfg
-                .get("anthropic")
-                .and_then(|v| v.get("authProfile"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            if !crate::auth::profiles::profile_store_encryption_enabled_from_env() {
-                return None;
-            }
-            let state_dir = crate::paths::resolve_state_dir();
-            let store = crate::auth::profiles::ProfileStore::from_env(state_dir).ok()?;
-            store.load().ok()?;
-            let profile = store.get(profile_id)?;
-            if profile.provider != crate::auth::profiles::OAuthProvider::Anthropic
-                || profile.credential_kind
-                    != crate::auth::profiles::AuthProfileCredentialKind::Token
-            {
-                return None;
-            }
-            profile.provider_token().map(|token| token.to_string())
-        })
+    {
+        return Ok(Some(api_key));
+    }
+
+    let Some(profile_id) = cfg
+        .get("anthropic")
+        .and_then(|v| v.get("authProfile"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if !crate::auth::profiles::profile_store_encryption_enabled_from_env() {
+        return Err(
+            "Anthropic auth profile is configured, but CARAPACE_CONFIG_PASSWORD is not set."
+                .to_string(),
+        );
+    }
+
+    let state_dir = crate::paths::resolve_state_dir();
+    let store = crate::auth::profiles::ProfileStore::from_env(state_dir)
+        .map_err(|err| format!("failed to open Anthropic auth profile store: {err}"))?;
+    store
+        .load()
+        .map_err(|err| format!("failed to load Anthropic auth profile store: {err}"))?;
+    let profile = store.get(profile_id).ok_or_else(|| {
+        format!("configured Anthropic auth profile \"{profile_id}\" was not found")
+    })?;
+    if profile.provider != crate::auth::profiles::OAuthProvider::Anthropic {
+        return Err(format!(
+            "configured Anthropic auth profile \"{profile_id}\" belongs to {}",
+            profile.provider
+        ));
+    }
+    if profile.credential_kind != crate::auth::profiles::AuthProfileCredentialKind::Token {
+        return Err(format!(
+            "configured Anthropic auth profile \"{profile_id}\" is not token-backed"
+        ));
+    }
+
+    profile.provider_token().map(|token| Some(token.to_string())).ok_or_else(|| {
+        format!(
+            "configured Anthropic auth profile \"{profile_id}\" has no usable token; check CARAPACE_CONFIG_PASSWORD and the stored profile"
+        )
+    })
 }
 
 fn resolve_anthropic_base_url(cfg: &Value) -> Option<String> {
@@ -1142,6 +1169,9 @@ fn resolve_sessions_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::profiles::{
+        AuthProfile, AuthProfileCredentialKind, OAuthProvider, ProfileStore,
+    };
     use crate::plugins::tools::ToolInvokeContext;
     use serde_json::json;
     use std::ffi::OsString;
@@ -1538,6 +1568,45 @@ mod tests {
             ToolInvokeResult::Error { .. } => {}
             _ => panic!("expected error for unsupported provider"),
         }
+    }
+
+    #[test]
+    fn test_resolve_anthropic_media_key_surfaces_unusable_auth_profile() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::tempdir().unwrap();
+        let _state_dir = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            temp.path().to_str().expect("state dir path"),
+        );
+
+        let store = ProfileStore::with_encryption(temp.path().to_path_buf(), b"correct-password")
+            .expect("encrypted profile store");
+        store
+            .add(AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 1,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "wrong-password");
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
+        });
+
+        let err = resolve_anthropic_media_key(&cfg).expect_err("wrong password should surface");
+        assert!(err.contains("has no usable token"));
+        assert!(err.contains("CARAPACE_CONFIG_PASSWORD"));
     }
 
     #[test]

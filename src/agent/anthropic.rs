@@ -51,17 +51,21 @@ impl std::fmt::Debug for AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    fn build_client() -> Result<reqwest::Client, AgentError> {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))
+    }
+
     pub fn new(api_key: String) -> Result<Self, AgentError> {
         if api_key.trim().is_empty() {
             return Err(AgentError::InvalidApiKey(
                 "API key must not be empty".to_string(),
             ));
         }
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
+        let client = Self::build_client()?;
         Ok(Self {
             client,
             auth: AnthropicAuth::ApiKey(api_key),
@@ -78,11 +82,7 @@ impl AnthropicProvider {
                 "Anthropic auth profile ID must not be empty".to_string(),
             ));
         }
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
+        let client = Self::build_client()?;
         Ok(Self {
             client,
             auth: AnthropicAuth::AuthProfileToken {
