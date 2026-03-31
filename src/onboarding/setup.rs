@@ -642,7 +642,7 @@ fn detect_auth_mode(cfg: &Value, provider: SetupProvider) -> Option<SetupAuthMod
             let has_api_key = config_string(cfg, &["anthropic", "apiKey"]).is_some();
             let has_auth_profile = config_string(cfg, &["anthropic", "authProfile"]).is_some();
             match (has_api_key, has_auth_profile) {
-                (true, false) => Some(SetupAuthMode::ApiKey),
+                (true, false) | (true, true) => Some(SetupAuthMode::ApiKey),
                 (false, true) => Some(SetupAuthMode::SetupToken),
                 _ => None,
             }
@@ -1328,6 +1328,21 @@ mod tests {
                 && check
                     .detail
                     .contains("runtime will prefer `anthropic.apiKey`")));
+    }
+
+    #[test]
+    fn test_detect_auth_mode_prefers_anthropic_api_key_when_both_paths_configured() {
+        let cfg = json!({
+            "anthropic": {
+                "apiKey": "${ANTHROPIC_API_KEY}",
+                "authProfile": "anthropic:default"
+            }
+        });
+
+        assert_eq!(
+            detect_auth_mode(&cfg, SetupProvider::Anthropic),
+            Some(SetupAuthMode::ApiKey)
+        );
     }
 
     #[test]

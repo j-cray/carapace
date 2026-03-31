@@ -257,7 +257,10 @@ impl AuthProfile {
             AuthProfileCredentialKind::Token => self
                 .token
                 .as_ref()
-                .map(|value| !value.trim().is_empty())
+                .map(|value| {
+                    let trimmed = value.trim();
+                    !trimmed.is_empty() && !is_encrypted(trimmed)
+                })
                 .unwrap_or(false),
         }
     }
@@ -283,7 +286,7 @@ impl AuthProfile {
                 .token
                 .as_deref()
                 .map(str::trim)
-                .filter(|value| !value.is_empty()),
+                .filter(|value| !value.is_empty() && !is_encrypted(value)),
         }
     }
 }
@@ -1082,10 +1085,9 @@ impl ProfileStore {
                             Ok(plaintext) => *token = plaintext,
                             Err(e) => {
                                 tracing::warn!(
-                                    "Failed to decrypt token credential for profile: {}; clearing token to prevent opaque downstream errors",
+                                    "Failed to decrypt token credential for profile: {}; preserving encrypted value so later saves do not destroy it",
                                     e
                                 );
-                                token.clear();
                             }
                         }
                     }
@@ -1266,6 +1268,17 @@ pub fn resolve_anthropic_profile_token(
             "configured Anthropic auth profile \"{profile_id}\" is not token-backed"
         ));
     }
+    if profile
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(is_encrypted)
+    {
+        return Err(format!(
+            "configured Anthropic auth profile \"{profile_id}\" could not decrypt the stored token; check CARAPACE_CONFIG_PASSWORD"
+        ));
+    }
     profile.provider_token().map(str::to_string).ok_or_else(|| {
         format!("configured Anthropic auth profile \"{profile_id}\" has no usable token")
     })
@@ -1394,6 +1407,29 @@ mod tests {
             credential_kind: AuthProfileCredentialKind::OAuth,
             tokens: Some(sample_tokens()),
             token: None,
+            oauth_provider_config: None,
+        }
+    }
+
+    fn sample_token_profile(id: &str, provider: OAuthProvider, token: &str) -> AuthProfile {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        AuthProfile {
+            id: id.to_string(),
+            name: format!("Token Profile {}", id),
+            provider,
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            created_at_ms: now_ms,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some(token.to_string()),
             oauth_provider_config: None,
         }
     }
@@ -2289,5 +2325,48 @@ mod tests {
         let loaded = store2.get("nrt-1").unwrap();
         assert!(oauth_tokens(&loaded).access_token == "access-123");
         assert!(oauth_tokens(&loaded).refresh_token.is_none());
+    }
+
+    #[test]
+    fn test_encrypted_token_profile_wrong_password_preserves_ciphertext() {
+        let dir = tempdir().unwrap();
+        let password = random_password();
+        let mut wrong_password = password.clone();
+        wrong_password[0] ^= 0xFF;
+
+        {
+            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
+            store
+                .add(sample_token_profile(
+                    "anthropic:default",
+                    OAuthProvider::Anthropic,
+                    "token-value-123",
+                ))
+                .unwrap();
+        }
+
+        let state_path = dir.path().join("auth_profiles.json");
+        let raw_before = std::fs::read_to_string(&state_path).unwrap();
+        let saved_before: serde_json::Value = serde_json::from_str(&raw_before).unwrap();
+        let ciphertext_before = saved_before[0]["token"].as_str().unwrap().to_string();
+        assert!(ciphertext_before.starts_with("enc:v1:"));
+
+        let store =
+            ProfileStore::with_encryption(dir.path().to_path_buf(), &wrong_password).unwrap();
+        store.load().unwrap();
+
+        let loaded = store.get("anthropic:default").unwrap();
+        assert!(!loaded.to_summary().token_valid);
+
+        let err = resolve_anthropic_profile_token(&store, "anthropic:default").unwrap_err();
+        assert!(err.contains("could not decrypt the stored token"));
+        assert!(err.contains("CARAPACE_CONFIG_PASSWORD"));
+
+        store.update_last_used("anthropic:default");
+
+        let raw_after = std::fs::read_to_string(&state_path).unwrap();
+        let saved_after: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
+        let ciphertext_after = saved_after[0]["token"].as_str().unwrap();
+        assert_eq!(ciphertext_after, ciphertext_before);
     }
 }

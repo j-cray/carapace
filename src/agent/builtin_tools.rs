@@ -1598,7 +1598,7 @@ mod tests {
         });
 
         let err = resolve_anthropic_media_key(&cfg).expect_err("wrong password should surface");
-        assert!(err.contains("has no usable token"));
+        assert!(err.contains("could not decrypt the stored token"));
         assert!(err.contains("CARAPACE_CONFIG_PASSWORD"));
     }
 
