@@ -5120,6 +5120,10 @@ fn vertex_validation_failure_remediation(
             "choose a supported Google Gemini model such as `vertex:gemini-2.5-flash`, then rerun `cara setup --force --provider vertex`"
                 .to_string()
         }
+        crate::agent::vertex::VertexSetupValidationError::ClientInit => {
+            "check local HTTP client and TLS runtime availability, then rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
         crate::agent::vertex::VertexSetupValidationError::AuthUnavailable => {
             "run `gcloud auth application-default login` or use a metadata-backed Google Cloud service account, then rerun `cara setup --force --provider vertex`"
                 .to_string()
@@ -6760,34 +6764,67 @@ fn configure_vertex_provider_interactive(
     let effective_model = model
         .as_ref()
         .and_then(|value| value.effective_value.clone());
-    let validation_input = project_id
-        .effective_value
-        .clone()
-        .zip(location.effective_value.clone())
-        .map(
-            |(project_id, location)| crate::onboarding::vertex::VertexSetupInput {
-                project_id,
-                location,
-                route,
-                model: effective_model.clone(),
-            },
-        );
-    if let Some(validation_input) = validation_input {
-        if matches!(route, crate::onboarding::vertex::VertexModelRoute::Default)
-            && effective_model.is_none()
-        {
-            result.observed_checks.push(crate::onboarding::setup::SetupCheck::validation_skip(
-                "Live provider validation",
-                "Vertex live validation was skipped because `vertex:default` still resolves `vertex.model` from `VERTEX_MODEL` later",
-                Some(
-                    "set `VERTEX_MODEL` in the same shell and run `cara verify --outcome local-chat` once the default model is available".to_string(),
+    let mut deferred_env_vars = Vec::new();
+    if project_id.effective_value.is_none() {
+        deferred_env_vars.push("`VERTEX_PROJECT_ID`");
+    }
+    if location.effective_value.is_none() {
+        deferred_env_vars.push("`VERTEX_LOCATION`");
+    }
+    if matches!(route, crate::onboarding::vertex::VertexModelRoute::Default)
+        && effective_model.is_none()
+    {
+        deferred_env_vars.push("`VERTEX_MODEL`");
+    }
+
+    if deferred_env_vars.is_empty() {
+        let validation_input = crate::onboarding::vertex::VertexSetupInput {
+            project_id: project_id
+                .effective_value
+                .clone()
+                .expect("deferred Vertex project should be skipped before validation"),
+            location: location
+                .effective_value
+                .clone()
+                .expect("deferred Vertex location should be skipped before validation"),
+            route,
+            model: effective_model.clone(),
+        };
+        result
+            .observed_checks
+            .push(validate_vertex_provider_interactive(&validation_input)?);
+    } else {
+        let (detail, remediation) = match deferred_env_vars.as_slice() {
+            ["`VERTEX_MODEL`"] => (
+                "Vertex live validation was skipped because `vertex:default` still resolves `vertex.model` from `VERTEX_MODEL` later".to_string(),
+                "set `VERTEX_MODEL` in the same shell and run `cara verify --outcome local-chat` once the default model is available".to_string(),
+            ),
+            [env_var] => (
+                format!(
+                    "Vertex live validation was skipped because {env_var} still resolves from the environment later"
                 ),
+                format!(
+                    "set {env_var} in the same shell and run `cara verify --outcome local-chat` once it is available"
+                ),
+            ),
+            deferred => (
+                format!(
+                    "Vertex live validation was skipped because {} still resolve from the environment later",
+                    deferred.join(", ")
+                ),
+                format!(
+                    "set {} in the same shell and run `cara verify --outcome local-chat` once they are available",
+                    deferred.join(", ")
+                ),
+            ),
+        };
+        result
+            .observed_checks
+            .push(crate::onboarding::setup::SetupCheck::validation_skip(
+                "Live provider validation",
+                detail,
+                Some(remediation),
             ));
-        } else {
-            result
-                .observed_checks
-                .push(validate_vertex_provider_interactive(&validation_input)?);
-        }
     }
 
     crate::onboarding::vertex::write_vertex_config(config, &config_input)?;
@@ -11726,6 +11763,51 @@ mod tests {
         assert_eq!(
             result.observed_checks[0].detail,
             "Vertex live validation was skipped because `vertex:default` still resolves `vertex.model` from `VERTEX_MODEL` later"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_with_unresolved_project_skips_validation() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "us-central1".to_string(),
+                "default-route".to_string(),
+                "gemini-2.5-flash".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+                .expect("interactive Vertex setup");
+
+        assert_eq!(config["vertex"]["projectId"], "${VERTEX_PROJECT_ID}");
+        assert_eq!(config["vertex"]["location"], "us-central1");
+        assert_eq!(config["vertex"]["model"], "gemini-2.5-flash");
+        assert_eq!(config["agents"]["defaults"]["model"], "vertex:default");
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            result.observed_checks[0].status,
+            crate::onboarding::setup::SetupCheckStatus::Skip
+        );
+        assert_eq!(
+            result.observed_checks[0].detail,
+            "Vertex live validation was skipped because `VERTEX_PROJECT_ID` still resolves from the environment later"
+        );
+        assert_eq!(
+            result.observed_checks[0].remediation.as_deref(),
+            Some(
+                "set `VERTEX_PROJECT_ID` in the same shell and run `cara verify --outcome local-chat` once it is available"
+            )
         );
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);

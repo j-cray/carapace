@@ -24,6 +24,7 @@ pub enum VertexSetupValidationError {
     InvalidLocation,
     MissingDefaultModel,
     UnsupportedModel,
+    ClientInit,
     AuthUnavailable,
     AccessDenied,
     Unavailable,
@@ -42,6 +43,9 @@ impl std::fmt::Display for VertexSetupValidationError {
             Self::UnsupportedModel => {
                 "Unsupported Vertex model. This provider currently supports Google Gemini models only."
             }
+            Self::ClientInit => {
+                "Vertex validation could not initialize the local HTTP client."
+            }
             Self::AuthUnavailable => {
                 "Vertex authentication is unavailable from both gcloud and the metadata server."
             }
@@ -59,6 +63,39 @@ impl std::fmt::Display for VertexSetupValidationError {
 }
 
 impl std::error::Error for VertexSetupValidationError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VertexProviderInitError {
+    InvalidProjectId,
+    InvalidLocation,
+    ClientInit,
+}
+
+impl From<VertexProviderInitError> for AgentError {
+    fn from(err: VertexProviderInitError) -> Self {
+        match err {
+            VertexProviderInitError::InvalidProjectId => {
+                AgentError::Provider(VertexSetupValidationError::InvalidProjectId.to_string())
+            }
+            VertexProviderInitError::InvalidLocation => {
+                AgentError::Provider(VertexSetupValidationError::InvalidLocation.to_string())
+            }
+            VertexProviderInitError::ClientInit => {
+                AgentError::Provider(VertexSetupValidationError::ClientInit.to_string())
+            }
+        }
+    }
+}
+
+impl From<VertexProviderInitError> for VertexSetupValidationError {
+    fn from(err: VertexProviderInitError) -> Self {
+        match err {
+            VertexProviderInitError::InvalidProjectId => Self::InvalidProjectId,
+            VertexProviderInitError::InvalidLocation => Self::InvalidLocation,
+            VertexProviderInitError::ClientInit => Self::ClientInit,
+        }
+    }
+}
 
 // =================================================================================================
 // Authentication
@@ -112,12 +149,12 @@ struct MetadataProvider {
 }
 
 impl MetadataProvider {
-    fn new() -> Result<Self, AgentError> {
+    fn new() -> Result<Self, VertexProviderInitError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
             .build()
-            .map_err(|e| AgentError::Provider(format!("failed to build metadata client: {e}")))?;
+            .map_err(|_| VertexProviderInitError::ClientInit)?;
         Ok(Self { client })
     }
 }
@@ -406,13 +443,13 @@ impl std::fmt::Debug for VertexProvider {
 }
 
 impl VertexProvider {
-    pub fn new(
+    fn try_new(
         project_id: String,
         location: String,
         default_model: Option<String>,
-    ) -> Result<Self, AgentError> {
-        validate_project_id(&project_id).map_err(|err| AgentError::Provider(err.to_string()))?;
-        validate_location(&location).map_err(|err| AgentError::Provider(err.to_string()))?;
+    ) -> Result<Self, VertexProviderInitError> {
+        validate_project_id(&project_id).map_err(|_| VertexProviderInitError::InvalidProjectId)?;
+        validate_location(&location).map_err(|_| VertexProviderInitError::InvalidLocation)?;
 
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
         let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new()?);
@@ -421,7 +458,7 @@ impl VertexProvider {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .build()
-            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
+            .map_err(|_| VertexProviderInitError::ClientInit)?;
 
         Ok(Self {
             client,
@@ -431,6 +468,14 @@ impl VertexProvider {
             token_cache: Arc::new(RwLock::new(None)),
             default_model,
         })
+    }
+
+    pub fn new(
+        project_id: String,
+        location: String,
+        default_model: Option<String>,
+    ) -> Result<Self, AgentError> {
+        Self::try_new(project_id, location, default_model).map_err(AgentError::from)
     }
 
     pub async fn get_token(&self) -> Result<String, AgentError> {
@@ -562,10 +607,8 @@ pub async fn validate_vertex_setup(
     route_model: String,
     default_model: Option<String>,
 ) -> Result<(), VertexSetupValidationError> {
-    validate_project_id(&project_id)?;
-    validate_location(&location)?;
-    let provider = VertexProvider::new(project_id, location, default_model)
-        .map_err(|_| VertexSetupValidationError::Rejected)?;
+    let provider = VertexProvider::try_new(project_id, location, default_model)
+        .map_err(VertexSetupValidationError::from)?;
     let target = provider.resolve_model_target(&route_model)?;
     let token = provider
         .get_token()
@@ -598,7 +641,7 @@ struct FallbackTokenProvider {
 }
 
 impl FallbackTokenProvider {
-    fn new() -> Result<Self, AgentError> {
+    fn new() -> Result<Self, VertexProviderInitError> {
         Ok(Self {
             primary: GCloudCliProvider,
             fallback: MetadataProvider::new()?,
@@ -1068,6 +1111,22 @@ mod tests {
         // Invalid location (invalid characters)
         assert!(
             VertexProvider::new("my-project".to_string(), "us_central1".to_string(), None).is_err()
+        );
+    }
+
+    #[test]
+    fn test_vertex_provider_init_error_maps_to_setup_validation_error() {
+        assert_eq!(
+            VertexSetupValidationError::from(VertexProviderInitError::InvalidProjectId),
+            VertexSetupValidationError::InvalidProjectId
+        );
+        assert_eq!(
+            VertexSetupValidationError::from(VertexProviderInitError::InvalidLocation),
+            VertexSetupValidationError::InvalidLocation
+        );
+        assert_eq!(
+            VertexSetupValidationError::from(VertexProviderInitError::ClientInit),
+            VertexSetupValidationError::ClientInit
         );
     }
 
