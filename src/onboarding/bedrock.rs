@@ -209,11 +209,12 @@ pub async fn validate_bedrock_credentials(
                 Some(body),
             ),
             Err(e) => (
-                SetupCheck::validation_pass(
+                SetupCheck::validation_skip(
                     "Bedrock credentials",
                     format!(
                         "AWS credentials are valid (HTTP 200) but response parsing failed: {e}"
                     ),
+                    Some("Run `cara verify` after setup to confirm model access.".to_string()),
                 ),
                 None,
             ),
@@ -271,12 +272,7 @@ pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value)
                 .and_then(|v| v.get("status"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("UNKNOWN");
-            if status == "ACTIVE" {
-                return SetupCheck::validation_pass(
-                    "Model access",
-                    format!("Model `{bare_model}` is active and accessible"),
-                );
-            } else {
+            if status != "ACTIVE" {
                 return SetupCheck::validation_fail(
                     "Model access",
                     format!("Model `{bare_model}` found but lifecycle status is `{status}`"),
@@ -285,6 +281,29 @@ pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value)
                         .to_string(),
                 );
             }
+
+            let supports_on_demand = model
+                .get("inferenceTypesSupported")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("ON_DEMAND")));
+
+            if !supports_on_demand {
+                return SetupCheck::validation_fail(
+                    "Model access",
+                    format!(
+                        "Model `{bare_model}` is active but does not support on-demand inference"
+                    ),
+                    "This model requires provisioned throughput. Choose a model \
+                     that supports on-demand inference, or provision throughput \
+                     in the AWS console."
+                        .to_string(),
+                );
+            }
+
+            return SetupCheck::validation_pass(
+                "Model access",
+                format!("Model `{bare_model}` is active and supports on-demand inference"),
+            );
         }
     }
 
@@ -454,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn check_model_access_found_active() {
+    fn check_model_access_active_missing_inference_types() {
         let body = json!({
             "modelSummaries": [
                 {
@@ -466,7 +485,7 @@ mod tests {
         let check = check_model_access("bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0", &body);
         assert_eq!(
             check.status,
-            crate::onboarding::setup::SetupCheckStatus::Pass
+            crate::onboarding::setup::SetupCheckStatus::Fail
         );
     }
 
@@ -536,5 +555,49 @@ mod tests {
     fn classify_error_region_404() {
         let (detail, _) = classify_api_error(404, "", "mars-west-1");
         assert!(detail.contains("mars-west-1"));
+    }
+
+    #[test]
+    fn classify_error_401() {
+        let (detail, _) = classify_api_error(401, "", "us-east-1");
+        assert!(detail.contains("401"));
+    }
+
+    #[test]
+    fn classify_error_unknown_status() {
+        let (detail, _) = classify_api_error(503, "", "us-east-1");
+        assert!(detail.contains("503"));
+    }
+
+    #[test]
+    fn check_model_access_active_on_demand() {
+        let body = json!({
+            "modelSummaries": [{
+                "modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+                "modelLifecycle": { "status": "ACTIVE" },
+                "inferenceTypesSupported": ["ON_DEMAND"]
+            }]
+        });
+        let check = check_model_access("bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0", &body);
+        assert_eq!(
+            check.status,
+            crate::onboarding::setup::SetupCheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn check_model_access_active_provisioned_only() {
+        let body = json!({
+            "modelSummaries": [{
+                "modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+                "modelLifecycle": { "status": "ACTIVE" },
+                "inferenceTypesSupported": ["PROVISIONED"]
+            }]
+        });
+        let check = check_model_access("bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0", &body);
+        assert_eq!(
+            check.status,
+            crate::onboarding::setup::SetupCheckStatus::Fail
+        );
     }
 }

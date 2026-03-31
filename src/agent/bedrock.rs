@@ -770,6 +770,10 @@ pub(crate) fn sign_aws_v4_request(
     body: &[u8],
     datetime: &str,
 ) -> Vec<(String, String)> {
+    debug_assert!(
+        datetime.len() >= 16,
+        "datetime must be a full SigV4 timestamp (YYYYMMDDTHHMMSSZ), got {datetime:?}"
+    );
     let date = &datetime[..8]; // YYYYMMDD
     let payload_hash = hex_sha256(body);
 
