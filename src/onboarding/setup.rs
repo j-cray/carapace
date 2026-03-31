@@ -574,7 +574,7 @@ fn detect_auth_mode(cfg: &Value, provider: SetupProvider) -> Option<SetupAuthMod
     }
 }
 
-const LOCAL_CHAT_VERIFY_COMMAND: &str = "cara verify --outcome local-chat";
+pub(crate) const LOCAL_CHAT_VERIFY_COMMAND: &str = "cara verify --outcome local-chat";
 
 enum SetupFollowUp<'a> {
     Rerun { command: &'a str, action: String },
@@ -1241,6 +1241,37 @@ mod tests {
         assert!(assessment.checks.iter().any(|check| {
             check.name == "Vertex default model" && check.status == SetupCheckStatus::Fail
         }));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_vertex_default_model_reports_missing_env_placeholder() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "vertex:default" } },
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "${VERTEX_DEFAULT_MODEL}"
+            }
+        });
+        let mut env = ScopedEnv::new();
+        env.unset("VERTEX_DEFAULT_MODEL");
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Vertex, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        let check = assessment
+            .checks
+            .iter()
+            .find(|check| check.name == "Vertex default model")
+            .expect("vertex default model check");
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert!(check.detail.contains("VERTEX_DEFAULT_MODEL"));
+        assert!(check
+            .remediation
+            .as_deref()
+            .expect("vertex default model remediation")
+            .contains("VERTEX_DEFAULT_MODEL"));
     }
 
     #[test]
