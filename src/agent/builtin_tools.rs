@@ -371,13 +371,14 @@ fn resolve_openai_base_url(cfg: &Value) -> Option<String> {
 fn resolve_anthropic_media_key(cfg: &Value) -> Result<Option<String>, String> {
     if let Some(api_key) = env::var("ANTHROPIC_API_KEY")
         .ok()
+        .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
         .or_else(|| {
             cfg.get("anthropic")
                 .and_then(|v| v.get("apiKey"))
                 .and_then(|v| v.as_str())
+                .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty())
-                .map(|k| k.to_string())
         })
     {
         return Ok(Some(api_key));
@@ -1599,6 +1600,49 @@ mod tests {
         let err = resolve_anthropic_media_key(&cfg).expect_err("wrong password should surface");
         assert!(err.contains("has no usable token"));
         assert!(err.contains("CARAPACE_CONFIG_PASSWORD"));
+    }
+
+    #[test]
+    fn test_resolve_anthropic_media_key_ignores_blank_api_key_when_auth_profile_present() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::tempdir().unwrap();
+        let _state_dir = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            temp.path().to_str().expect("state dir path"),
+        );
+
+        let password = format!(
+            "builtin-tools-test-password-{}",
+            crate::time::unix_now_ms_u64()
+        );
+        let store = ProfileStore::with_encryption(temp.path().to_path_buf(), password.as_bytes())
+            .expect("encrypted profile store");
+        store
+            .add(AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 1,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
+        let _blank_key = set_env_var_scoped("ANTHROPIC_API_KEY", "   ");
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
+        });
+
+        let key = resolve_anthropic_media_key(&cfg).expect("resolved key");
+        assert_eq!(key.as_deref(), Some("sk-ant-oat01-test-token"));
     }
 
     #[test]

@@ -25,6 +25,19 @@ fn resolve_anthropic_auth_profile_id(cfg: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn resolve_anthropic_api_key(cfg: &Value) -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .or_else(|| {
+            cfg.get("anthropic")
+                .and_then(|v| v.get("apiKey"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn resolve_google_auth_profile_id(cfg: &Value) -> Option<String> {
     cfg.get("google")
         .and_then(|v| v.get("authProfile"))
@@ -503,12 +516,7 @@ fn try_build_ollama_provider(
 /// Returns `None` if no providers are configured.
 pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std::error::Error>> {
     // Anthropic
-    let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
-        cfg.get("anthropic")
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let anthropic_api_key = resolve_anthropic_api_key(cfg);
     let anthropic_auth_profile = resolve_anthropic_auth_profile_id(cfg);
     let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
         cfg.get("anthropic")
@@ -719,12 +727,7 @@ pub struct ProviderFingerprint {
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
 pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
-        cfg.get("anthropic")
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let anthropic_key = resolve_anthropic_api_key(cfg);
     let anthropic_auth_profile_fingerprint = resolve_anthropic_auth_profile_fingerprint(cfg);
     let anthropic_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
         cfg.get("anthropic")
@@ -1452,6 +1455,46 @@ mod tests {
             assert!(
                 providers.is_some(),
                 "Anthropic auth profile should build a usable provider set"
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_providers_ignores_blank_anthropic_api_key_when_auth_profile_present() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+            let _blank_key = set_env_var_scoped("ANTHROPIC_API_KEY", "   ");
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let providers = build_providers(&cfg).expect("build providers");
+            assert!(
+                providers.is_some(),
+                "blank ANTHROPIC_API_KEY should not mask auth-profile Anthropic setup"
             );
         });
     }

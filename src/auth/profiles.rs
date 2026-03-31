@@ -1257,7 +1257,7 @@ pub fn resolve_anthropic_profile_token(
     })?;
     if profile.provider != OAuthProvider::Anthropic {
         return Err(format!(
-            "configured Anthropic auth profile \"{profile_id}\" belongs to {}",
+            "configured Anthropic auth profile \"{profile_id}\" belongs to {}, not anthropic",
             profile.provider
         ));
     }
