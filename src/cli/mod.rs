@@ -7404,13 +7404,16 @@ pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Err
         return Ok(());
     }
 
-    // Build and write config.
-    let config = plan.build_carapace_config();
+    // Build and write config with restricted permissions.
+    let mut config = plan.build_carapace_config();
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    if let Err(e) = config::seal_config_secrets(&mut config) {
+        eprintln!("Warning: could not encrypt secrets: {e}");
+    }
     let content = json5::to_string(&config)?;
-    std::fs::write(&config_path, &content)?;
+    write_config_restricted(&config_path, &content)?;
 
     println!("\nConfig written to {}", config_path.display());
     println!();
@@ -7423,11 +7426,25 @@ pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Err
 }
 
 fn truncate_display(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
     }
+}
+
+fn write_config_restricted(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Run the `setup` subcommand -- interactive first-run wizard.

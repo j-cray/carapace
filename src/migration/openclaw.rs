@@ -255,33 +255,14 @@ fn extract_agent_defaults(config: &Value, plan: &mut ImportPlan) {
 }
 
 fn extract_channel_tokens(config: &Value, plan: &mut ImportPlan) {
-    let channel_mappings: &[(&[&str], &str, &str)] = &[
-        (
-            &["channels", "telegram", "botToken"],
-            "telegram.botToken",
-            "channels.telegram.botToken",
-        ),
-        (
-            &["channels", "discord", "token"],
-            "discord.botToken",
-            "channels.discord.token",
-        ),
-        (
-            &["channels", "slack", "botToken"],
-            "slack.botToken",
-            "channels.slack.botToken",
-        ),
+    let channel_mappings: &[(&[&str], &str)] = &[
+        (&["channels", "telegram", "botToken"], "telegram.botToken"),
+        (&["channels", "discord", "token"], "discord.botToken"),
+        (&["channels", "slack", "botToken"], "slack.botToken"),
     ];
 
-    for (path, carapace_key, openclaw_path) in channel_mappings {
+    for (path, carapace_key) in channel_mappings {
         try_map_secret(config, path, carapace_key, plan);
-        // If already mapped by try_map_secret, the openclaw_path is set there.
-        // Fixup the openclaw_path for display.
-        if let Some(last) = plan.mappings.last_mut() {
-            if last.carapace_key == *carapace_key {
-                last.openclaw_path = openclaw_path.to_string();
-            }
-        }
     }
 }
 
@@ -332,7 +313,11 @@ fn extract_env_block(config: &Value, plan: &mut ImportPlan) {
 fn extract_dotenv_keys(env_path: &Path, plan: &mut ImportPlan) {
     let content = match std::fs::read_to_string(env_path) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            plan.warnings
+                .push(format!("Failed to read {}: {e}", env_path.display()));
+            return;
+        }
     };
 
     for line in content.lines() {
@@ -342,7 +327,12 @@ fn extract_dotenv_keys(env_path: &Path, plan: &mut ImportPlan) {
         }
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
-            let value = value.trim().trim_matches('"').trim_matches('\'');
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
             if value.is_empty() || value.starts_with("change-me") {
                 continue;
             }
@@ -481,6 +471,8 @@ fn is_importable_env_key(key: &str) -> bool {
             | "GOOGLE_API_KEY"
             | "GEMINI_API_KEY"
             | "VENICE_API_KEY"
+            | "OLLAMA_BASE_URL"
+            | "OLLAMA_API_KEY"
             | "TELEGRAM_BOT_TOKEN"
             | "DISCORD_BOT_TOKEN"
             | "SLACK_BOT_TOKEN"
@@ -493,6 +485,8 @@ fn env_key_to_carapace_config(key: &str) -> Option<&'static str> {
         "OPENAI_API_KEY" => Some("openai.apiKey"),
         "GOOGLE_API_KEY" | "GEMINI_API_KEY" => Some("google.apiKey"),
         "VENICE_API_KEY" => Some("venice.apiKey"),
+        "OLLAMA_BASE_URL" => Some("providers.ollama.baseUrl"),
+        "OLLAMA_API_KEY" => Some("providers.ollama.apiKey"),
         "TELEGRAM_BOT_TOKEN" => Some("telegram.botToken"),
         "DISCORD_BOT_TOKEN" => Some("discord.botToken"),
         "SLACK_BOT_TOKEN" => Some("slack.botToken"),
