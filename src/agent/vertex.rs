@@ -1174,6 +1174,18 @@ mod tests {
     #[test]
     fn test_classify_vertex_validation_probe_status() {
         assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::OK),
+            Ok(())
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::UNAUTHORIZED),
+            Err(VertexSetupValidationError::AccessDenied)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::FORBIDDEN),
+            Err(VertexSetupValidationError::AccessDenied)
+        );
+        assert_eq!(
             classify_vertex_validation_probe_status(StatusCode::TOO_MANY_REQUESTS),
             Err(VertexSetupValidationError::RateLimited)
         );

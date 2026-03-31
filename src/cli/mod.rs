@@ -6788,11 +6788,13 @@ fn configure_vertex_provider_interactive(
                 "Vertex location prompt must produce a concrete value before validation",
             )
         })?;
+        let effective_project_id = project_id.effective_value.clone().ok_or_else(|| {
+            std::io::Error::other(
+                "Vertex project prompt must produce a concrete value before validation",
+            )
+        })?;
         let validation_input = crate::onboarding::vertex::VertexSetupInput {
-            project_id: project_id
-                .effective_value
-                .clone()
-                .expect("deferred Vertex project should be skipped before validation"),
+            project_id: effective_project_id,
             location: effective_location,
             route,
             model: effective_model.clone(),
