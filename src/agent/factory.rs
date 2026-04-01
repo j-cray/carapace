@@ -1607,6 +1607,48 @@ mod tests {
     }
 
     #[test]
+    fn test_build_providers_rejects_anthropic_auth_profile_with_oauth_credential_kind() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic oauth profile".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
+                    access_token: "access-token".to_string(),
+                    refresh_token: Some("refresh-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(u64::MAX),
+                    scope: None,
+                }),
+                token: None,
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let err = build_providers(&cfg).expect_err("oauth-backed profile should fail fast");
+            assert!(err.to_string().contains("is not token-backed"));
+        });
+    }
+
+    #[test]
     fn test_resolve_google_oauth_runtime_config_uses_stored_redirect_uri_when_missing() {
         with_clean_provider_env(|| {
             let temp = tempfile::tempdir().expect("tempdir");

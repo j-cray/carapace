@@ -2331,8 +2331,12 @@ mod tests {
     fn test_encrypted_token_profile_wrong_password_preserves_ciphertext() {
         let dir = tempdir().unwrap();
         let password = random_password();
-        let mut wrong_password = password.clone();
-        wrong_password[0] ^= 0xFF;
+        let wrong_password = loop {
+            let candidate = random_password();
+            if candidate != password {
+                break candidate;
+            }
+        };
 
         {
             let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
