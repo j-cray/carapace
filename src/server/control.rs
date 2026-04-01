@@ -2382,12 +2382,22 @@ mod tests {
 
         let json = serde_json::to_value(&response).expect("apply response should serialize");
         assert_eq!(json["ok"], true);
-        assert_eq!(json["applied"]["mode"], "oauth");
+        let applied = json
+            .get("applied")
+            .and_then(|value| value.as_object())
+            .expect("applied should be an object");
+        assert_eq!(applied.get("mode"), Some(&serde_json::json!("oauth")));
+        // The applied wire shape should be narrowed to only { mode: ... }.
+        assert_eq!(
+            applied.len(),
+            1,
+            "applied should only contain the `mode` key"
+        );
         assert_eq!(json["providerStatus"]["provider"], "codex");
-        assert!(json["applied"]["profileId"].is_null());
-        assert!(json["applied"]["authProfile"].is_null());
-        assert!(json["applied"]["provider"].is_null());
-        assert!(json["applied"]["model"].is_null());
+        assert!(applied.get("profileId").is_none());
+        assert!(applied.get("authProfile").is_none());
+        assert!(applied.get("provider").is_none());
+        assert!(applied.get("model").is_none());
     }
 
     #[test]
