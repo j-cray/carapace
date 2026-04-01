@@ -35,6 +35,7 @@ use crate::agent;
 use crate::auth::profiles::{
     AuthProfileCredentialKind, AuthProfileSummary, OAuthProvider, ProfileStore,
 };
+use crate::config::secrets::is_encrypted;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupProvider {
@@ -872,14 +873,14 @@ fn auth_profile_summary_check(
     setup_command: Option<&str>,
 ) -> (SetupCheck, Option<AuthProfileSummary>) {
     match load_profile_summary(state_dir, profile_id) {
-        Ok(Some(summary)) => {
-            if summary.provider != expected_provider {
+        Ok(Some(loaded)) => {
+            if loaded.summary.provider != expected_provider {
                 (
                     SetupCheck::fail(
                         label,
                         format!(
                             "stored profile `{profile_id}` belongs to {}, not {}",
-                            summary.provider, expected_provider
+                            loaded.summary.provider, expected_provider
                         ),
                         setup_follow_up(provider_setup_follow_up(
                             setup_command,
@@ -889,13 +890,13 @@ fn auth_profile_summary_check(
                     ),
                     None,
                 )
-            } else if summary.credential_kind != expected_credential_kind {
+            } else if loaded.summary.credential_kind != expected_credential_kind {
                 (
                     SetupCheck::fail(
                         label,
                         format!(
                             "stored profile `{profile_id}` uses {} credentials, not {}",
-                            summary.credential_kind, expected_credential_kind
+                            loaded.summary.credential_kind, expected_credential_kind
                         ),
                         setup_follow_up(provider_setup_follow_up(
                             setup_command,
@@ -905,13 +906,20 @@ fn auth_profile_summary_check(
                     ),
                     None,
                 )
-            } else if summary.credential_kind == AuthProfileCredentialKind::Token
-                && !summary.token_valid
+            } else if loaded.summary.credential_kind == AuthProfileCredentialKind::Token
+                && !loaded.summary.token_valid
             {
+                let detail = if loaded.token_still_encrypted && profile_store_password_present() {
+                    format!(
+                        "stored profile `{profile_id}` could not decrypt the stored token; check CARAPACE_CONFIG_PASSWORD"
+                    )
+                } else {
+                    format!("stored profile `{profile_id}` has no usable token")
+                };
                 (
                     SetupCheck::fail(
                         label,
-                        format!("stored profile `{profile_id}` has no usable token"),
+                        detail,
                         setup_follow_up(provider_setup_follow_up(
                             setup_command,
                             "to store a fresh auth profile token",
@@ -921,11 +929,14 @@ fn auth_profile_summary_check(
                     None,
                 )
             } else {
-                let detail = match summary.email.as_deref() {
-                    Some(email) => format!("loaded `{}` ({email})", summary.name),
-                    None => format!("loaded `{}`", summary.name),
+                let detail = match loaded.summary.email.as_deref() {
+                    Some(email) => format!("loaded `{}` ({email})", loaded.summary.name),
+                    None => format!("loaded `{}`", loaded.summary.name),
                 };
-                (SetupCheck::validation_pass(label, detail), Some(summary))
+                (
+                    SetupCheck::validation_pass(label, detail),
+                    Some(loaded.summary),
+                )
             }
         }
         Ok(None) => (
@@ -955,6 +966,11 @@ fn auth_profile_summary_check(
             )
         }
     }
+}
+
+struct LoadedProfileSummary {
+    summary: AuthProfileSummary,
+    token_still_encrypted: bool,
 }
 
 fn configured_value_check(
@@ -1078,14 +1094,22 @@ where
 fn load_profile_summary(
     state_dir: &Path,
     profile_id: &str,
-) -> Result<Option<AuthProfileSummary>, String> {
+) -> Result<Option<LoadedProfileSummary>, String> {
     let store = if profile_store_password_present() {
         ProfileStore::from_env(state_dir.to_path_buf()).map_err(|err| err.to_string())?
     } else {
         ProfileStore::new(state_dir.to_path_buf())
     };
     store.load().map_err(|err| err.to_string())?;
-    Ok(store.get(profile_id).map(|profile| profile.to_summary()))
+    Ok(store.get(profile_id).map(|profile| LoadedProfileSummary {
+        token_still_encrypted: profile
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(is_encrypted),
+        summary: profile.to_summary(),
+    }))
 }
 
 fn profile_store_password_present() -> bool {
@@ -1302,6 +1326,53 @@ mod tests {
             .any(|check| check.name == "Anthropic auth profile"
                 && check.status == SetupCheckStatus::Fail
                 && check.detail.contains("has no usable token")));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_surfaces_wrong_password_for_anthropic_token_profile() {
+        let temp = TempDir::new().unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "correct-password");
+
+        {
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).unwrap();
+            store
+                .add(AuthProfile {
+                    id: "anthropic:default".to_string(),
+                    name: "Anthropic setup token".to_string(),
+                    provider: OAuthProvider::Anthropic,
+                    user_id: None,
+                    email: None,
+                    display_name: None,
+                    avatar_url: None,
+                    created_at_ms: 1,
+                    last_used_ms: Some(1),
+                    credential_kind: AuthProfileCredentialKind::Token,
+                    tokens: None,
+                    token: Some("sk-ant-oat01-token".to_string()),
+                    oauth_provider_config: None,
+                })
+                .unwrap();
+        }
+
+        env.set("CARAPACE_CONFIG_PASSWORD", "wrong-password");
+
+        let cfg = json!({
+            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "auth": { "profiles": { "enabled": true } },
+            "anthropic": { "authProfile": "anthropic:default" }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment
+            .checks
+            .iter()
+            .any(|check| check.name == "Anthropic auth profile"
+                && check.status == SetupCheckStatus::Fail
+                && check.detail.contains("could not decrypt the stored token")
+                && check.detail.contains("CARAPACE_CONFIG_PASSWORD")));
     }
 
     #[test]
