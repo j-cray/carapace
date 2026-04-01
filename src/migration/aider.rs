@@ -80,7 +80,7 @@ fn extract_yaml_config(path: &Path, plan: &mut ImportPlan) {
 
     let entries = parse_flat_yaml(&content);
 
-    if let Some(key) = entries.get("openai-api-key") {
+    if let Some(key) = entries.get("openai-api-key").filter(|v| !v.is_empty()) {
         push_mapping(
             plan,
             "openai-api-key".to_string(),
@@ -90,7 +90,7 @@ fn extract_yaml_config(path: &Path, plan: &mut ImportPlan) {
         );
     }
 
-    if let Some(key) = entries.get("anthropic-api-key") {
+    if let Some(key) = entries.get("anthropic-api-key").filter(|v| !v.is_empty()) {
         push_mapping(
             plan,
             "anthropic-api-key".to_string(),
@@ -100,7 +100,7 @@ fn extract_yaml_config(path: &Path, plan: &mut ImportPlan) {
         );
     }
 
-    if let Some(model) = entries.get("model") {
+    if let Some(model) = entries.get("model").filter(|v| !v.is_empty()) {
         let remapped = remap_model_id(model);
         push_mapping(
             plan,

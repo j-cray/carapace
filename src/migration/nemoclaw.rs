@@ -18,12 +18,6 @@ pub fn discover() -> Option<NemoClawDiscovery> {
         return Some(NemoClawDiscovery { config_path: path });
     }
 
-    // Fallback: system temp dir.
-    let tmp = std::env::temp_dir().join(".nemoclaw").join("config.json");
-    if tmp.is_file() {
-        return Some(NemoClawDiscovery { config_path: tmp });
-    }
-
     None
 }
 
@@ -108,6 +102,10 @@ fn extract_inference_config(config: &Value, plan: &mut ImportPlan) {
                     Value::String(key.clone()),
                     true,
                 );
+            } else if !credential_env.is_empty() {
+                plan.warnings.push(format!(
+                    "NemoClaw references ${credential_env} for OpenAI but it is not set"
+                ));
             }
             if !endpoint_url.is_empty() {
                 push_mapping(
@@ -128,6 +126,10 @@ fn extract_inference_config(config: &Value, plan: &mut ImportPlan) {
                     Value::String(key.clone()),
                     true,
                 );
+            } else if !credential_env.is_empty() {
+                plan.warnings.push(format!(
+                    "NemoClaw references ${credential_env} for Gemini but it is not set"
+                ));
             }
         }
         "ollama" => {
@@ -151,11 +153,15 @@ fn extract_inference_config(config: &Value, plan: &mut ImportPlan) {
     }
 
     if !model.is_empty() {
+        let remapped = match endpoint_type {
+            "ollama" if !model.starts_with("ollama:") => format!("ollama:{model}"),
+            _ => model.to_string(),
+        };
         push_mapping(
             plan,
             "model".to_string(),
             "agents.defaults.model",
-            Value::String(model.to_string()),
+            Value::String(remapped),
             false,
         );
     }
@@ -252,6 +258,12 @@ mod tests {
             .collect();
         assert!(keys.contains(&"providers.ollama.baseUrl"));
         assert!(keys.contains(&"agents.defaults.model"));
+        let model = plan
+            .mappings
+            .iter()
+            .find(|m| m.carapace_key == "agents.defaults.model")
+            .unwrap();
+        assert_eq!(model.value, json!("ollama:llama3"));
     }
 
     #[test]

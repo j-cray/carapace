@@ -7341,7 +7341,9 @@ pub fn handle_import_opencode(force: bool) -> Result<(), Box<dyn std::error::Err
         Some(d) => d,
         None => {
             eprintln!("No OpenCode installation found.");
-            eprintln!("Checked: ./.opencode.json, ~/.opencode.json, $XDG_CONFIG_HOME/opencode/");
+            eprintln!(
+                "Checked: ./.opencode.json, ~/.opencode.json, $XDG_CONFIG_HOME/opencode/, ~/.config/opencode/"
+            );
             return Err("no OpenCode config found".into());
         }
     };

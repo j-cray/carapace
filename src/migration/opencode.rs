@@ -178,7 +178,9 @@ fn provider_skip_reason(name: &str) -> &'static str {
     match name {
         "groq" => "Groq provider has no Carapace equivalent",
         "openrouter" => "OpenRouter provider has no Carapace equivalent",
-        "azure" => "Azure OpenAI has no direct Carapace mapping; use cara setup for Bedrock/Vertex",
+        "azure" => {
+            "Azure OpenAI has no direct Carapace mapping; use cara setup with a supported provider"
+        }
         "copilot" => "GitHub Copilot auth uses OAuth; not importable as a static key",
         "bedrock" => "Bedrock credentials use env vars or cara setup; cannot import a static key",
         "vertexai" => "VertexAI uses ADC/config; cannot import a static key",
