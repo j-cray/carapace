@@ -237,11 +237,16 @@ pub struct ControlProviderOnboardingStatus {
     pub label: String,
     pub configured: bool,
     pub supported_auth_modes: Vec<onboarding::setup::SetupAuthMode>,
+    /// Full set of browser/CLI entrypoints the UI may surface for this
+    /// provider.
     pub available_entrypoints: Vec<ControlOnboardingEntrypoint>,
+    /// Recommended CLI action for the provider's current state. When a UI
+    /// wants a single default command, prefer this over enumerating the CLI
+    /// entries in `available_entrypoints`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_setup_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub assessment: Option<onboarding::setup::SetupAssessment>,
+    pub assessment: Option<ControlSetupAssessment>,
 }
 
 /// A browser or CLI entrypoint the Control UI can surface for onboarding.
@@ -262,6 +267,31 @@ pub struct ControlOnboardingEntrypoint {
 pub enum ControlOnboardingEntrypointKind {
     Browser,
     Cli,
+}
+
+/// Control-facing provider assessment. Intentionally omits auth-profile
+/// identity details so the Control API does not expose raw profile names or
+/// emails in browser-visible payloads.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlSetupAssessment {
+    pub provider: onboarding::setup::SetupProvider,
+    pub auth_mode: Option<onboarding::setup::SetupAuthMode>,
+    pub status: onboarding::setup::SetupAssessmentStatus,
+    pub summary: String,
+    pub checks: Vec<onboarding::setup::SetupCheck>,
+}
+
+impl From<onboarding::setup::SetupAssessment> for ControlSetupAssessment {
+    fn from(value: onboarding::setup::SetupAssessment) -> Self {
+        Self {
+            provider: value.provider,
+            auth_mode: value.auth_mode,
+            status: value.status,
+            summary: value.summary,
+            checks: value.checks,
+        }
+    }
 }
 
 /// Shared shape returned by onboarding apply/save handlers.
@@ -905,7 +935,7 @@ fn build_control_provider_onboarding_status(
         supported_auth_modes: provider.supported_auth_modes().to_vec(),
         available_entrypoints: control_onboarding_entrypoints(provider),
         cli_setup_command,
-        assessment,
+        assessment: assessment.map(ControlSetupAssessment::from),
     }
 }
 
@@ -2190,7 +2220,7 @@ mod tests {
                 cli_setup_command: Some(
                     "cara setup --force --provider gemini --auth-mode oauth".to_string(),
                 ),
-                assessment: Some(onboarding::setup::SetupAssessment {
+                assessment: Some(ControlSetupAssessment {
                     provider: onboarding::setup::SetupProvider::Gemini,
                     auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
                     status: onboarding::setup::SetupAssessmentStatus::Partial,
@@ -2200,8 +2230,6 @@ mod tests {
                         "setup completed without a live provider-side validation step",
                         None,
                     )],
-                    profile_name: Some("Google Profile".to_string()),
-                    email: Some("user@example.com".to_string()),
                 }),
             }],
         };
@@ -2214,6 +2242,10 @@ mod tests {
             "browser"
         );
         assert_eq!(json["providers"][0]["assessment"]["status"], "partial");
+        assert!(json["providers"][0]["assessment"]
+            .get("profileName")
+            .is_none());
+        assert!(json["providers"][0]["assessment"].get("email").is_none());
     }
 
     #[test]

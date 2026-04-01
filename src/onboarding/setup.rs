@@ -349,8 +349,7 @@ impl SetupAssessmentStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct SetupAssessment {
     pub provider: SetupProvider,
     pub auth_mode: Option<SetupAuthMode>,
@@ -1877,29 +1876,22 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_assessment_serializes_with_control_facing_field_names() {
-        let assessment = SetupAssessment {
-            provider: SetupProvider::Gemini,
-            auth_mode: Some(SetupAuthMode::ApiKey),
-            status: SetupAssessmentStatus::Partial,
-            summary: "Gemini setup is written, but live validation was skipped.".to_string(),
-            checks: vec![SetupCheck::validation_skip(
-                "Live provider validation",
-                "setup completed without a live provider-side validation step",
-                Some("run `cara verify --outcome local-chat`".to_string()),
-            )],
-            profile_name: Some("Google Profile".to_string()),
-            email: Some("user@example.com".to_string()),
-        };
+    fn test_setup_check_serializes_with_control_facing_field_names() {
+        let check = SetupCheck::validation_skip(
+            "Live provider validation",
+            "setup completed without a live provider-side validation step",
+            Some("run `cara verify --outcome local-chat`".to_string()),
+        );
 
-        let value = serde_json::to_value(&assessment).expect("assessment should serialize");
+        let value = serde_json::to_value(&check).expect("check should serialize");
 
-        assert_eq!(value["provider"], "gemini");
-        assert_eq!(value["authMode"], "apiKey");
-        assert_eq!(value["status"], "partial");
-        assert_eq!(value["checks"][0]["status"], "skip");
-        assert_eq!(value["checks"][0]["kind"], "validation");
-        assert_eq!(value["profileName"], "Google Profile");
+        assert_eq!(value["status"], "skip");
+        assert_eq!(value["kind"], "validation");
+        assert_eq!(value["name"], "Live provider validation");
+        assert_eq!(
+            value["detail"],
+            "setup completed without a live provider-side validation step"
+        );
     }
 
     #[test]

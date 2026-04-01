@@ -3218,12 +3218,50 @@ mod tests {
         assert_eq!(json["providerStatus"]["provider"], "gemini");
         assert_eq!(json["providerStatus"]["configured"], true);
         assert_eq!(json["providerStatus"]["assessment"]["status"], "partial");
+        assert!(json["providerStatus"]["assessment"]
+            .get("profileName")
+            .is_none());
+        assert!(json["providerStatus"]["assessment"].get("email").is_none());
 
         let content = std::fs::read_to_string(config_path).expect("written config");
         let parsed: Value = json5::from_str(&content).expect("valid json5 config");
         assert_eq!(parsed["google"]["apiKey"], "AIza-test-key");
         assert_eq!(parsed["google"]["baseUrl"], "https://proxy.example.com");
         assert!(parsed["google"].get("authProfile").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_control_gemini_oauth_apply_returns_provider_status() {
+        let (temp, mut env_guard) = set_temp_config_path();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let flow_id =
+            crate::onboarding::gemini::insert_completed_control_google_oauth_flow_for_test();
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/onboarding/gemini/oauth/{flow_id}/apply"))
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["applied"]["mode"], "oauth");
+        assert_eq!(json["providerStatus"]["provider"], "gemini");
+        assert_eq!(json["providerStatus"]["configured"], true);
+        assert_eq!(json["providerStatus"]["assessment"]["provider"], "gemini");
+        assert_eq!(json["providerStatus"]["assessment"]["authMode"], "oauth");
+        assert!(json["providerStatus"]["assessment"]
+            .get("profileName")
+            .is_none());
+        assert!(json["providerStatus"]["assessment"].get("email").is_none());
     }
 
     #[tokio::test]
@@ -3258,6 +3296,39 @@ mod tests {
             json["redirectUri"],
             "https://gateway.example.com/control/onboarding/codex/callback"
         );
+    }
+
+    #[tokio::test]
+    async fn test_control_codex_oauth_apply_returns_provider_status() {
+        let (temp, mut env_guard) = set_temp_config_path();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let flow_id =
+            crate::onboarding::codex::insert_completed_control_openai_oauth_flow_for_test();
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/onboarding/codex/oauth/{flow_id}/apply"))
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["providerStatus"]["provider"], "codex");
+        assert_eq!(json["providerStatus"]["configured"], true);
+        assert_eq!(json["providerStatus"]["assessment"]["provider"], "codex");
+        assert_eq!(json["providerStatus"]["assessment"]["authMode"], "oauth");
+        assert!(json["providerStatus"]["assessment"]
+            .get("profileName")
+            .is_none());
+        assert!(json["providerStatus"]["assessment"].get("email").is_none());
     }
 
     #[tokio::test]
