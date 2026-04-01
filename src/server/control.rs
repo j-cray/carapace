@@ -884,13 +884,15 @@ fn control_onboarding_entrypoints(
 }
 
 fn build_control_provider_onboarding_status(
-    cfg: &Value,
+    configured_cfg: &Value,
+    assessment_cfg: &Value,
     state_dir: &FsPath,
     provider: onboarding::setup::SetupProvider,
 ) -> ControlProviderOnboardingStatus {
-    let configured = provider.is_configured(cfg);
-    let assessment = configured
-        .then(|| onboarding::setup::assess_provider_setup(cfg, state_dir, provider, vec![]));
+    let configured = provider.is_configured(configured_cfg);
+    let assessment = configured.then(|| {
+        onboarding::setup::assess_provider_setup(assessment_cfg, state_dir, provider, vec![])
+    });
     let cli_setup_command = provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode));
 
     ControlProviderOnboardingStatus {
@@ -905,35 +907,52 @@ fn build_control_provider_onboarding_status(
 }
 
 fn build_control_onboarding_statuses(
-    cfg: &Value,
+    configured_cfg: &Value,
+    assessment_cfg: &Value,
     state_dir: &FsPath,
 ) -> Vec<ControlProviderOnboardingStatus> {
     onboarding::setup::SetupProvider::all()
         .iter()
         .copied()
-        .map(|provider| build_control_provider_onboarding_status(cfg, state_dir, provider))
+        .map(|provider| {
+            build_control_provider_onboarding_status(
+                configured_cfg,
+                assessment_cfg,
+                state_dir,
+                provider,
+            )
+        })
         .collect()
 }
 
 async fn build_control_provider_onboarding_status_async(
-    cfg: Value,
+    configured_cfg: Value,
+    assessment_cfg: Value,
     state_dir: PathBuf,
     provider: onboarding::setup::SetupProvider,
 ) -> Result<ControlProviderOnboardingStatus, String> {
     tokio::task::spawn_blocking(move || {
-        build_control_provider_onboarding_status(&cfg, &state_dir, provider)
+        build_control_provider_onboarding_status(
+            &configured_cfg,
+            &assessment_cfg,
+            &state_dir,
+            provider,
+        )
     })
     .await
     .map_err(|err| format!("failed to build provider onboarding status: {err}"))
 }
 
 async fn build_control_onboarding_statuses_async(
-    cfg: Value,
+    configured_cfg: Value,
+    assessment_cfg: Value,
     state_dir: PathBuf,
 ) -> Result<Vec<ControlProviderOnboardingStatus>, String> {
-    tokio::task::spawn_blocking(move || build_control_onboarding_statuses(&cfg, &state_dir))
-        .await
-        .map_err(|err| format!("failed to build onboarding statuses: {err}"))
+    tokio::task::spawn_blocking(move || {
+        build_control_onboarding_statuses(&configured_cfg, &assessment_cfg, &state_dir)
+    })
+    .await
+    .map_err(|err| format!("failed to build onboarding statuses: {err}"))
 }
 
 /// GET /control/onboarding/status - Shared provider onboarding/status snapshot.
@@ -949,7 +968,12 @@ pub async fn onboarding_status_handler(
 
     let snapshot = read_config_snapshot();
     let state_dir = crate::server::ws::resolve_state_dir();
-    let providers = match build_control_onboarding_statuses_async(snapshot.config, state_dir).await
+    let providers = match build_control_onboarding_statuses_async(
+        snapshot.raw_config,
+        snapshot.config,
+        state_dir,
+    )
+    .await
     {
         Ok(providers) => providers,
         Err(err) => {
@@ -1076,6 +1100,7 @@ pub async fn gemini_oauth_apply_handler(
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
+                snapshot.raw_config,
                 snapshot.config,
                 state_dir,
                 onboarding::setup::SetupProvider::Gemini,
@@ -1212,6 +1237,7 @@ pub async fn codex_oauth_apply_handler(
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
+                snapshot.raw_config,
                 snapshot.config,
                 state_dir,
                 onboarding::setup::SetupProvider::Codex,
@@ -1331,6 +1357,7 @@ pub async fn gemini_api_key_handler(
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
+                snapshot.raw_config,
                 snapshot.config,
                 crate::server::ws::resolve_state_dir(),
                 onboarding::setup::SetupProvider::Gemini,
@@ -2193,6 +2220,7 @@ mod tests {
 
         let status = build_control_provider_onboarding_status(
             &cfg,
+            &cfg,
             temp.path(),
             onboarding::setup::SetupProvider::Anthropic,
         );
@@ -2201,6 +2229,25 @@ mod tests {
         assert!(status.assessment.is_none());
         assert_eq!(status.provider, "anthropic");
         assert_eq!(status.available_entrypoints.len(), 2);
+    }
+
+    #[test]
+    fn test_build_control_provider_onboarding_status_uses_raw_config_for_configured_detection() {
+        let temp = TempDir::new().unwrap();
+        let raw_cfg = json!({});
+        let effective_cfg = json!({
+            "vertex": { "location": "us-central1" }
+        });
+
+        let status = build_control_provider_onboarding_status(
+            &raw_cfg,
+            &effective_cfg,
+            temp.path(),
+            onboarding::setup::SetupProvider::Vertex,
+        );
+
+        assert!(!status.configured);
+        assert!(status.assessment.is_none());
     }
 
     #[test]

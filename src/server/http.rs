@@ -3141,6 +3141,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_control_onboarding_status_ignores_defaulted_vertex_location() {
+        let (temp, _guard) = set_temp_config_path();
+        let config_path = temp.path().join("carapace-test-config.json5");
+        std::fs::write(
+            &config_path,
+            r#"{
+                agents: { defaults: { model: "gpt-4o" } }
+            }"#,
+        )
+        .unwrap();
+
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/onboarding/status")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let providers = json["providers"]
+            .as_array()
+            .expect("providers should be an array");
+        let vertex = providers
+            .iter()
+            .find(|provider| provider["provider"] == "vertex")
+            .expect("vertex status should be present");
+        assert_eq!(vertex["configured"], false);
+        assert!(vertex["assessment"].is_null());
+    }
+
+    #[tokio::test]
     async fn test_control_gemini_api_key_writes_config() {
         let (temp, _guard) = set_temp_config_path();
         let config_path = temp.path().join("carapace-test-config.json5");

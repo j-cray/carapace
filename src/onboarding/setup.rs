@@ -179,7 +179,6 @@ impl SetupProvider {
             Self::Vertex => {
                 config_string(cfg, &["vertex", "projectId"]).is_some()
                     || config_string(cfg, &["vertex", "location"]).is_some()
-                    || config_string(cfg, &["vertex", "model"]).is_some()
             }
             Self::Venice => {
                 config_string(cfg, &["venice", "apiKey"]).is_some()
@@ -189,7 +188,6 @@ impl SetupProvider {
                 config_string(cfg, &["bedrock", "region"]).is_some()
                     || config_string(cfg, &["bedrock", "accessKeyId"]).is_some()
                     || config_string(cfg, &["bedrock", "secretAccessKey"]).is_some()
-                    || config_string(cfg, &["bedrock", "sessionToken"]).is_some()
             }
         }
     }
@@ -1910,16 +1908,42 @@ mod tests {
 
     #[test]
     fn test_setup_provider_is_configured_tracks_provider_owned_state() {
-        let cfg = json!({
-            "anthropic": { "baseUrl": "https://anthropic-proxy.example.com" },
-            "providers": { "ollama": { "baseUrl": "http://127.0.0.1:11434" } },
-            "vertex": { "projectId": "test-project" },
-        });
+        assert!(SetupProvider::Anthropic.is_configured(&json!({
+            "anthropic": { "baseUrl": "https://anthropic-proxy.example.com" }
+        })));
+        assert!(SetupProvider::Codex.is_configured(&json!({
+            "codex": { "authProfile": "openai-default" }
+        })));
+        assert!(SetupProvider::OpenAi.is_configured(&json!({
+            "openai": { "apiKey": "sk-test" }
+        })));
+        assert!(SetupProvider::Ollama.is_configured(&json!({
+            "providers": { "ollama": { "baseUrl": "http://127.0.0.1:11434" } }
+        })));
+        assert!(SetupProvider::Gemini.is_configured(&json!({
+            "google": { "authProfile": "google-default" }
+        })));
+        assert!(SetupProvider::Vertex.is_configured(&json!({
+            "vertex": { "projectId": "test-project" }
+        })));
+        assert!(SetupProvider::Venice.is_configured(&json!({
+            "venice": { "baseUrl": "https://venice.example.com/v1" }
+        })));
+        assert!(SetupProvider::Bedrock.is_configured(&json!({
+            "bedrock": { "region": "us-east-1" }
+        })));
 
-        assert!(SetupProvider::Anthropic.is_configured(&cfg));
-        assert!(SetupProvider::Ollama.is_configured(&cfg));
-        assert!(SetupProvider::Vertex.is_configured(&cfg));
-        assert!(!SetupProvider::Codex.is_configured(&cfg));
+        assert!(!SetupProvider::Anthropic.is_configured(&json!({})));
+        assert!(!SetupProvider::Codex.is_configured(&json!({})));
+        assert!(!SetupProvider::OpenAi.is_configured(&json!({})));
+        assert!(!SetupProvider::Ollama.is_configured(&json!({})));
+        assert!(!SetupProvider::Gemini.is_configured(&json!({})));
+        assert!(!SetupProvider::Vertex.is_configured(&json!({
+            "vertex": { "model": "gemini-2.5-flash" }
+        })));
+        assert!(!SetupProvider::Bedrock.is_configured(&json!({
+            "bedrock": { "sessionToken": "sts-token" }
+        })));
     }
 
     #[test]
