@@ -392,7 +392,7 @@ pub struct ControlOnboardingApplyResponse {
     pub provider_status: ControlProviderOnboardingStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlOnboardingAppliedMode {
     #[serde(rename = "apiKey")]
     ApiKey,
@@ -400,24 +400,42 @@ pub enum ControlOnboardingAppliedMode {
     OAuth,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlOnboardingApplied {
     pub mode: ControlOnboardingAppliedMode,
 }
 
-impl ControlOnboardingApplied {
-    fn api_key() -> Self {
-        Self {
-            mode: ControlOnboardingAppliedMode::ApiKey,
+impl ControlOnboardingAppliedMode {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::ApiKey => "apiKey",
+            Self::OAuth => "oauth",
         }
     }
 
-    fn oauth() -> Self {
-        Self {
-            mode: ControlOnboardingAppliedMode::OAuth,
-        }
+    fn applied(self) -> ControlOnboardingApplied {
+        ControlOnboardingApplied { mode: self }
     }
+}
+
+fn validate_control_onboarding_applied_mode(
+    applied: &Value,
+    expected_mode: ControlOnboardingAppliedMode,
+) -> Result<ControlOnboardingApplied, String> {
+    let reported_mode = applied
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Provider onboarding apply result is missing required `mode`".to_string())?;
+
+    if reported_mode != expected_mode.wire_name() {
+        return Err(format!(
+            "Provider onboarding apply result reported unexpected mode `{reported_mode}` (expected `{}`)",
+            expected_mode.wire_name()
+        ));
+    }
+
+    Ok(expected_mode.applied())
 }
 
 #[derive(Default)]
@@ -1241,7 +1259,20 @@ pub async fn gemini_oauth_apply_handler(
 
     let state_dir = crate::server::ws::resolve_state_dir();
     match onboarding::gemini::apply_control_google_oauth(flow_id.trim(), state_dir.clone()) {
-        Ok(_) => {
+        Ok(applied) => {
+            let applied = match validate_control_onboarding_applied_mode(
+                &applied,
+                ControlOnboardingAppliedMode::OAuth,
+            ) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -1265,7 +1296,7 @@ pub async fn gemini_oauth_apply_handler(
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
-                    applied: ControlOnboardingApplied::oauth(),
+                    applied,
                     hash,
                     provider_status,
                 }),
@@ -1378,7 +1409,20 @@ pub async fn codex_oauth_apply_handler(
 
     let state_dir = crate::server::ws::resolve_state_dir();
     match onboarding::codex::apply_control_openai_oauth(flow_id.trim(), state_dir.clone()) {
-        Ok(_) => {
+        Ok(applied) => {
+            let applied = match validate_control_onboarding_applied_mode(
+                &applied,
+                ControlOnboardingAppliedMode::OAuth,
+            ) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -1402,7 +1446,7 @@ pub async fn codex_oauth_apply_handler(
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
-                    applied: ControlOnboardingApplied::oauth(),
+                    applied,
                     hash,
                     provider_status,
                 }),
@@ -1498,7 +1542,20 @@ pub async fn gemini_api_key_handler(
         api_key: req.api_key,
         base_url: req.base_url,
     }) {
-        Ok(_) => {
+        Ok(applied) => {
+            let applied = match validate_control_onboarding_applied_mode(
+                &applied,
+                ControlOnboardingAppliedMode::ApiKey,
+            ) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -1522,7 +1579,7 @@ pub async fn gemini_api_key_handler(
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
-                    applied: ControlOnboardingApplied::api_key(),
+                    applied,
                     hash,
                     provider_status,
                 }),
@@ -2367,7 +2424,7 @@ mod tests {
     fn test_control_onboarding_apply_response_serialization() {
         let response = ControlOnboardingApplyResponse {
             ok: true,
-            applied: ControlOnboardingApplied::oauth(),
+            applied: ControlOnboardingAppliedMode::OAuth.applied(),
             hash: Some("deadbeef".to_string()),
             provider_status: ControlProviderOnboardingStatus {
                 provider: onboarding::setup::SetupProvider::Codex,
@@ -2398,6 +2455,46 @@ mod tests {
         assert!(applied.get("authProfile").is_none());
         assert!(applied.get("provider").is_none());
         assert!(applied.get("model").is_none());
+    }
+
+    #[test]
+    fn test_control_onboarding_applied_round_trips() {
+        let applied = ControlOnboardingAppliedMode::ApiKey.applied();
+        let json = serde_json::to_string(&applied).expect("applied payload should serialize");
+        let round_trip: ControlOnboardingApplied =
+            serde_json::from_str(&json).expect("applied payload should deserialize");
+        assert_eq!(round_trip.mode, ControlOnboardingAppliedMode::ApiKey);
+    }
+
+    #[test]
+    fn test_validate_control_onboarding_applied_mode_accepts_expected_mode() {
+        let applied = json!({ "mode": "oauth", "profileId": "google-123" });
+        let projected =
+            validate_control_onboarding_applied_mode(&applied, ControlOnboardingAppliedMode::OAuth)
+                .expect("matching mode should be accepted");
+        assert_eq!(projected, ControlOnboardingAppliedMode::OAuth.applied());
+    }
+
+    #[test]
+    fn test_validate_control_onboarding_applied_mode_rejects_missing_mode() {
+        let err = validate_control_onboarding_applied_mode(
+            &json!({"authProfile": "openai-123"}),
+            ControlOnboardingAppliedMode::OAuth,
+        )
+        .expect_err("missing mode should be rejected");
+        assert!(err.contains("missing required `mode`"));
+    }
+
+    #[test]
+    fn test_validate_control_onboarding_applied_mode_rejects_unexpected_mode() {
+        let err = validate_control_onboarding_applied_mode(
+            &json!({"mode": "apiKey"}),
+            ControlOnboardingAppliedMode::OAuth,
+        )
+        .expect_err("unexpected mode should be rejected");
+        assert!(err.contains("unexpected mode"));
+        assert!(err.contains("apiKey"));
+        assert!(err.contains("oauth"));
     }
 
     #[test]
