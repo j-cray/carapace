@@ -7032,14 +7032,29 @@ fn configure_provider_interactive(
                     config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
                 }
                 SetupAuthModeSelection::SetupToken => {
-                    if crate::onboarding::anthropic::anthropic_setup_token_would_replace_api_key(
-                        config,
-                    ) && !prompt_yes_no(
-                        "Replace existing `anthropic.apiKey` config with Anthropic setup-token auth?",
-                        false,
-                    )? {
+                    let api_key_conflict =
+                        crate::onboarding::anthropic::anthropic_setup_token_api_key_conflict(
+                            config,
+                        );
+                    if api_key_conflict.config_api_key_present
+                        && !prompt_yes_no(
+                            "Replace existing `anthropic.apiKey` config with Anthropic setup-token auth?",
+                            false,
+                        )?
+                    {
                         return Err(
                             "setup aborted before replacing existing Anthropic API key config"
+                                .into(),
+                        );
+                    }
+                    if api_key_conflict.env_api_key_present
+                        && !prompt_yes_no(
+                            "`ANTHROPIC_API_KEY` is set in this shell and will override Anthropic setup-token auth until you unset it. Continue storing the setup token anyway?",
+                            false,
+                        )?
+                    {
+                        return Err(
+                            "setup aborted while `ANTHROPIC_API_KEY` would still override Anthropic setup-token auth"
                                 .into(),
                         );
                     }
@@ -7313,10 +7328,16 @@ fn configure_provider_noninteractive(
     match provider {
         SetupProvider::Anthropic => match requested_auth_mode {
             Some(SetupAuthModeSelection::SetupToken) => {
-                if crate::onboarding::anthropic::anthropic_setup_token_would_replace_api_key(config)
-                {
+                let api_key_conflict =
+                    crate::onboarding::anthropic::anthropic_setup_token_api_key_conflict(config);
+                if api_key_conflict.config_api_key_present {
                     eprintln!(
                         "Replacing existing `anthropic.apiKey` config with `anthropic.authProfile` for Anthropic setup-token mode."
+                    );
+                }
+                if api_key_conflict.env_api_key_present {
+                    eprintln!(
+                        "`ANTHROPIC_API_KEY` is set in this shell and will override `anthropic.authProfile` until you unset it."
                     );
                 }
                 let token = env_var_value("ANTHROPIC_SETUP_TOKEN").ok_or_else(|| {
@@ -12159,6 +12180,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let state_dir = tempfile::TempDir::new().unwrap();
         env_guard.unset("ANTHROPIC_SETUP_TOKEN");
+        env_guard.unset("ANTHROPIC_API_KEY");
         env_guard.set("CARAPACE_STATE_DIR", state_dir.path().as_os_str());
         env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
@@ -12224,6 +12246,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let state_dir = tempfile::TempDir::new().unwrap();
         env_guard.unset("ANTHROPIC_SETUP_TOKEN");
+        env_guard.unset("ANTHROPIC_API_KEY");
         env_guard.set("CARAPACE_STATE_DIR", state_dir.path().as_os_str());
         env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
@@ -12272,6 +12295,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let state_dir = tempfile::TempDir::new().unwrap();
         env_guard.unset("ANTHROPIC_SETUP_TOKEN");
+        env_guard.unset("ANTHROPIC_API_KEY");
         env_guard.set("CARAPACE_STATE_DIR", state_dir.path().as_os_str());
         env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
@@ -12303,6 +12327,92 @@ mod tests {
             "setup aborted before replacing existing Anthropic API key config"
         );
         assert_eq!(config["anthropic"]["apiKey"], "${ANTHROPIC_API_KEY}");
+        assert!(config["anthropic"].get("authProfile").is_none());
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 1);
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+        assert!(!state_dir.path().join("auth_profiles.json").exists());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_anthropic_setup_token_confirms_env_api_key_override() {
+        let mut env_guard = ScopedEnv::new();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        env_guard.unset("ANTHROPIC_SETUP_TOKEN");
+        env_guard.set("ANTHROPIC_API_KEY", "sk-anthropic");
+        env_guard.set("CARAPACE_STATE_DIR", state_dir.path().as_os_str());
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+
+        let payload_len = crate::onboarding::anthropic::ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH
+            - crate::onboarding::anthropic::ANTHROPIC_SETUP_TOKEN_PREFIX.len();
+        let token = format!(
+            "{}{}",
+            crate::onboarding::anthropic::ANTHROPIC_SETUP_TOKEN_PREFIX,
+            "a".repeat(payload_len)
+        );
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["y".to_string()]),
+            hidden_inputs: VecDeque::from(vec![token]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result = configure_provider_interactive(
+            &mut config,
+            SetupProvider::Anthropic,
+            true,
+            Some(SetupAuthModeSelection::SetupToken),
+        )
+        .expect("interactive Anthropic setup-token setup");
+
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            config["anthropic"]["authProfile"],
+            crate::onboarding::anthropic::DEFAULT_ANTHROPIC_AUTH_PROFILE_ID
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 1);
+        assert_eq!(state.hidden_prompt_count, 1);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_anthropic_setup_token_decline_env_api_key_override() {
+        let mut env_guard = ScopedEnv::new();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        env_guard.unset("ANTHROPIC_SETUP_TOKEN");
+        env_guard.set("ANTHROPIC_API_KEY", "sk-anthropic");
+        env_guard.set("CARAPACE_STATE_DIR", state_dir.path().as_os_str());
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["n".to_string()]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result = configure_provider_interactive(
+            &mut config,
+            SetupProvider::Anthropic,
+            true,
+            Some(SetupAuthModeSelection::SetupToken),
+        );
+
+        assert!(
+            result.is_err(),
+            "setup should abort when env API key override is declined"
+        );
+        assert_eq!(
+            result
+                .expect_err("expected env-override-decline abort")
+                .to_string(),
+            "setup aborted while `ANTHROPIC_API_KEY` would still override Anthropic setup-token auth"
+        );
         assert!(config["anthropic"].get("authProfile").is_none());
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");

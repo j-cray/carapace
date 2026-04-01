@@ -10,6 +10,12 @@ pub const ANTHROPIC_SETUP_TOKEN_PREFIX: &str = "sk-ant-oat01-";
 pub const ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH: usize = 80;
 pub const DEFAULT_ANTHROPIC_AUTH_PROFILE_ID: &str = "anthropic:default";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnthropicSetupTokenApiKeyConflict {
+    pub env_api_key_present: bool,
+    pub config_api_key_present: bool,
+}
+
 pub fn require_encrypted_profile_store_for_anthropic_setup_token() -> Result<(), String> {
     if profile_store_encryption_enabled_from_env() {
         Ok(())
@@ -49,13 +55,19 @@ pub fn persist_cli_anthropic_setup_token(
     Ok(profile_id)
 }
 
-pub fn anthropic_setup_token_would_replace_api_key(config: &Value) -> bool {
-    config
-        .get("anthropic")
-        .and_then(|anthropic| anthropic.get("apiKey"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
+pub fn anthropic_setup_token_api_key_conflict(config: &Value) -> AnthropicSetupTokenApiKeyConflict {
+    AnthropicSetupTokenApiKeyConflict {
+        env_api_key_present: std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        config_api_key_present: config
+            .get("anthropic")
+            .and_then(|anthropic| anthropic.get("apiKey"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+    }
 }
 
 fn upsert_anthropic_setup_token_profile(state_dir: &Path, token: &str) -> Result<String, String> {
@@ -168,20 +180,45 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_setup_token_would_replace_api_key_detects_existing_value() {
+    fn test_anthropic_setup_token_api_key_conflict_detects_existing_value() {
+        let mut env = ScopedEnv::new();
+        env.unset("ANTHROPIC_API_KEY");
         let config = json!({
             "anthropic": {
                 "apiKey": "${ANTHROPIC_API_KEY}"
             }
         });
-        assert!(anthropic_setup_token_would_replace_api_key(&config));
+        assert_eq!(
+            anthropic_setup_token_api_key_conflict(&config),
+            AnthropicSetupTokenApiKeyConflict {
+                env_api_key_present: false,
+                config_api_key_present: true,
+            }
+        );
 
         let blank = json!({
             "anthropic": {
                 "apiKey": "   "
             }
         });
-        assert!(!anthropic_setup_token_would_replace_api_key(&blank));
+        assert_eq!(
+            anthropic_setup_token_api_key_conflict(&blank),
+            AnthropicSetupTokenApiKeyConflict::default()
+        );
+    }
+
+    #[test]
+    fn test_anthropic_setup_token_api_key_conflict_detects_env_api_key() {
+        let mut env = ScopedEnv::new();
+        env.set("ANTHROPIC_API_KEY", "sk-anthropic");
+
+        assert_eq!(
+            anthropic_setup_token_api_key_conflict(&json!({})),
+            AnthropicSetupTokenApiKeyConflict {
+                env_api_key_present: true,
+                config_api_key_present: false,
+            }
+        );
     }
 
     #[test]

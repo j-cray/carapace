@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
-use crate::auth::profiles::{refresh_token, OAuthProviderConfig, ProfileStore};
+use crate::auth::profiles::{
+    refresh_token, AuthProfile, AuthProfileCredentialKind, OAuthProviderConfig, ProfileStore,
+};
 
 const TOKEN_REFRESH_MARGIN_MS: u64 = 60_000;
 
@@ -234,6 +236,7 @@ impl GeminiProvider {
                         "configured Gemini auth profile \"{profile_id}\" was not found"
                     ))
                 })?;
+                ensure_oauth_profile_kind(&profile, profile_id)?;
                 let now_ms = current_time_ms();
                 if profile
                     .oauth_tokens()
@@ -246,6 +249,7 @@ impl GeminiProvider {
                             "configured Gemini auth profile \"{profile_id}\" was not found"
                         ))
                     })?;
+                    ensure_oauth_profile_kind(&refreshed_profile, profile_id)?;
                     let now_ms_after_lock = current_time_ms();
                     if refreshed_profile
                         .oauth_tokens()
@@ -298,6 +302,16 @@ impl GeminiProvider {
             }
         }
     }
+}
+
+fn ensure_oauth_profile_kind(profile: &AuthProfile, profile_id: &str) -> Result<(), AgentError> {
+    if profile.credential_kind != AuthProfileCredentialKind::OAuth {
+        return Err(AgentError::Provider(format!(
+            "Gemini auth profile \"{profile_id}\" uses {} credentials, not oauth",
+            profile.credential_kind
+        )));
+    }
+    Ok(())
 }
 
 /// Find the tool name that corresponds to a ToolResult block by searching
@@ -818,6 +832,52 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Gemini auth profile \"google-empty-token\" has no usable access token"));
+    }
+
+    #[tokio::test]
+    async fn test_with_oauth_profile_errors_when_credential_kind_is_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        store
+            .add(AuthProfile {
+                id: "google-token-kind".to_string(),
+                name: "Gemini (Token Kind)".to_string(),
+                provider: OAuthProvider::Google,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: now_ms,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-token".to_string()),
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let provider = GeminiProvider::with_oauth_profile(
+            Arc::new(store),
+            "google-token-kind".to_string(),
+            OAuthProvider::Google.default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            ),
+        )
+        .expect("oauth-backed provider");
+
+        let err = provider
+            .auth_headers()
+            .await
+            .expect_err("wrong credential kind should fail");
+        assert!(err.to_string().contains(
+            "Gemini auth profile \"google-token-kind\" uses token credentials, not oauth"
+        ));
     }
 
     #[test]
