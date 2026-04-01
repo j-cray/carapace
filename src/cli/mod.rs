@@ -7410,7 +7410,7 @@ pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Err
         std::fs::create_dir_all(parent)?;
     }
     if let Err(e) = config::seal_config_secrets(&mut config) {
-        eprintln!("Warning: could not encrypt secrets: {e}");
+        return Err(format!("Failed to encrypt secrets: {e}").into());
     }
     let content = json5::to_string(&config)?;
     write_config_restricted(&config_path, &content)?;
@@ -7438,11 +7438,26 @@ fn write_config_restricted(
     path: &std::path::Path,
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::write(path, content)?;
+    use std::io::Write;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
     }
     Ok(())
 }

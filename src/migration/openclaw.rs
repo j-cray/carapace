@@ -302,7 +302,7 @@ fn extract_env_block(config: &Value, plan: &mut ImportPlan) {
                         format!("env.{key}"),
                         ck,
                         Value::String(s.to_string()),
-                        true,
+                        is_sensitive_config_key(ck),
                     );
                 }
             }
@@ -346,7 +346,7 @@ fn extract_dotenv_keys(env_path: &Path, plan: &mut ImportPlan) {
                             format!(".env:{key}"),
                             ck,
                             Value::String(value.to_string()),
-                            true,
+                            is_sensitive_config_key(ck),
                         );
                     }
                 }
@@ -477,6 +477,10 @@ fn is_importable_env_key(key: &str) -> bool {
             | "DISCORD_BOT_TOKEN"
             | "SLACK_BOT_TOKEN"
     )
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    !key.contains("baseUrl") && !key.contains("base_url")
 }
 
 fn env_key_to_carapace_config(key: &str) -> Option<&'static str> {
