@@ -3081,7 +3081,10 @@ mod tests {
         let providers = json["providers"]
             .as_array()
             .expect("providers should be an array");
-        assert_eq!(providers.len(), 8);
+        assert_eq!(
+            providers.len(),
+            crate::onboarding::setup::SetupProvider::all().len()
+        );
         let anthropic = providers
             .iter()
             .find(|provider| provider["provider"] == "anthropic")
@@ -3090,6 +3093,11 @@ mod tests {
         assert!(anthropic["assessment"].is_null());
         assert_eq!(anthropic["supportedAuthModes"][0], "apiKey");
         assert_eq!(anthropic["supportedAuthModes"][1], "setupToken");
+        let codex = providers
+            .iter()
+            .find(|provider| provider["provider"] == "codex")
+            .expect("codex status should be present");
+        assert_eq!(codex["label"], "Codex");
     }
 
     #[tokio::test]

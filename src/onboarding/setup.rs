@@ -76,7 +76,7 @@ impl SetupProvider {
     pub fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
-            Self::Codex => "OpenAI",
+            Self::Codex => "Codex",
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
@@ -1920,5 +1920,11 @@ mod tests {
         assert!(SetupProvider::Ollama.is_configured(&cfg));
         assert!(SetupProvider::Vertex.is_configured(&cfg));
         assert!(!SetupProvider::Codex.is_configured(&cfg));
+    }
+
+    #[test]
+    fn test_setup_provider_labels_distinguish_codex_from_openai() {
+        assert_eq!(SetupProvider::Codex.label(), "Codex");
+        assert_eq!(SetupProvider::OpenAi.label(), "OpenAI");
     }
 }

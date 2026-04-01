@@ -24,7 +24,7 @@ use axum::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use crate::auth;
@@ -849,14 +849,15 @@ fn cli_onboarding_entrypoints(
     if supported_auth_modes.is_empty() {
         return provider
             .setup_command(None)
-            .into_iter()
-            .map(|command| ControlOnboardingEntrypoint {
-                kind: ControlOnboardingEntrypointKind::Cli,
-                auth_mode: None,
-                path: None,
-                command: Some(command),
+            .map(|command| {
+                vec![ControlOnboardingEntrypoint {
+                    kind: ControlOnboardingEntrypointKind::Cli,
+                    auth_mode: None,
+                    path: None,
+                    command: Some(command),
+                }]
             })
-            .collect();
+            .unwrap_or_default();
     }
 
     supported_auth_modes
@@ -914,6 +915,27 @@ fn build_control_onboarding_statuses(
         .collect()
 }
 
+async fn build_control_provider_onboarding_status_async(
+    cfg: Value,
+    state_dir: PathBuf,
+    provider: onboarding::setup::SetupProvider,
+) -> Result<ControlProviderOnboardingStatus, String> {
+    tokio::task::spawn_blocking(move || {
+        build_control_provider_onboarding_status(&cfg, &state_dir, provider)
+    })
+    .await
+    .map_err(|err| format!("failed to build provider onboarding status: {err}"))
+}
+
+async fn build_control_onboarding_statuses_async(
+    cfg: Value,
+    state_dir: PathBuf,
+) -> Result<Vec<ControlProviderOnboardingStatus>, String> {
+    tokio::task::spawn_blocking(move || build_control_onboarding_statuses(&cfg, &state_dir))
+        .await
+        .map_err(|err| format!("failed to build onboarding statuses: {err}"))
+}
+
 /// GET /control/onboarding/status - Shared provider onboarding/status snapshot.
 pub async fn onboarding_status_handler(
     State(state): State<ControlState>,
@@ -927,11 +949,22 @@ pub async fn onboarding_status_handler(
 
     let snapshot = read_config_snapshot();
     let state_dir = crate::server::ws::resolve_state_dir();
+    let providers = match build_control_onboarding_statuses_async(snapshot.config, state_dir).await
+    {
+        Ok(providers) => providers,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ControlError::new(err)),
+            )
+                .into_response();
+        }
+    };
     (
         StatusCode::OK,
         Json(ControlOnboardingStatusResponse {
             ok: true,
-            providers: build_control_onboarding_statuses(&snapshot.config, &state_dir),
+            providers,
         }),
     )
         .into_response()
@@ -1041,17 +1074,29 @@ pub async fn gemini_oauth_apply_handler(
     match onboarding::gemini::apply_control_google_oauth(flow_id.trim(), state_dir.clone()) {
         Ok(applied) => {
             let snapshot = read_config_snapshot();
-            let provider_status = build_control_provider_onboarding_status(
-                &snapshot.config,
-                &state_dir,
+            let hash = snapshot.hash;
+            let provider_status = match build_control_provider_onboarding_status_async(
+                snapshot.config,
+                state_dir,
                 onboarding::setup::SetupProvider::Gemini,
-            );
+            )
+            .await
+            {
+                Ok(provider_status) => provider_status,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             (
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
                     applied,
-                    hash: snapshot.hash,
+                    hash,
                     provider_status,
                 }),
             )
@@ -1165,17 +1210,29 @@ pub async fn codex_oauth_apply_handler(
     match onboarding::codex::apply_control_openai_oauth(flow_id.trim(), state_dir.clone()) {
         Ok(applied) => {
             let snapshot = read_config_snapshot();
-            let provider_status = build_control_provider_onboarding_status(
-                &snapshot.config,
-                &state_dir,
+            let hash = snapshot.hash;
+            let provider_status = match build_control_provider_onboarding_status_async(
+                snapshot.config,
+                state_dir,
                 onboarding::setup::SetupProvider::Codex,
-            );
+            )
+            .await
+            {
+                Ok(provider_status) => provider_status,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             (
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
                     applied,
-                    hash: snapshot.hash,
+                    hash,
                     provider_status,
                 }),
             )
@@ -1272,18 +1329,29 @@ pub async fn gemini_api_key_handler(
     }) {
         Ok(applied) => {
             let snapshot = read_config_snapshot();
-            let state_dir = crate::server::ws::resolve_state_dir();
-            let provider_status = build_control_provider_onboarding_status(
-                &snapshot.config,
-                &state_dir,
+            let hash = snapshot.hash;
+            let provider_status = match build_control_provider_onboarding_status_async(
+                snapshot.config,
+                crate::server::ws::resolve_state_dir(),
                 onboarding::setup::SetupProvider::Gemini,
-            );
+            )
+            .await
+            {
+                Ok(provider_status) => provider_status,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             (
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
                     applied,
-                    hash: snapshot.hash,
+                    hash,
                     provider_status,
                 }),
             )
