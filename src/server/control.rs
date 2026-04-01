@@ -322,7 +322,7 @@ fn sanitize_control_setup_check(check: onboarding::setup::SetupCheck) -> Control
         } else if detail.starts_with("loaded `") {
             format!("{name} loaded from encrypted profile store")
         } else {
-            detail
+            format!("{name} requires attention")
         }
     } else {
         detail
@@ -343,6 +343,9 @@ impl From<onboarding::setup::SetupAssessment> for ControlSetupAssessment {
             provider: value.provider,
             auth_mode: value.auth_mode,
             status: value.status,
+            // `SetupAssessment::summary` remains browser-visible here. The
+            // setup layer must keep it limited to static provider guidance and
+            // avoid embedding auth-profile identity or server-local details.
             summary: value.summary,
             checks: value
                 .checks
@@ -2326,6 +2329,11 @@ mod tests {
                     "Gemini auth profile",
                     "loaded `Google Profile` (user@example.com)",
                 ),
+                onboarding::setup::SetupCheck::validation_fail(
+                    "Gemini auth profile",
+                    "future auth profile detail with `internal-profile-id`",
+                    "Re-run setup for Gemini auth profile.",
+                ),
             ],
             profile_name: Some("Google Profile".to_string()),
             email: Some("user@example.com".to_string()),
@@ -2342,9 +2350,14 @@ mod tests {
             json["checks"][1]["detail"],
             "Gemini auth profile loaded from encrypted profile store"
         );
+        assert_eq!(
+            json["checks"][2]["detail"],
+            "Gemini auth profile requires attention"
+        );
         assert!(!json.to_string().contains("google-123"));
         assert!(!json.to_string().contains("Google Profile"));
         assert!(!json.to_string().contains("user@example.com"));
+        assert!(!json.to_string().contains("internal-profile-id"));
     }
 
     #[test]
