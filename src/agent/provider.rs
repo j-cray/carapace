@@ -408,7 +408,7 @@ impl MultiProvider {
                 Ok(provider)
             } else {
                 Err(AgentError::Provider(format!(
-                    "model \"{model}\" requires Anthropic provider, but neither ANTHROPIC_API_KEY nor anthropic.authProfile is configured"
+                    "model \"{model}\" requires Anthropic provider, but neither an API key (ANTHROPIC_API_KEY env var or anthropic.apiKey config) nor anthropic.authProfile is configured"
                 )))
             }
         }
@@ -500,6 +500,14 @@ mod tests {
         assert!(
             msg.contains("Anthropic"),
             "expected Anthropic in error: {msg}"
+        );
+        assert!(
+            msg.contains("anthropic.apiKey"),
+            "expected anthropic.apiKey guidance in error: {msg}"
+        );
+        assert!(
+            msg.contains("anthropic.authProfile"),
+            "expected anthropic.authProfile guidance in error: {msg}"
         );
     }
 
