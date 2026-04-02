@@ -2893,7 +2893,6 @@ async fn write_staged_plugin_artifact(dest: &Path, bytes: &[u8]) -> std::io::Res
     // then wraps in tokio::fs::File for async write.
     let dest = dest.to_path_buf();
     let std_file = tokio::task::spawn_blocking({
-        let dest = dest.clone();
         move || {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
