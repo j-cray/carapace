@@ -695,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn test_with_auth_profile_token_uses_stored_token() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = ProfileStore::new(temp.path().to_path_buf());
+        let store = Arc::new(ProfileStore::new(temp.path().to_path_buf()));
         store
             .add(AuthProfile {
                 id: "anthropic:default".to_string(),
@@ -715,13 +715,21 @@ mod tests {
             .expect("store profile");
 
         let provider = AnthropicProvider::with_auth_profile_token(
-            Arc::new(store),
+            store.clone(),
             "anthropic:default".to_string(),
         )
         .expect("provider");
 
         let token = provider.api_key().await.expect("token");
         assert_eq!(token, "sk-ant-oat01-test-token");
+        assert!(
+            store
+                .get("anthropic:default")
+                .expect("stored profile")
+                .last_used_ms
+                .is_some(),
+            "last_used_ms should update after successful Anthropic token resolution"
+        );
     }
 
     #[tokio::test]

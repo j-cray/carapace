@@ -16,7 +16,7 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::secrets::{is_encrypted, SecretStore};
@@ -119,6 +119,35 @@ struct SkippedProfile {
 struct LoadedProfiles {
     profiles: Vec<AuthProfile>,
     skipped: Vec<SkippedProfile>,
+}
+
+struct LastUsedPersistence {
+    state: Mutex<LastUsedPersistenceState>,
+    condvar: Condvar,
+}
+
+struct LastUsedPersistenceState {
+    dirty_generation: u64,
+    scheduled_generation: u64,
+    flushed_generation: u64,
+    shutdown: bool,
+    auto_flush_enabled: bool,
+}
+
+struct ProfileStoreShared {
+    profiles: RwLock<Vec<AuthProfile>>,
+    /// Profiles that could not be deserialized but are preserved for
+    /// round-trip safety (e.g., profiles from a newer binary version).
+    skipped_profiles: RwLock<Vec<SkippedProfile>>,
+    state_path: PathBuf,
+    secret_store: Option<Arc<SecretStore>>,
+    /// Password bytes kept for `decrypt_rekey` (values on disk may have been
+    /// encrypted with a different salt than the current `SecretStore`).
+    encryption_password: Option<Arc<zeroize::Zeroizing<Vec<u8>>>>,
+    /// Serializes all disk writes and load/save replacement so deferred
+    /// `last_used_ms` flushes cannot race newer synchronous profile saves.
+    persist_lock: Mutex<()>,
+    last_used_persistence: LastUsedPersistence,
 }
 
 /// Parse a store file, auto-detecting bare-array (v1) vs envelope (v2) format.
@@ -941,15 +970,8 @@ fn decode_jwt_payload(token: &str) -> Option<Value> {
 /// values loaded from disk (backward-compatible) are transparently encrypted
 /// on the next save.
 pub struct ProfileStore {
-    profiles: RwLock<Vec<AuthProfile>>,
-    /// Profiles that could not be deserialized but are preserved for
-    /// round-trip safety (e.g., profiles from a newer binary version).
-    skipped_profiles: RwLock<Vec<SkippedProfile>>,
-    state_path: PathBuf,
-    secret_store: Option<SecretStore>,
-    /// Password bytes kept for `decrypt_rekey` (values on disk may have been
-    /// encrypted with a different salt than the current `SecretStore`).
-    encryption_password: Option<zeroize::Zeroizing<Vec<u8>>>,
+    shared: Arc<ProfileStoreShared>,
+    last_used_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ProfileStore {
@@ -973,12 +995,27 @@ impl ProfileStore {
     /// to enable at-rest encryption.
     pub fn new(state_dir: PathBuf) -> Self {
         let state_path = state_dir.join("auth_profiles.json");
-        Self {
+        let shared = Arc::new(ProfileStoreShared {
             profiles: RwLock::new(Vec::new()),
             skipped_profiles: RwLock::new(Vec::new()),
             state_path,
             secret_store: None,
             encryption_password: None,
+            persist_lock: Mutex::new(()),
+            last_used_persistence: LastUsedPersistence {
+                state: Mutex::new(LastUsedPersistenceState {
+                    dirty_generation: 0,
+                    scheduled_generation: 0,
+                    flushed_generation: 0,
+                    shutdown: false,
+                    auto_flush_enabled: true,
+                }),
+                condvar: Condvar::new(),
+            },
+        });
+        Self {
+            last_used_worker: Mutex::new(Self::start_last_used_worker(&shared)),
+            shared,
         }
     }
 
@@ -996,13 +1033,195 @@ impl ProfileStore {
         let state_path = state_dir.join("auth_profiles.json");
         let secret_store = SecretStore::new(password)
             .map_err(|e| AuthProfileError::IoError(format!("encryption init failed: {e}")))?;
-        Ok(Self {
+        let shared = Arc::new(ProfileStoreShared {
             profiles: RwLock::new(Vec::new()),
             skipped_profiles: RwLock::new(Vec::new()),
             state_path,
-            secret_store: Some(secret_store),
-            encryption_password: Some(zeroize::Zeroizing::new(password.to_vec())),
+            secret_store: Some(Arc::new(secret_store)),
+            encryption_password: Some(Arc::new(zeroize::Zeroizing::new(password.to_vec()))),
+            persist_lock: Mutex::new(()),
+            last_used_persistence: LastUsedPersistence {
+                state: Mutex::new(LastUsedPersistenceState {
+                    dirty_generation: 0,
+                    scheduled_generation: 0,
+                    flushed_generation: 0,
+                    shutdown: false,
+                    auto_flush_enabled: true,
+                }),
+                condvar: Condvar::new(),
+            },
+        });
+        Ok(Self {
+            last_used_worker: Mutex::new(Self::start_last_used_worker(&shared)),
+            shared,
         })
+    }
+
+    fn lock_persist(&self) -> MutexGuard<'_, ()> {
+        self.shared
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_last_used_state(&self) -> MutexGuard<'_, LastUsedPersistenceState> {
+        self.shared
+            .last_used_persistence
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn start_last_used_worker(
+        shared: &Arc<ProfileStoreShared>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let worker_shared = Arc::clone(shared);
+        match std::thread::Builder::new()
+            .name("auth-profile-last-used".to_string())
+            .spawn(move || Self::last_used_worker_loop(worker_shared))
+        {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to start auth profile last_used persistence worker; pending timestamps will flush on synchronous saves or shutdown"
+                );
+                None
+            }
+        }
+    }
+
+    fn last_used_worker_loop(shared: Arc<ProfileStoreShared>) {
+        while let Some(shutdown_flush) = Self::next_last_used_work(&shared) {
+            if let Err(err) = Self::flush_pending_last_used_once_shared(&shared) {
+                if shutdown_flush {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to flush auth profile last_used metadata during shutdown"
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist auth profile last_used metadata"
+                );
+            }
+            if shutdown_flush {
+                return;
+            }
+        }
+    }
+
+    fn next_last_used_work(shared: &ProfileStoreShared) -> Option<bool> {
+        let mut state = shared
+            .last_used_persistence
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.shutdown {
+                return (state.dirty_generation > state.flushed_generation).then_some(true);
+            }
+            if state.auto_flush_enabled && state.dirty_generation > state.scheduled_generation {
+                state.scheduled_generation = state.dirty_generation;
+                return Some(false);
+            }
+            state = shared
+                .last_used_persistence
+                .condvar
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn capture_dirty_generation(&self) -> u64 {
+        self.lock_last_used_state().dirty_generation
+    }
+
+    fn mark_last_used_persisted(&self, generation: u64) {
+        let mut state = self.lock_last_used_state();
+        state.flushed_generation = state.flushed_generation.max(generation);
+        state.scheduled_generation = state.scheduled_generation.max(generation);
+        self.shared.last_used_persistence.condvar.notify_all();
+    }
+
+    fn note_last_used_dirty(&self) {
+        let mut state = self.lock_last_used_state();
+        state.dirty_generation = state.dirty_generation.saturating_add(1);
+        self.shared.last_used_persistence.condvar.notify_one();
+    }
+
+    fn flush_pending_last_used_once_shared(
+        shared: &ProfileStoreShared,
+    ) -> Result<bool, AuthProfileError> {
+        let _persist_guard = shared
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let profiles = shared.profiles.read();
+        let target_generation = {
+            let state = shared
+                .last_used_persistence
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.dirty_generation <= state.flushed_generation {
+                return Ok(false);
+            }
+            state.dirty_generation
+        };
+        Self::save_profiles_shared(shared, &profiles)?;
+        let mut state = shared
+            .last_used_persistence
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.flushed_generation = state.flushed_generation.max(target_generation);
+        state.scheduled_generation = state.scheduled_generation.max(target_generation);
+        shared.last_used_persistence.condvar.notify_all();
+        Ok(true)
+    }
+
+    fn flush_pending_last_used_once(&self) -> Result<bool, AuthProfileError> {
+        Self::flush_pending_last_used_once_shared(self.shared.as_ref())
+    }
+
+    #[cfg(test)]
+    fn pause_last_used_auto_flush_for_tests(&self) {
+        let mut state = self.lock_last_used_state();
+        state.auto_flush_enabled = false;
+        self.shared.last_used_persistence.condvar.notify_all();
+    }
+
+    #[cfg(test)]
+    fn flush_pending_last_used_for_tests(&self) -> Result<bool, AuthProfileError> {
+        self.flush_pending_last_used_once()
+    }
+
+    fn shutdown_last_used_worker(&self) {
+        {
+            let mut state = self.lock_last_used_state();
+            state.shutdown = true;
+            self.shared.last_used_persistence.condvar.notify_all();
+        }
+
+        let handle = self
+            .last_used_worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            if handle.join().is_err() {
+                tracing::warn!(
+                    "auth profile last_used persistence worker panicked during shutdown"
+                );
+            }
+        } else if let Err(err) = self.flush_pending_last_used_once() {
+            tracing::warn!(
+                error = %err,
+                "failed to flush auth profile last_used metadata during shutdown"
+            );
+        }
     }
 
     /// Load profiles from disk. Replaces any in-memory data.
@@ -1011,19 +1230,21 @@ impl ProfileStore {
     /// transparently.  Plaintext values (no `enc:v1:` prefix) are left as-is
     /// for backward compatibility.
     pub fn load(&self) -> Result<(), AuthProfileError> {
-        if !self.state_path.exists() {
+        let _persist_guard = self.lock_persist();
+        if !self.shared.state_path.exists() {
             return Ok(());
         }
 
-        let content = fs::read_to_string(&self.state_path)
+        let content = fs::read_to_string(&self.shared.state_path)
             .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
 
         let loaded = parse_store_file(&content)?;
         let mut profiles = loaded.profiles;
 
         // Decrypt token fields if we have a SecretStore
-        if let Some(ref store) = self.secret_store {
+        if let Some(ref store) = self.shared.secret_store {
             let password: &[u8] = self
+                .shared
                 .encryption_password
                 .as_deref()
                 .map(|v| v.as_slice())
@@ -1033,8 +1254,13 @@ impl ProfileStore {
             }
         }
 
-        *self.profiles.write() = profiles;
-        *self.skipped_profiles.write() = loaded.skipped;
+        *self.shared.profiles.write() = profiles;
+        *self.shared.skipped_profiles.write() = loaded.skipped;
+        let mut state = self.lock_last_used_state();
+        state.dirty_generation = 0;
+        state.scheduled_generation = 0;
+        state.flushed_generation = 0;
+        self.shared.last_used_persistence.condvar.notify_all();
         Ok(())
     }
 
@@ -1044,8 +1270,12 @@ impl ProfileStore {
     /// fields are encrypted before serialization.  In-memory profiles remain
     /// in plaintext so that callers never see encrypted values.
     pub fn save(&self) -> Result<(), AuthProfileError> {
-        let guard = self.profiles.read();
-        self.save_profiles(&guard)
+        let _persist_guard = self.lock_persist();
+        let guard = self.shared.profiles.read();
+        let persisted_generation = self.capture_dirty_generation();
+        self.save_profiles(&guard)?;
+        self.mark_last_used_persisted(persisted_generation);
+        Ok(())
     }
 
     /// Internal save that operates on an already-borrowed slice of profiles.
@@ -1055,25 +1285,32 @@ impl ProfileStore {
     /// mutate the data between the two lock acquisitions.  Callers that already
     /// hold a write guard should use this method directly.
     fn save_profiles(&self, profiles: &[AuthProfile]) -> Result<(), AuthProfileError> {
+        Self::save_profiles_shared(self.shared.as_ref(), profiles)
+    }
+
+    fn save_profiles_shared(
+        shared: &ProfileStoreShared,
+        profiles: &[AuthProfile],
+    ) -> Result<(), AuthProfileError> {
         // Clone so we can encrypt without mutating in-memory state
         let mut to_save = profiles.to_vec();
 
         // Encrypt token fields if we have a SecretStore
-        if let Some(ref store) = self.secret_store {
+        if let Some(ref store) = shared.secret_store {
             for profile in to_save.iter_mut() {
-                Self::encrypt_profile_credential(profile, store)?;
+                Self::encrypt_profile_credential(profile, store.as_ref())?;
             }
         }
 
-        let skipped = self.skipped_profiles.read();
+        let skipped = shared.skipped_profiles.read();
         let content = serialize_store(&to_save, &skipped)?;
 
         // Ensure parent directory exists
-        if let Some(parent) = self.state_path.parent() {
+        if let Some(parent) = shared.state_path.parent() {
             fs::create_dir_all(parent).map_err(|e| AuthProfileError::IoError(e.to_string()))?;
         }
 
-        let temp_path = self.state_path.with_extension("tmp");
+        let temp_path = shared.state_path.with_extension("tmp");
 
         let mut file =
             fs::File::create(&temp_path).map_err(|e| AuthProfileError::IoError(e.to_string()))?;
@@ -1084,7 +1321,7 @@ impl ProfileStore {
         file.sync_all()
             .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
 
-        fs::rename(&temp_path, &self.state_path)
+        fs::rename(&temp_path, &shared.state_path)
             .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
 
         Ok(())
@@ -1250,7 +1487,8 @@ impl ProfileStore {
 
     /// Add a profile. Fails if MAX_PROFILES would be exceeded.
     pub fn add(&self, profile: AuthProfile) -> Result<(), AuthProfileError> {
-        let mut guard = self.profiles.write();
+        let _persist_guard = self.lock_persist();
+        let mut guard = self.shared.profiles.write();
         if guard.len() >= MAX_PROFILES {
             return Err(AuthProfileError::MaxProfilesExceeded);
         }
@@ -1258,24 +1496,30 @@ impl ProfileStore {
             return Err(AuthProfileError::DuplicateProfileId(profile.id));
         }
         guard.push(profile);
-        self.save_profiles(&guard)
+        let persisted_generation = self.capture_dirty_generation();
+        self.save_profiles(&guard)?;
+        self.mark_last_used_persisted(persisted_generation);
+        Ok(())
     }
 
     /// Remove a profile by ID. Returns `true` if a profile was removed.
     pub fn remove(&self, id: &str) -> Result<bool, AuthProfileError> {
-        let mut guard = self.profiles.write();
+        let _persist_guard = self.lock_persist();
+        let mut guard = self.shared.profiles.write();
         let before = guard.len();
         guard.retain(|p| p.id != id);
         let removed = guard.len() < before;
         if removed {
+            let persisted_generation = self.capture_dirty_generation();
             self.save_profiles(&guard)?;
+            self.mark_last_used_persisted(persisted_generation);
         }
         Ok(removed)
     }
 
     /// Get a profile by ID (cloned).
     pub fn get(&self, id: &str) -> Option<AuthProfile> {
-        let guard = self.profiles.read();
+        let guard = self.shared.profiles.read();
         guard.iter().find(|p| p.id == id).cloned()
     }
 
@@ -1286,7 +1530,7 @@ impl ProfileStore {
         user_id: Option<&str>,
         email: Option<&str>,
     ) -> Option<AuthProfile> {
-        let guard = self.profiles.read();
+        let guard = self.shared.profiles.read();
         guard
             .iter()
             .find(|profile| {
@@ -1313,13 +1557,14 @@ impl ProfileStore {
 
     /// List all profiles as summaries (no tokens exposed).
     pub fn list(&self) -> Vec<AuthProfileSummary> {
-        let guard = self.profiles.read();
+        let guard = self.shared.profiles.read();
         guard.iter().map(|p| p.to_summary()).collect()
     }
 
     /// Update the tokens for a profile.
     pub fn update_tokens(&self, id: &str, tokens: OAuthTokens) -> Result<(), AuthProfileError> {
-        let mut guard = self.profiles.write();
+        let _persist_guard = self.lock_persist();
+        let mut guard = self.shared.profiles.write();
         let profile = guard
             .iter_mut()
             .find(|p| p.id == id)
@@ -1330,7 +1575,10 @@ impl ProfileStore {
             )));
         }
         profile.tokens = Some(tokens);
-        self.save_profiles(&guard)
+        let persisted_generation = self.capture_dirty_generation();
+        self.save_profiles(&guard)?;
+        self.mark_last_used_persisted(persisted_generation);
+        Ok(())
     }
 
     /// Update the last-used timestamp for a profile.
@@ -1340,8 +1588,8 @@ impl ProfileStore {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        let mut guard = self.profiles.write();
-        let mut should_persist = false;
+        let mut guard = self.shared.profiles.write();
+        let mut should_schedule_flush = false;
         if let Some(profile) = guard.iter_mut().find(|p| p.id == id) {
             let is_stale = profile
                 .last_used_ms
@@ -1349,18 +1597,19 @@ impl ProfileStore {
                 .unwrap_or(true);
             if is_stale {
                 profile.last_used_ms = Some(now_ms);
-                should_persist = true;
+                should_schedule_flush = true;
             }
         }
-        if should_persist {
-            // Best-effort save; ignore errors for a timestamp update
-            let _ = self.save_profiles(&guard);
+        drop(guard);
+        if should_schedule_flush {
+            self.note_last_used_dirty();
         }
     }
 
     /// Insert or replace a full profile by ID.
     pub fn upsert(&self, profile: AuthProfile) -> Result<(), AuthProfileError> {
-        let mut guard = self.profiles.write();
+        let _persist_guard = self.lock_persist();
+        let mut guard = self.shared.profiles.write();
         if let Some(existing) = guard.iter_mut().find(|p| p.id == profile.id) {
             *existing = profile;
         } else {
@@ -1369,7 +1618,16 @@ impl ProfileStore {
             }
             guard.push(profile);
         }
-        self.save_profiles(&guard)
+        let persisted_generation = self.capture_dirty_generation();
+        self.save_profiles(&guard)?;
+        self.mark_last_used_persisted(persisted_generation);
+        Ok(())
+    }
+}
+
+impl Drop for ProfileStore {
+    fn drop(&mut self) {
+        self.shutdown_last_used_worker();
     }
 }
 
@@ -1975,6 +2233,31 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_store_update_last_used_defers_disk_write_until_flush() {
+        let dir = tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().to_path_buf());
+        store.pause_last_used_auto_flush_for_tests();
+        store.add(sample_profile("lu-flush")).unwrap();
+
+        let state_path = dir.path().join("auth_profiles.json");
+        let raw_before = std::fs::read_to_string(&state_path).unwrap();
+        let saved_before: serde_json::Value = serde_json::from_str(&raw_before).unwrap();
+        assert!(saved_before["profiles"][0]["last_used_ms"].is_null());
+
+        store.update_last_used("lu-flush");
+
+        let raw_after_update = std::fs::read_to_string(&state_path).unwrap();
+        assert_eq!(raw_after_update, raw_before);
+
+        store.flush_pending_last_used_for_tests().unwrap();
+
+        let raw_after_flush = std::fs::read_to_string(&state_path).unwrap();
+        assert_ne!(raw_after_flush, raw_before);
+        let saved: serde_json::Value = serde_json::from_str(&raw_after_flush).unwrap();
+        assert!(saved["profiles"][0]["last_used_ms"].as_u64().is_some());
+    }
+
+    #[test]
     fn test_profile_store_update_last_used_skips_recent_timestamp() {
         let dir = tempdir().unwrap();
         let store = ProfileStore::new(dir.path().to_path_buf());
@@ -1993,6 +2276,71 @@ mod tests {
 
         let profile = store.get("lu-recent").unwrap();
         assert_eq!(profile.last_used_ms, expected);
+    }
+
+    #[test]
+    fn test_profile_store_sync_save_absorbs_pending_last_used_flush() {
+        let dir = tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().to_path_buf());
+        store.pause_last_used_auto_flush_for_tests();
+        store.add(sample_profile("lu-sync")).unwrap();
+
+        let state_path = dir.path().join("auth_profiles.json");
+        let raw_before = std::fs::read_to_string(&state_path).unwrap();
+
+        store.update_last_used("lu-sync");
+        assert_eq!(std::fs::read_to_string(&state_path).unwrap(), raw_before);
+
+        store
+            .update_tokens(
+                "lu-sync",
+                OAuthTokens {
+                    access_token: "new-access".to_string(),
+                    refresh_token: Some("new-refresh".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(123_456_789),
+                    scope: None,
+                },
+            )
+            .unwrap();
+
+        let raw_after_save = std::fs::read_to_string(&state_path).unwrap();
+        assert_ne!(raw_after_save, raw_before);
+        let saved: serde_json::Value = serde_json::from_str(&raw_after_save).unwrap();
+        assert_eq!(saved["profiles"][0]["tokens"]["access_token"], "new-access");
+        assert!(saved["profiles"][0]["last_used_ms"].as_u64().is_some());
+
+        let flushed = store.flush_pending_last_used_for_tests().unwrap();
+        assert!(
+            !flushed,
+            "synchronous save should absorb pending last_used dirtiness"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            raw_after_save
+        );
+    }
+
+    #[test]
+    fn test_profile_store_drop_flushes_pending_last_used() {
+        let dir = tempdir().unwrap();
+        {
+            let store = ProfileStore::new(dir.path().to_path_buf());
+            store.pause_last_used_auto_flush_for_tests();
+            store.add(sample_profile("lu-drop")).unwrap();
+            store.update_last_used("lu-drop");
+        }
+
+        let reopened = ProfileStore::new(dir.path().to_path_buf());
+        reopened.load().unwrap();
+        assert!(
+            reopened
+                .get("lu-drop")
+                .expect("profile after drop flush")
+                .last_used_ms
+                .is_some(),
+            "drop should flush pending last_used metadata"
+        );
     }
 
     #[test]
@@ -2383,6 +2731,7 @@ mod tests {
 
         // Trigger a save -- tokens should now be encrypted
         store2.update_last_used("plain-1");
+        store2.flush_pending_last_used_for_tests().unwrap();
 
         let raw2 = std::fs::read_to_string(dir.path().join("auth_profiles.json")).unwrap();
         assert!(
@@ -2438,6 +2787,7 @@ mod tests {
 
         // Force a re-save
         store2.update_last_used("de-1");
+        store2.flush_pending_last_used_for_tests().unwrap();
 
         // Load yet again to verify
         let store3 = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
@@ -2519,6 +2869,7 @@ mod tests {
         assert!(err.contains("CARAPACE_CONFIG_PASSWORD"));
 
         store.update_last_used("anthropic:default");
+        store.flush_pending_last_used_for_tests().unwrap();
 
         let raw_after = std::fs::read_to_string(&state_path).unwrap();
         let saved_after: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
@@ -2577,7 +2928,7 @@ mod tests {
         let store = ProfileStore::new(dir.path().to_path_buf());
         store.load().unwrap();
 
-        let profiles = store.profiles.read();
+        let profiles = store.shared.profiles.read();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].id, "v1-test");
     }
@@ -2589,7 +2940,8 @@ mod tests {
         store.load().unwrap();
 
         {
-            let mut guard = store.profiles.write();
+            let _persist_guard = store.lock_persist();
+            let mut guard = store.shared.profiles.write();
             guard.push(sample_profile("envelope-test"));
             store.save_profiles(&guard).unwrap();
         }
@@ -2625,7 +2977,7 @@ mod tests {
 
         // Reload should still work.
         store.load().unwrap();
-        assert_eq!(store.profiles.read().len(), 1);
+        assert_eq!(store.shared.profiles.read().len(), 1);
     }
 
     #[test]
@@ -2646,8 +2998,8 @@ mod tests {
 
         let store = ProfileStore::new(dir.path().to_path_buf());
         store.load().unwrap();
-        assert_eq!(store.profiles.read().len(), 1);
-        assert_eq!(store.profiles.read()[0].id, "v2-test");
+        assert_eq!(store.shared.profiles.read().len(), 1);
+        assert_eq!(store.shared.profiles.read()[0].id, "v2-test");
     }
 
     #[test]
@@ -2680,9 +3032,9 @@ mod tests {
         store.load().unwrap();
 
         // Good profile loaded, bad one skipped.
-        assert_eq!(store.profiles.read().len(), 1);
-        assert_eq!(store.profiles.read()[0].id, "good");
-        assert_eq!(store.skipped_profiles.read().len(), 1);
+        assert_eq!(store.shared.profiles.read().len(), 1);
+        assert_eq!(store.shared.profiles.read()[0].id, "good");
+        assert_eq!(store.shared.skipped_profiles.read().len(), 1);
 
         // Save and reload — skipped profile is preserved.
         store.save().unwrap();
@@ -2692,8 +3044,8 @@ mod tests {
 
         // Reload — same result.
         store.load().unwrap();
-        assert_eq!(store.profiles.read().len(), 1);
-        assert_eq!(store.skipped_profiles.read().len(), 1);
+        assert_eq!(store.shared.profiles.read().len(), 1);
+        assert_eq!(store.shared.skipped_profiles.read().len(), 1);
     }
 
     #[test]
@@ -2722,8 +3074,8 @@ mod tests {
         let store = ProfileStore::new(dir.path().to_path_buf());
         store.load().unwrap();
 
-        assert_eq!(store.profiles.read().len(), 0);
-        assert_eq!(store.skipped_profiles.read().len(), 1);
+        assert_eq!(store.shared.profiles.read().len(), 0);
+        assert_eq!(store.shared.skipped_profiles.read().len(), 1);
     }
 
     #[test]
@@ -2732,7 +3084,8 @@ mod tests {
         let store = ProfileStore::new(dir.path().to_path_buf());
 
         {
-            let mut guard = store.profiles.write();
+            let _persist_guard = store.lock_persist();
+            let mut guard = store.shared.profiles.write();
             guard.push(sample_token_profile(
                 "anthropic:default",
                 OAuthProvider::Anthropic,
@@ -2743,7 +3096,7 @@ mod tests {
 
         // Reload and verify.
         store.load().unwrap();
-        let profiles = store.profiles.read();
+        let profiles = store.shared.profiles.read();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].id, "anthropic:default");
         assert_eq!(
