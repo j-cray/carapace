@@ -2543,25 +2543,36 @@ fn plugin_cli_staged_path(dest: &Path) -> Result<PathBuf, Box<dyn std::error::Er
 async fn acquire_plugin_file_transaction_lock(
     lock: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(lock)
-        .await
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                cli_error(format!(
-                    "refusing to stage plugin file because staging lock '{}' already exists; another local plugin mutation may still be in progress, or the lock may be stale from a previous interrupted run. Verify that no other `cara plugins install --file` or `cara plugins update --file` command is still running, inspect the PID recorded in the lock file if needed, and then remove the lock file and retry. The PID in the lock file may have been recycled if the original process crashed.",
-                    lock.display()
-                ))
-            } else {
-                cli_error(format!(
-                    "failed to create staging lock '{}': {}",
-                    lock.display(),
-                    err
-                ))
+    let lock_owned = lock.to_path_buf();
+    let std_file = tokio::task::spawn_blocking({
+        let lock_owned = lock_owned.clone();
+        move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
             }
-        })?;
+            options.open(&lock_owned)
+        }
+    })
+    .await
+    .map_err(|e| cli_error(format!("spawn_blocking failed: {e}")))?;
+    let mut file = tokio::fs::File::from_std(std_file.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            cli_error(format!(
+                "refusing to stage plugin file because staging lock '{}' already exists; another local plugin mutation may still be in progress, or the lock may be stale from a previous interrupted run. Verify that no other `cara plugins install --file` or `cara plugins update --file` command is still running, inspect the PID recorded in the lock file if needed, and then remove the lock file and retry. The PID in the lock file may have been recycled if the original process crashed.",
+                lock.display()
+            ))
+        } else {
+            cli_error(format!(
+                "failed to create staging lock '{}': {}",
+                lock.display(),
+                err
+            ))
+        }
+    })?);
     let pid = std::process::id().to_string();
     if let Err(err) = file.write_all(pid.as_bytes()).await {
         return Err(cleanup_failed_plugin_file_transaction_lock_init(
@@ -2848,6 +2859,20 @@ fn should_fail_staged_plugin_write(dest: &Path) -> bool {
         == Some(dest)
 }
 
+/// Reject a path that is a symlink. This narrows the TOCTOU window between
+/// a prior `symlink_metadata` check and a subsequent mutation. It is not
+/// race-proof on its own but combined with `O_NOFOLLOW` on opens it
+/// provides defense-in-depth against local symlink-swap attacks.
+fn reject_if_symlink(path: &Path, label: &str) -> Result<(), String> {
+    match path.symlink_metadata() {
+        Ok(m) if m.file_type().is_symlink() => Err(format!(
+            "{label} '{}' is a symlink; refusing to proceed",
+            path.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
 async fn write_staged_plugin_artifact(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
     if should_fail_staged_plugin_write(dest) {
@@ -2855,11 +2880,31 @@ async fn write_staged_plugin_artifact(dest: &Path, bytes: &[u8]) -> std::io::Res
             "injected staged plugin write failure",
         ));
     }
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)
-        .await?;
+    // create_new(true) provides O_CREAT|O_EXCL (fails if path exists).
+    // On Unix, O_NOFOLLOW prevents following symlinks — if an attacker
+    // places a symlink between the cleanup check and this open, the open
+    // fails with ELOOP instead of creating a file through the symlink.
+    //
+    // Uses std::fs for the open (to access OpenOptionsExt::custom_flags),
+    // then wraps in tokio::fs::File for async write.
+    let dest = dest.to_path_buf();
+    let std_file = tokio::task::spawn_blocking({
+        let dest = dest.clone();
+        move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            options.open(&dest)
+        }
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("spawn_blocking failed: {e}")))??;
+
+    let mut file = tokio::fs::File::from_std(std_file);
     file.write_all(bytes).await?;
     file.sync_data().await
 }
@@ -2948,11 +2993,8 @@ async fn stage_plugin_file_into_managed_dir(
                 ));
             }
         }
-        // This preflight rejects existing symlinks and the `.cli-lock` serializes
-        // concurrent `cara ... --file` mutations, but it intentionally assumes a
-        // trusted local state directory for this loopback-only workflow. We do
-        // not try to defend here against an unrelated local process swapping the
-        // path between this check and the later rename.
+        // SECURITY: symlink-resistant staging — see docs/security.md for the
+        // filesystem trust model.
         match tokio::fs::symlink_metadata(&backup).await {
             Ok(_) => {
                 return Err(format!(
@@ -2992,6 +3034,10 @@ async fn stage_plugin_file_into_managed_dir(
         }
         let had_existing = existing_metadata.is_some();
         if had_existing {
+            // Tighten the TOCTOU window: re-check dest is not a symlink
+            // immediately before the rename. Combined with the preflight
+            // check above, this narrows the attack surface.
+            reject_if_symlink(&dest, "managed plugin destination")?;
             tokio::fs::rename(&dest, &backup).await.map_err(|err| {
                 format!(
                     "failed to move existing managed plugin artifact '{}' to staging backup '{}': {}",
