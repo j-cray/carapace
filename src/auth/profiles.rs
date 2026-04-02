@@ -1161,6 +1161,9 @@ impl ProfileStore {
     fn note_last_used_dirty(&self) {
         let mut state = self.lock_last_used_state();
         state.dirty_generation = state.dirty_generation.saturating_add(1);
+    }
+
+    fn notify_last_used_dirty(&self) {
         self.shared.last_used_persistence.condvar.notify_one();
     }
 
@@ -1199,6 +1202,9 @@ impl ProfileStore {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Capture both the saved snapshot and dirty generation under the
+            // same profile lock so a concurrent `update_last_used()` cannot
+            // advance the generation past what was actually written.
             if state.dirty_generation <= state.flushed_generation {
                 return Ok(false);
             }
@@ -1672,6 +1678,9 @@ impl ProfileStore {
             self.note_last_used_dirty();
         }
         drop(guard);
+        if should_schedule_flush {
+            self.notify_last_used_dirty();
+        }
     }
 
     /// Insert or replace a full profile by ID.
