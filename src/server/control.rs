@@ -407,31 +407,46 @@ pub struct ControlOnboardingApplied {
 }
 
 impl ControlOnboardingAppliedMode {
-    fn wire_name(self) -> &'static str {
-        match self {
-            Self::ApiKey => "apiKey",
-            Self::OAuth => "oauth",
-        }
-    }
-
     fn applied(self) -> ControlOnboardingApplied {
         ControlOnboardingApplied { mode: self }
     }
+}
+
+fn serialize_control_onboarding_applied_mode(mode: ControlOnboardingAppliedMode) -> String {
+    serde_json::to_value(mode)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .expect("control onboarding applied mode should serialize to a string")
 }
 
 fn validate_control_onboarding_applied_mode(
     applied: &Value,
     expected_mode: ControlOnboardingAppliedMode,
 ) -> Result<ControlOnboardingApplied, String> {
-    let reported_mode = applied
+    let expected_mode_name = serialize_control_onboarding_applied_mode(expected_mode);
+    let reported_mode_value = applied
         .get("mode")
-        .and_then(Value::as_str)
+        .cloned()
         .ok_or_else(|| "Provider onboarding apply result is missing required `mode`".to_string())?;
+    let reported_mode = serde_json::from_value::<ControlOnboardingAppliedMode>(
+        reported_mode_value.clone(),
+    )
+    .map_err(|_| {
+        if let Some(reported_mode) = reported_mode_value.as_str() {
+            format!(
+                "Provider onboarding apply result reported unexpected mode `{reported_mode}` (expected `{expected_mode_name}`)"
+            )
+        } else {
+            format!(
+                "Provider onboarding apply result reported invalid non-string `mode` (expected `{expected_mode_name}`)"
+            )
+        }
+    })?;
 
-    if reported_mode != expected_mode.wire_name() {
+    if reported_mode != expected_mode {
         return Err(format!(
-            "Provider onboarding apply result reported unexpected mode `{reported_mode}` (expected `{}`)",
-            expected_mode.wire_name()
+            "Provider onboarding apply result reported unexpected mode `{}` (expected `{expected_mode_name}`)",
+            serialize_control_onboarding_applied_mode(reported_mode),
         ));
     }
 
@@ -2467,6 +2482,18 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_control_onboarding_applied_mode_uses_serde_wire_names() {
+        assert_eq!(
+            serialize_control_onboarding_applied_mode(ControlOnboardingAppliedMode::ApiKey),
+            "apiKey"
+        );
+        assert_eq!(
+            serialize_control_onboarding_applied_mode(ControlOnboardingAppliedMode::OAuth),
+            "oauth"
+        );
+    }
+
+    #[test]
     fn test_validate_control_onboarding_applied_mode_accepts_expected_mode() {
         let applied = json!({ "mode": "oauth", "profileId": "google-123" });
         let projected =
@@ -2483,6 +2510,17 @@ mod tests {
         )
         .expect_err("missing mode should be rejected");
         assert!(err.contains("missing required `mode`"));
+    }
+
+    #[test]
+    fn test_validate_control_onboarding_applied_mode_rejects_invalid_non_string_mode() {
+        let err = validate_control_onboarding_applied_mode(
+            &json!({"mode": {"kind": "oauth"}}),
+            ControlOnboardingAppliedMode::OAuth,
+        )
+        .expect_err("non-string mode should be rejected");
+        assert!(err.contains("invalid non-string `mode`"));
+        assert!(err.contains("oauth"));
     }
 
     #[test]
