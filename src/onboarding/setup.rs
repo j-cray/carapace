@@ -233,6 +233,7 @@ pub enum SetupCheckKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupCheckCode {
     AuthProfileConfigured,
+    AuthProfileNotConfigured,
     AuthProfileLoaded,
     AuthProfileWrongProvider,
     AuthProfileWrongCredentialType,
@@ -240,7 +241,6 @@ pub enum SetupCheckCode {
     AuthProfileTokenMissing,
     AuthProfileMissing,
     AuthProfileStoreReadFailed,
-    AuthProfileNeedsAttention,
     LocalValidationFailed,
 }
 
@@ -952,7 +952,8 @@ fn auth_profile_id_check(
                 "to store a sign-in profile",
                 format!("write {label} into config"),
             )),
-        ),
+        )
+        .with_code(SetupCheckCode::AuthProfileNotConfigured),
     }
 }
 
@@ -1619,6 +1620,23 @@ mod tests {
 
         assert_eq!(check.status, SetupCheckStatus::Pass);
         assert_eq!(check.code, Some(SetupCheckCode::AuthProfileConfigured));
+    }
+
+    #[test]
+    fn test_auth_profile_id_check_sets_auth_profile_not_configured_code() {
+        let cfg = json!({
+            "google": {}
+        });
+
+        let check = auth_profile_id_check(
+            &cfg,
+            &["google", "authProfile"],
+            "Gemini auth profile",
+            Some("cara setup --provider gemini --auth-mode oauth"),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(check.code, Some(SetupCheckCode::AuthProfileNotConfigured));
     }
 
     #[test]
