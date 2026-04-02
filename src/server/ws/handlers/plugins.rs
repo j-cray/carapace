@@ -464,11 +464,24 @@ fn atomic_write_plugin_file(
 
 /// Download a WASM binary from the given URL and save it atomically to the plugins
 /// directory.  Returns the final file path and the raw bytes on success.
+/// Download a plugin WASM binary without writing it to disk.
+///
+/// Returns the raw bytes after DNS validation and SSRF checks.
+/// Combined download+write for tests that need the old behavior.
+#[cfg(test)]
 fn download_plugin_wasm(
     url: &url::Url,
     plugins_dir: &Path,
     file_name: &str,
 ) -> Result<(PathBuf, Vec<u8>), ErrorShape> {
+    let bytes = download_plugin_wasm_bytes(url, plugins_dir)?;
+    let dest = atomic_write_plugin_file(plugins_dir, file_name, &bytes)?;
+    Ok((dest, bytes))
+}
+
+/// The caller is responsible for writing the bytes via
+/// `atomic_write_plugin_file` at the appropriate transactional point.
+fn download_plugin_wasm_bytes(url: &url::Url, plugins_dir: &Path) -> Result<Vec<u8>, ErrorShape> {
     let (host, port, resolved_ip) = validate_and_resolve_dns(url)?;
 
     std::fs::create_dir_all(plugins_dir).map_err(|e| {
@@ -480,9 +493,7 @@ fn download_plugin_wasm(
     })?;
 
     let bytes = download_with_pinned_ip(url, &host, port, resolved_ip)?;
-    let dest_path = atomic_write_plugin_file(plugins_dir, file_name, &bytes)?;
-
-    Ok((dest_path, bytes.to_vec()))
+    Ok(bytes.to_vec())
 }
 
 pub(super) fn handle_plugins_status(state: &WsServerState) -> Result<Value, ErrorShape> {
@@ -848,21 +859,28 @@ fn scan_plugins_bins(dir: &std::path::Path) -> Vec<Value> {
 /// previous one committed, the earlier writes are rolled back from backups.
 struct PluginWriteTransaction {
     plugins_dir: PathBuf,
+    plugin_name: String,
     artifact_backup: Option<PathBuf>,
     manifest_backup: Option<PathBuf>,
+    /// Whether the artifact was written by this transaction (for rollback
+    /// of first-install where no backup exists).
+    artifact_written: bool,
 }
 
 impl PluginWriteTransaction {
-    fn new(plugins_dir: PathBuf) -> Self {
+    fn new(plugins_dir: PathBuf, plugin_name: String) -> Self {
         Self {
             plugins_dir,
+            plugin_name,
             artifact_backup: None,
             manifest_backup: None,
+            artifact_written: false,
         }
     }
 
     /// Back up the existing artifact before overwriting it.
-    fn backup_artifact(&mut self, name: &str) -> Result<(), ErrorShape> {
+    fn backup_artifact(&mut self) -> Result<(), ErrorShape> {
+        let name = &self.plugin_name;
         let artifact = self.plugins_dir.join(format!("{name}.wasm"));
         if artifact.is_file() {
             let backup = self.plugins_dir.join(format!("{name}.wasm.txn-bak"));
@@ -911,14 +929,26 @@ impl PluginWriteTransaction {
     }
 
     /// Roll back the artifact to its pre-transaction state.
-    fn rollback_artifact(&self, name: &str) {
+    fn rollback_artifact(&self) {
+        let name = &self.plugin_name;
         let artifact = self.plugins_dir.join(format!("{name}.wasm"));
         if let Some(ref backup) = self.artifact_backup {
+            // Restore from backup (update case).
+            let _ = std::fs::remove_file(&artifact);
             if let Err(e) = std::fs::rename(backup, &artifact) {
                 tracing::warn!(
                     error = %e,
                     plugin = name,
                     "failed to roll back plugin artifact from backup"
+                );
+            }
+        } else if self.artifact_written {
+            // First install — no backup, just remove the newly written file.
+            if let Err(e) = std::fs::remove_file(&artifact) {
+                tracing::warn!(
+                    error = %e,
+                    plugin = name,
+                    "failed to remove newly written plugin artifact during rollback"
                 );
             }
         }
@@ -981,9 +1011,10 @@ fn handle_plugins_install_inner(
     // --- Phase 1: Prepare all payloads and validate config BEFORE any writes ---
 
     // Resolve the artifact bytes (download or read existing).
+    // Download returns bytes only — no disk write yet (that happens in Phase 2).
     let (wasm_bytes_for_write, wasm_hash) = if let Some(raw_url) = url_str {
         let parsed_url = validate_url(raw_url)?;
-        let (_dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
+        let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir)?;
         let hash = compute_sha256_hex(&wasm_bytes);
         (Some(wasm_bytes), hash)
     } else {
@@ -1049,29 +1080,33 @@ fn handle_plugins_install_inner(
 
     // --- Phase 2: Commit all writes with backup-based rollback ---
 
-    let mut txn = PluginWriteTransaction::new(plugins_dir.to_path_buf());
+    let mut txn = PluginWriteTransaction::new(plugins_dir.to_path_buf(), name.to_string());
 
     // Write 1: artifact (if download path).
     if let Some(ref bytes) = wasm_bytes_for_write {
-        txn.backup_artifact(name)?;
+        txn.backup_artifact()?;
         if let Err(e) = atomic_write_plugin_file(plugins_dir, &wasm_file_name, bytes) {
-            txn.rollback_artifact(name);
+            txn.rollback_artifact();
             return Err(e);
         }
+        txn.artifact_written = true;
     }
 
     // Write 2: manifest.
-    txn.backup_manifest()?;
+    if let Err(e) = txn.backup_manifest() {
+        txn.rollback_artifact();
+        return Err(e);
+    }
     if let Err(e) = write_plugins_manifest(plugins_dir, &manifest) {
         txn.rollback_manifest();
-        txn.rollback_artifact(name);
+        txn.rollback_artifact();
         return Err(e);
     }
 
     // Write 3: config.
     if let Err(e) = write_config_file(&config::get_config_path(), &config_value) {
         txn.rollback_manifest();
-        txn.rollback_artifact(name);
+        txn.rollback_artifact();
         return Err(e);
     }
 
@@ -1157,7 +1192,7 @@ fn handle_plugins_update_inner(
 
     let (wasm_bytes_for_write, wasm_hash, source_url) = if let Some(url_str) = url_str {
         let parsed_url = validate_url(url_str)?;
-        let (_dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
+        let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir)?;
         let hash = compute_sha256_hex(&wasm_bytes);
         (Some(wasm_bytes), hash, Some(url_str.to_string()))
     } else {
@@ -1221,29 +1256,33 @@ fn handle_plugins_update_inner(
 
     // --- Phase 2: Commit all writes with backup-based rollback ---
 
-    let mut txn = PluginWriteTransaction::new(plugins_dir.to_path_buf());
+    let mut txn = PluginWriteTransaction::new(plugins_dir.to_path_buf(), name.to_string());
 
     // Write 1: artifact (if download path).
     if let Some(ref bytes) = wasm_bytes_for_write {
-        txn.backup_artifact(name)?;
+        txn.backup_artifact()?;
         if let Err(e) = atomic_write_plugin_file(plugins_dir, &wasm_file_name, bytes) {
-            txn.rollback_artifact(name);
+            txn.rollback_artifact();
             return Err(e);
         }
+        txn.artifact_written = true;
     }
 
     // Write 2: manifest.
-    txn.backup_manifest()?;
+    if let Err(e) = txn.backup_manifest() {
+        txn.rollback_artifact();
+        return Err(e);
+    }
     if let Err(e) = write_plugins_manifest(plugins_dir, &manifest) {
         txn.rollback_manifest();
-        txn.rollback_artifact(name);
+        txn.rollback_artifact();
         return Err(e);
     }
 
     // Write 3: config.
     if let Err(e) = write_config_file(&config::get_config_path(), &config_value) {
         txn.rollback_manifest();
-        txn.rollback_artifact(name);
+        txn.rollback_artifact();
         return Err(e);
     }
 
