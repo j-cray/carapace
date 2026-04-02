@@ -4,9 +4,10 @@
 //! resolution on hot paths that do not otherwise hold a long-lived
 //! `ProfileStore`.
 
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::UNIX_EPOCH;
@@ -29,7 +30,7 @@ struct ProfileStoreFileStamp {
 
 impl ProfileStoreFileStamp {
     fn read(path: &Path) -> Self {
-        let Ok(metadata) = fs::metadata(path) else {
+        let Ok(mut file) = fs::File::open(path) else {
             return Self {
                 exists: false,
                 len: 0,
@@ -37,20 +38,25 @@ impl ProfileStoreFileStamp {
                 content_fingerprint: None,
             };
         };
+        let metadata = file.metadata().ok();
         let modified_ns = metadata
-            .modified()
-            .ok()
+            .as_ref()
+            .and_then(|file| file.modified().ok())
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        let content_fingerprint = fs::read(path).ok().map(|bytes| {
-            let mut hasher = Sha256::new();
-            hasher.update(bytes);
-            hasher.finalize().into()
-        });
+        let mut bytes = Vec::new();
+        let (len, content_fingerprint) = match file.read_to_end(&mut bytes) {
+            Ok(_) => {
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                (bytes.len() as u64, Some(hasher.finalize().into()))
+            }
+            Err(_) => (metadata.as_ref().map(|file| file.len()).unwrap_or(0), None),
+        };
         Self {
             exists: true,
-            len: metadata.len(),
+            len,
             modified_ns,
             content_fingerprint,
         }
@@ -110,6 +116,7 @@ struct AuthProfileRuntimeState {
 
 pub(crate) struct AuthProfileRuntimeResolver {
     state: RwLock<AuthProfileRuntimeState>,
+    reload_lock: Mutex<()>,
     #[cfg(test)]
     anthropic_load_attempts: AtomicUsize,
 }
@@ -118,9 +125,21 @@ impl AuthProfileRuntimeResolver {
     pub(crate) fn new() -> Self {
         Self {
             state: RwLock::new(AuthProfileRuntimeState::default()),
+            reload_lock: Mutex::new(()),
             #[cfg(test)]
             anthropic_load_attempts: AtomicUsize::new(0),
         }
+    }
+
+    fn resolve_cached_match(
+        &self,
+        snapshot: &AnthropicProfileStoreSnapshot,
+        profile_id: &str,
+    ) -> Option<Result<String, String>> {
+        let state = self.state.read();
+        let cached = state.anthropic_store.as_ref()?;
+        (&cached.snapshot == snapshot)
+            .then(|| Self::resolve_cached_anthropic_token(&cached.store, profile_id))
     }
 
     fn resolve_anthropic_token(
@@ -128,18 +147,13 @@ impl AuthProfileRuntimeResolver {
         inputs: AnthropicProfileRuntimeInputs,
         profile_id: &str,
     ) -> Result<String, String> {
-        let state = self.state.upgradable_read();
-        if let Some(cached) = state.anthropic_store.as_ref() {
-            if cached.snapshot == inputs.snapshot {
-                return Self::resolve_cached_anthropic_token(&cached.store, profile_id);
-            }
+        if let Some(result) = self.resolve_cached_match(&inputs.snapshot, profile_id) {
+            return result;
         }
 
-        let mut state = RwLockUpgradableReadGuard::upgrade(state);
-        if let Some(cached) = state.anthropic_store.as_ref() {
-            if cached.snapshot == inputs.snapshot {
-                return Self::resolve_cached_anthropic_token(&cached.store, profile_id);
-            }
+        let _reload_guard = self.reload_lock.lock();
+        if let Some(result) = self.resolve_cached_match(&inputs.snapshot, profile_id) {
+            return result;
         }
 
         #[cfg(test)]
@@ -153,13 +167,14 @@ impl AuthProfileRuntimeResolver {
         store
             .load()
             .map_err(|err| format!("failed to load Anthropic auth profile store: {err}"))?;
-        let resolved = Self::resolve_cached_anthropic_token(&store, profile_id)?;
+        let resolved = Self::resolve_cached_anthropic_token(&store, profile_id);
 
+        let mut state = self.state.write();
         state.anthropic_store = Some(CachedAnthropicProfileStore {
             snapshot: inputs.snapshot,
             store,
         });
-        Ok(resolved)
+        resolved
     }
 
     fn resolve_cached_anthropic_token(
@@ -226,10 +241,14 @@ mod tests {
         }
     }
 
+    fn test_password(label: &str) -> String {
+        format!("{label}-{}", crate::time::unix_now_ms_u64())
+    }
+
     #[test]
     fn test_resolve_anthropic_profile_token_reuses_cached_store() {
         let temp = tempfile::tempdir().unwrap();
-        let password = "runtime-cache-password".to_string();
+        let password = test_password("runtime-cache-password");
         let profile_id = "anthropic:default";
         let store = ProfileStore::with_encryption(temp.path().to_path_buf(), password.as_bytes())
             .expect("encrypted profile store");
@@ -263,7 +282,7 @@ mod tests {
     #[test]
     fn test_resolve_anthropic_profile_token_reloads_after_store_write() {
         let temp = tempfile::tempdir().unwrap();
-        let password = "runtime-reload-password".to_string();
+        let password = test_password("runtime-reload-password");
         let profile_id = "anthropic:default";
         let store = ProfileStore::with_encryption(temp.path().to_path_buf(), password.as_bytes())
             .expect("encrypted profile store");
@@ -324,8 +343,8 @@ mod tests {
     #[test]
     fn test_resolve_anthropic_profile_token_reloads_after_password_change() {
         let temp = tempfile::tempdir().unwrap();
-        let correct_password = "runtime-correct-password".to_string();
-        let wrong_password = "runtime-wrong-password".to_string();
+        let correct_password = test_password("runtime-correct-password");
+        let wrong_password = test_password("runtime-wrong-password");
         let profile_id = "anthropic:default";
         let store =
             ProfileStore::with_encryption(temp.path().to_path_buf(), correct_password.as_bytes())
@@ -362,6 +381,35 @@ mod tests {
                 .expect("correct password resolve after mismatch"),
             "sk-ant-oat01-correct-token"
         );
-        assert_eq!(resolver.anthropic_load_attempts_for_tests(), 2);
+        assert_eq!(resolver.anthropic_load_attempts_for_tests(), 3);
+    }
+
+    #[test]
+    fn test_resolve_anthropic_profile_token_caches_loaded_store_on_profile_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let password = test_password("runtime-missing-profile-password");
+        let store = ProfileStore::with_encryption(temp.path().to_path_buf(), password.as_bytes())
+            .expect("encrypted profile store");
+        store
+            .add(anthropic_token_profile(
+                "anthropic:default",
+                "sk-ant-oat01-cached-token",
+            ))
+            .expect("store profile");
+
+        let resolver = AuthProfileRuntimeResolver::new();
+        let inputs =
+            AnthropicProfileRuntimeInputs::new(temp.path().to_path_buf(), password.clone());
+        let first = resolver
+            .resolve_anthropic_token(inputs, "anthropic:missing")
+            .expect_err("missing profile should fail");
+        let inputs =
+            AnthropicProfileRuntimeInputs::new(temp.path().to_path_buf(), password.clone());
+        let second = resolver
+            .resolve_anthropic_token(inputs, "anthropic:missing")
+            .expect_err("missing profile should still fail");
+
+        assert_eq!(first, second);
+        assert_eq!(resolver.anthropic_load_attempts_for_tests(), 1);
     }
 }
