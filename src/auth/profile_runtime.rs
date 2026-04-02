@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::UNIX_EPOCH;
+use zeroize::Zeroizing;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -83,15 +84,6 @@ impl AnthropicProfileStoreSnapshot {
         }
     }
 
-    fn refreshed_after_load(&self) -> Self {
-        Self {
-            state_dir: self.state_dir.clone(),
-            state_path: self.state_path.clone(),
-            password_fingerprint: self.password_fingerprint,
-            file_stamp: ProfileStoreMetadataStamp::read(&self.state_path),
-        }
-    }
-
     fn cache_key_matches(&self, other: &Self) -> bool {
         self.state_dir == other.state_dir
             && self.state_path == other.state_path
@@ -101,7 +93,7 @@ impl AnthropicProfileStoreSnapshot {
 
 struct AnthropicProfileRuntimeInputs {
     snapshot: AnthropicProfileStoreSnapshot,
-    password: String,
+    password: Zeroizing<String>,
 }
 
 impl AnthropicProfileRuntimeInputs {
@@ -117,8 +109,9 @@ impl AnthropicProfileRuntimeInputs {
     }
 
     fn new(state_dir: PathBuf, password: String) -> Self {
+        let password = Zeroizing::new(password);
         Self {
-            snapshot: AnthropicProfileStoreSnapshot::new(state_dir, &password),
+            snapshot: AnthropicProfileStoreSnapshot::new(state_dir, password.as_str()),
             password,
         }
     }
@@ -142,6 +135,8 @@ pub(crate) struct AuthProfileRuntimeResolver {
     anthropic_load_attempts: AtomicUsize,
     #[cfg(test)]
     test_now_ms: AtomicU64,
+    #[cfg(test)]
+    post_load_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl AuthProfileRuntimeResolver {
@@ -153,6 +148,8 @@ impl AuthProfileRuntimeResolver {
             anthropic_load_attempts: AtomicUsize::new(0),
             #[cfg(test)]
             test_now_ms: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            post_load_hook: Mutex::new(None),
         }
     }
 
@@ -201,12 +198,17 @@ impl AuthProfileRuntimeResolver {
         }
 
         let store = self.load_anthropic_store(&inputs)?;
+        #[cfg(test)]
+        self.run_post_load_hook_for_tests();
         let resolved = Self::resolve_cached_anthropic_token(&store, profile_id);
-        let snapshot = inputs.snapshot.refreshed_after_load();
 
         let mut state = self.state.write();
+        // Cache the pre-load metadata stamp, not a post-load re-read. If the
+        // store changes after this load completes, the next caller sees the
+        // new metadata and reloads instead of treating a post-load stamp as if
+        // it described the bytes already cached in memory.
         state.anthropic_store = Some(CachedAnthropicProfileStore {
-            snapshot,
+            snapshot: inputs.snapshot,
             expires_at_ms: now_ms.saturating_add(ANTHROPIC_PROFILE_STORE_CACHE_TTL_MS),
             store,
         });
@@ -245,6 +247,7 @@ impl AuthProfileRuntimeResolver {
         state.anthropic_store = None;
         self.anthropic_load_attempts.store(0, Ordering::Relaxed);
         self.test_now_ms.store(u64::MAX, Ordering::Relaxed);
+        *self.post_load_hook.lock() = None;
     }
 
     #[cfg(test)]
@@ -265,6 +268,18 @@ impl AuthProfileRuntimeResolver {
         };
         self.test_now_ms
             .store(base.saturating_add(delta_ms), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn set_post_load_hook_for_tests(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.post_load_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_post_load_hook_for_tests(&self) {
+        if let Some(hook) = self.post_load_hook.lock().take() {
+            hook();
+        }
     }
 }
 
@@ -406,6 +421,57 @@ mod tests {
             resolver
                 .resolve_anthropic_token(inputs, profile_id)
                 .expect("reload resolve"),
+            "sk-ant-oat01-fresh-token"
+        );
+        assert_eq!(resolver.anthropic_load_attempts_for_tests(), 2);
+    }
+
+    #[test]
+    fn test_resolve_anthropic_profile_token_keeps_preload_stamp_when_store_changes_post_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let password = test_password();
+        let profile_id = "anthropic:default";
+        let state_dir = temp.path().to_path_buf();
+        let store = ProfileStore::with_encryption(state_dir.clone(), password.as_bytes())
+            .expect("encrypted profile store");
+        store
+            .add(anthropic_token_profile(
+                profile_id,
+                "sk-ant-oat01-first-token",
+            ))
+            .expect("store profile");
+
+        let resolver = AuthProfileRuntimeResolver::new();
+        resolver.set_now_ms_for_tests(25_000);
+        let expected_updated_token = "sk-ant-oat01-fresh-token".to_string();
+        let hook_password = password.clone();
+        let hook_state_dir = state_dir.clone();
+        resolver.set_post_load_hook_for_tests(Box::new(move || {
+            let external_store =
+                ProfileStore::with_encryption(hook_state_dir, hook_password.as_bytes())
+                    .expect("external store");
+            external_store.load().expect("load existing profile");
+            external_store
+                .upsert(anthropic_token_profile(profile_id, &expected_updated_token))
+                .expect("rewrite profile after load");
+        }));
+
+        let initial_inputs =
+            AnthropicProfileRuntimeInputs::new(state_dir.clone(), password.clone());
+        let preload_stamp = initial_inputs.snapshot.file_stamp.clone();
+        assert_eq!(
+            resolver
+                .resolve_anthropic_token(initial_inputs, profile_id)
+                .expect("initial resolve"),
+            "sk-ant-oat01-first-token"
+        );
+
+        let updated_inputs = AnthropicProfileRuntimeInputs::new(state_dir, password);
+        assert_ne!(updated_inputs.snapshot.file_stamp, preload_stamp);
+        assert_eq!(
+            resolver
+                .resolve_anthropic_token(updated_inputs, profile_id)
+                .expect("changed store should force reload"),
             "sk-ant-oat01-fresh-token"
         );
         assert_eq!(resolver.anthropic_load_attempts_for_tests(), 2);
