@@ -1170,6 +1170,21 @@ mod tests {
         EnvVarGuard { key, previous }
     }
 
+    struct AuthProfileRuntimeResetGuard;
+
+    impl AuthProfileRuntimeResetGuard {
+        fn new() -> Self {
+            crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
+            Self
+        }
+    }
+
+    impl Drop for AuthProfileRuntimeResetGuard {
+        fn drop(&mut self) {
+            crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
+        }
+    }
+
     // -- current_time tests --
 
     #[test]
@@ -1543,7 +1558,7 @@ mod tests {
     #[test]
     fn test_resolve_anthropic_media_key_surfaces_unusable_auth_profile() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
+        let _runtime_guard = AuthProfileRuntimeResetGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let _state_dir = set_env_var_scoped(
             "CARAPACE_STATE_DIR",
@@ -1587,13 +1602,12 @@ mod tests {
         let err = resolve_anthropic_media_key(&cfg).expect_err("wrong password should surface");
         assert!(err.contains("could not decrypt the stored token"));
         assert!(err.contains("CARAPACE_CONFIG_PASSWORD"));
-        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
     }
 
     #[test]
     fn test_resolve_anthropic_media_key_ignores_blank_api_key_when_auth_profile_present() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
+        let _runtime_guard = AuthProfileRuntimeResetGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let _state_dir = set_env_var_scoped(
             "CARAPACE_STATE_DIR",
@@ -1632,13 +1646,12 @@ mod tests {
 
         let key = resolve_anthropic_media_key(&cfg).expect("resolved key");
         assert_eq!(key.as_deref(), Some("sk-ant-oat01-test-token"));
-        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
     }
 
     #[test]
     fn test_resolve_anthropic_media_key_reuses_cached_auth_profile_store() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
+        let _runtime_guard = AuthProfileRuntimeResetGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let _state_dir = set_env_var_scoped(
             "CARAPACE_STATE_DIR",
@@ -1682,7 +1695,6 @@ mod tests {
             crate::auth::profile_runtime::anthropic_profile_runtime_load_attempts_for_tests(),
             1
         );
-        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! resolution on hot paths that do not otherwise hold a long-lived
 //! `ProfileStore`.
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,8 @@ static AUTH_PROFILE_RUNTIME_RESOLVER: LazyLock<AuthProfileRuntimeResolver> =
 struct ProfileStoreFileStamp {
     exists: bool,
     len: u64,
-    modified_ms: u64,
+    modified_ns: u128,
+    content_fingerprint: Option<[u8; 32]>,
 }
 
 impl ProfileStoreFileStamp {
@@ -32,19 +33,26 @@ impl ProfileStoreFileStamp {
             return Self {
                 exists: false,
                 len: 0,
-                modified_ms: 0,
+                modified_ns: 0,
+                content_fingerprint: None,
             };
         };
-        let modified_ms = metadata
+        let modified_ns = metadata
             .modified()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_millis() as u64)
+            .map(|duration| duration.as_nanos())
             .unwrap_or(0);
+        let content_fingerprint = fs::read(path).ok().map(|bytes| {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            hasher.finalize().into()
+        });
         Self {
             exists: true,
             len: metadata.len(),
-            modified_ms,
+            modified_ns,
+            content_fingerprint,
         }
     }
 }
@@ -120,12 +128,17 @@ impl AuthProfileRuntimeResolver {
         inputs: AnthropicProfileRuntimeInputs,
         profile_id: &str,
     ) -> Result<String, String> {
-        {
-            let state = self.state.read();
-            if let Some(cached) = state.anthropic_store.as_ref() {
-                if cached.snapshot == inputs.snapshot {
-                    return Self::resolve_cached_anthropic_token(&cached.store, profile_id);
-                }
+        let state = self.state.upgradable_read();
+        if let Some(cached) = state.anthropic_store.as_ref() {
+            if cached.snapshot == inputs.snapshot {
+                return Self::resolve_cached_anthropic_token(&cached.store, profile_id);
+            }
+        }
+
+        let mut state = RwLockUpgradableReadGuard::upgrade(state);
+        if let Some(cached) = state.anthropic_store.as_ref() {
+            if cached.snapshot == inputs.snapshot {
+                return Self::resolve_cached_anthropic_token(&cached.store, profile_id);
             }
         }
 
@@ -142,7 +155,6 @@ impl AuthProfileRuntimeResolver {
             .map_err(|err| format!("failed to load Anthropic auth profile store: {err}"))?;
         let resolved = Self::resolve_cached_anthropic_token(&store, profile_id)?;
 
-        let mut state = self.state.write();
         state.anthropic_store = Some(CachedAnthropicProfileStore {
             snapshot: inputs.snapshot,
             store,
@@ -194,6 +206,7 @@ mod tests {
     use crate::auth::profiles::{
         AuthProfile, AuthProfileCredentialKind, OAuthProvider, ProfileStore,
     };
+    use std::fs;
 
     fn anthropic_token_profile(id: &str, token: &str) -> AuthProfile {
         AuthProfile {
@@ -255,7 +268,10 @@ mod tests {
         let store = ProfileStore::with_encryption(temp.path().to_path_buf(), password.as_bytes())
             .expect("encrypted profile store");
         store
-            .add(anthropic_token_profile(profile_id, "sk-ant-oat01-short"))
+            .add(anthropic_token_profile(
+                profile_id,
+                "sk-ant-oat01-first-token",
+            ))
             .expect("store profile");
 
         let resolver = AuthProfileRuntimeResolver::new();
@@ -265,7 +281,7 @@ mod tests {
             resolver
                 .resolve_anthropic_token(inputs, profile_id)
                 .expect("initial resolve"),
-            "sk-ant-oat01-short"
+            "sk-ant-oat01-first-token"
         );
 
         let external_store =
@@ -275,7 +291,7 @@ mod tests {
         external_store
             .upsert(anthropic_token_profile(
                 profile_id,
-                "sk-ant-oat01-much-longer-reloaded-token",
+                "sk-ant-oat01-fresh-token",
             ))
             .expect("rewrite profile");
 
@@ -285,9 +301,24 @@ mod tests {
             resolver
                 .resolve_anthropic_token(inputs, profile_id)
                 .expect("reload resolve"),
-            "sk-ant-oat01-much-longer-reloaded-token"
+            "sk-ant-oat01-fresh-token"
         );
         assert_eq!(resolver.anthropic_load_attempts_for_tests(), 2);
+    }
+
+    #[test]
+    fn test_profile_store_file_stamp_tracks_same_length_content_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth_profiles.json");
+
+        fs::write(&path, b"aaaa").expect("write initial file");
+        let first = ProfileStoreFileStamp::read(&path);
+
+        fs::write(&path, b"bbbb").expect("rewrite same-length file");
+        let second = ProfileStoreFileStamp::read(&path);
+
+        assert_eq!(first.len, second.len);
+        assert_ne!(first.content_fingerprint, second.content_fingerprint);
     }
 
     #[test]
