@@ -17,6 +17,41 @@ use crate::auth::profiles::{
     AuthProfileCredentialKind, OAuthProvider, ProfileStore,
 };
 
+/// Open and load the profile store, logging a warning on failure.
+///
+/// Returns `None` if the store cannot be opened or loaded, with a structured
+/// warning that includes the provider name, profile ID, and error. This
+/// replaces the previous silent `.ok()?` pattern that erased failures into
+/// the same state as "no auth profile configured."
+fn open_and_load_profile_store(
+    state_dir: std::path::PathBuf,
+    provider: &str,
+    profile_id: &str,
+) -> Option<ProfileStore> {
+    let store = match ProfileStore::from_env(state_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                provider = provider,
+                profile_id = profile_id,
+                error = %e,
+                "failed to open auth-profile store; check CARAPACE_CONFIG_PASSWORD"
+            );
+            return None;
+        }
+    };
+    if let Err(e) = store.load() {
+        warn!(
+            provider = provider,
+            profile_id = profile_id,
+            error = %e,
+            "failed to load auth-profile store"
+        );
+        return None;
+    }
+    Some(store)
+}
+
 fn resolve_anthropic_auth_profile_id(cfg: &Value) -> Option<String> {
     cfg.get("anthropic")
         .and_then(|v| v.get("authProfile"))
@@ -59,8 +94,7 @@ fn resolve_google_oauth_runtime_config(
     state_dir: &Path,
     profile_id: &str,
 ) -> Option<crate::auth::profiles::OAuthProviderConfig> {
-    let profile_store = ProfileStore::from_env(state_dir.to_path_buf()).ok()?;
-    profile_store.load().ok()?;
+    let profile_store = open_and_load_profile_store(state_dir.to_path_buf(), "google", profile_id)?;
     let profile = profile_store.get(profile_id)?;
     if profile.provider != OAuthProvider::Google
         || profile.credential_kind != AuthProfileCredentialKind::OAuth
@@ -91,8 +125,7 @@ fn resolve_google_oauth_runtime_config(
 fn resolve_anthropic_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_id = resolve_anthropic_auth_profile_id(cfg)?;
     let state_dir = crate::paths::resolve_state_dir();
-    let profile_store = ProfileStore::from_env(state_dir).ok()?;
-    profile_store.load().ok()?;
+    let profile_store = open_and_load_profile_store(state_dir, "anthropic", &profile_id)?;
     let profile = profile_store.get(&profile_id)?;
     if profile.provider != OAuthProvider::Anthropic
         || profile.credential_kind != AuthProfileCredentialKind::Token
@@ -114,8 +147,7 @@ fn resolve_openai_oauth_runtime_config(
     state_dir: &Path,
     profile_id: &str,
 ) -> Option<crate::auth::profiles::OAuthProviderConfig> {
-    let profile_store = ProfileStore::from_env(state_dir.to_path_buf()).ok()?;
-    profile_store.load().ok()?;
+    let profile_store = open_and_load_profile_store(state_dir.to_path_buf(), "openai", profile_id)?;
     let profile = profile_store.get(profile_id)?;
     if profile.provider != OAuthProvider::OpenAI
         || profile.credential_kind != AuthProfileCredentialKind::OAuth
@@ -146,8 +178,7 @@ fn resolve_openai_oauth_runtime_config(
 fn resolve_google_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_id = resolve_google_auth_profile_id(cfg)?;
     let state_dir = crate::paths::resolve_state_dir();
-    let profile_store = ProfileStore::from_env(state_dir).ok()?;
-    profile_store.load().ok()?;
+    let profile_store = open_and_load_profile_store(state_dir, "google", &profile_id)?;
     let profile = profile_store.get(&profile_id)?;
     if profile.provider != OAuthProvider::Google
         || profile.credential_kind != AuthProfileCredentialKind::OAuth
@@ -168,8 +199,7 @@ fn resolve_google_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
 fn resolve_openai_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_id = resolve_openai_auth_profile_id(cfg)?;
     let state_dir = crate::paths::resolve_state_dir();
-    let profile_store = ProfileStore::from_env(state_dir).ok()?;
-    profile_store.load().ok()?;
+    let profile_store = open_and_load_profile_store(state_dir, "openai", &profile_id)?;
     let profile = profile_store.get(&profile_id)?;
     if profile.provider != OAuthProvider::OpenAI
         || profile.credential_kind != AuthProfileCredentialKind::OAuth
@@ -997,11 +1027,13 @@ mod tests {
                 "CARAPACE_STATE_DIR",
                 temp.path().to_str().expect("state dir path"),
             );
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1081,11 +1113,13 @@ mod tests {
                 "CARAPACE_STATE_DIR",
                 temp.path().to_str().expect("state dir path"),
             );
-            let provider_config = OAuthProvider::OpenAI.default_config(
-                "openai-client-id",
-                "openai-client-secret",
-                "https://gateway.example.com/control/onboarding/codex/callback",
-            );
+            let provider_config = OAuthProvider::OpenAI
+                .default_config(
+                    "openai-client-id",
+                    "openai-client-secret",
+                    "https://gateway.example.com/control/onboarding/codex/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "openai-abc123".to_string(),
                 name: "Codex user@example.com".to_string(),
@@ -1129,11 +1163,13 @@ mod tests {
                 temp.path().to_str().expect("state dir path"),
             );
             let _blank_key = set_env_var_scoped("GOOGLE_API_KEY", "   ");
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1261,11 +1297,13 @@ mod tests {
                 "CARAPACE_STATE_DIR",
                 temp.path().to_str().expect("state dir path"),
             );
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1326,11 +1364,13 @@ mod tests {
             );
             let _blank_key = set_env_var_scoped("GOOGLE_API_KEY", "   ");
 
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1378,11 +1418,13 @@ mod tests {
                 temp.path().to_str().expect("state dir path"),
             );
 
-            let provider_config = OAuthProvider::OpenAI.default_config(
-                "openai-client-id",
-                "openai-client-secret",
-                "https://gateway.example.com/control/onboarding/codex/callback",
-            );
+            let provider_config = OAuthProvider::OpenAI
+                .default_config(
+                    "openai-client-id",
+                    "openai-client-secret",
+                    "https://gateway.example.com/control/onboarding/codex/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "openai-abc123".to_string(),
                 name: "Codex user@example.com".to_string(),
@@ -1675,11 +1717,13 @@ mod tests {
     fn test_resolve_google_oauth_runtime_config_uses_stored_redirect_uri_when_missing() {
         with_clean_provider_env(|| {
             let temp = tempfile::tempdir().expect("tempdir");
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1856,5 +1900,98 @@ mod tests {
         let a = hash_key_prefix("key-1");
         let b = hash_key_prefix("key-2");
         assert_ne!(a, b);
+    }
+
+    fn sample_anthropic_token_profile() -> crate::auth::profiles::AuthProfile {
+        crate::auth::profiles::AuthProfile {
+            id: "anthropic:default".to_string(),
+            name: "Test".to_string(),
+            provider: OAuthProvider::Anthropic,
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some("sk-ant-oat01-test-token".to_string()),
+            oauth_provider_config: None,
+        }
+    }
+
+    fn random_test_password() -> String {
+        let mut bytes = [0u8; 24];
+        getrandom::fill(&mut bytes).expect("random test password bytes");
+        hex::encode(bytes)
+    }
+
+    #[test]
+    fn anthropic_auth_profile_fingerprint_with_correct_password() {
+        with_clean_provider_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let password = random_test_password();
+            let _pw = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
+            let _sd = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
+
+            let store =
+                ProfileStore::with_encryption(dir.path().to_path_buf(), password.as_bytes())
+                    .unwrap();
+            store.add(sample_anthropic_token_profile()).unwrap();
+
+            let cfg = json!({ "anthropic": { "authProfile": "anthropic:default" } });
+            let fp = resolve_anthropic_auth_profile_fingerprint(&cfg);
+
+            assert!(
+                fp.is_some(),
+                "fingerprint should resolve with correct password"
+            );
+            assert!(fp.unwrap().starts_with("auth-profile:anthropic:default:"));
+        });
+    }
+
+    #[test]
+    fn anthropic_auth_profile_fingerprint_differs_with_wrong_password() {
+        with_clean_provider_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let password = random_test_password();
+            let wrong_password = random_test_password();
+
+            let store =
+                ProfileStore::with_encryption(dir.path().to_path_buf(), password.as_bytes())
+                    .unwrap();
+            store.add(sample_anthropic_token_profile()).unwrap();
+
+            let cfg = json!({ "anthropic": { "authProfile": "anthropic:default" } });
+
+            // Fingerprint with correct password.
+            let _pw = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
+            let _sd = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
+            let fp_correct = resolve_anthropic_auth_profile_fingerprint(&cfg);
+            drop(_pw);
+            drop(_sd);
+
+            // Fingerprint with wrong password — store loads but token stays
+            // encrypted, producing a different fingerprint hash.
+            let _pw2 = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &wrong_password);
+            let _sd2 = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
+            let fp_wrong = resolve_anthropic_auth_profile_fingerprint(&cfg);
+
+            assert!(fp_correct.is_some());
+            assert!(fp_wrong.is_some());
+            assert_ne!(
+                fp_correct, fp_wrong,
+                "fingerprint should differ when password is wrong (token stays encrypted)"
+            );
+        });
+    }
+
+    #[test]
+    fn anthropic_auth_profile_fingerprint_no_profile_configured() {
+        with_clean_provider_env(|| {
+            let cfg = json!({ "anthropic": { "apiKey": "sk-ant-test" } });
+            let fp = resolve_anthropic_auth_profile_fingerprint(&cfg);
+            assert!(fp.is_none());
+        });
     }
 }

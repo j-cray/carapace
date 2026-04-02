@@ -699,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn test_with_oauth_profile_uses_stored_access_token() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = ProfileStore::new(temp.path().to_path_buf());
+        let store = Arc::new(ProfileStore::new(temp.path().to_path_buf()));
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -729,13 +729,15 @@ mod tests {
             .expect("store profile");
 
         let provider = GeminiProvider::with_oauth_profile(
-            Arc::new(store),
+            store.clone(),
             "google-test".to_string(),
-            OAuthProvider::Google.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::Google
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("oauth-backed provider");
 
@@ -743,6 +745,14 @@ mod tests {
         assert_eq!(
             headers,
             vec![("authorization", "Bearer access-token-123".to_string())]
+        );
+        assert!(
+            store
+                .get("google-test")
+                .expect("stored profile")
+                .last_used_ms
+                .is_some(),
+            "last_used_ms should update after successful Gemini auth resolution"
         );
     }
 
@@ -753,11 +763,13 @@ mod tests {
         let provider = GeminiProvider::with_oauth_profile(
             Arc::new(store),
             "missing-profile".to_string(),
-            OAuthProvider::Google.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::Google
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("oauth-backed provider");
 
@@ -805,11 +817,13 @@ mod tests {
         let provider = GeminiProvider::with_oauth_profile(
             Arc::new(store),
             "google-empty-token".to_string(),
-            OAuthProvider::Google.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::Google
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("oauth-backed provider");
 
@@ -851,11 +865,13 @@ mod tests {
         let provider = GeminiProvider::with_oauth_profile(
             Arc::new(store),
             "google-token-kind".to_string(),
-            OAuthProvider::Google.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::Google
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("oauth-backed provider");
 
