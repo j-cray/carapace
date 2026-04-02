@@ -419,35 +419,46 @@ fn serialize_control_onboarding_applied_mode(mode: ControlOnboardingAppliedMode)
         .expect("control onboarding applied mode should serialize to a string")
 }
 
+fn invalid_control_onboarding_apply_result_message() -> String {
+    "Provider onboarding apply result was invalid; check server logs.".to_string()
+}
+
 fn validate_control_onboarding_applied_mode(
     applied: &Value,
     expected_mode: ControlOnboardingAppliedMode,
 ) -> Result<ControlOnboardingApplied, String> {
     let expected_mode_name = serialize_control_onboarding_applied_mode(expected_mode);
-    let reported_mode_value = applied
-        .get("mode")
-        .cloned()
-        .ok_or_else(|| "Provider onboarding apply result is missing required `mode`".to_string())?;
-    let reported_mode = serde_json::from_value::<ControlOnboardingAppliedMode>(
-        reported_mode_value.clone(),
-    )
-    .map_err(|_| {
-        if let Some(reported_mode) = reported_mode_value.as_str() {
-            format!(
-                "Provider onboarding apply result reported unexpected mode `{reported_mode}` (expected `{expected_mode_name}`)"
-            )
-        } else {
-            format!(
-                "Provider onboarding apply result reported invalid non-string `mode` (expected `{expected_mode_name}`)"
-            )
-        }
+    let reported_mode_value = applied.get("mode").cloned().ok_or_else(|| {
+        let applied_keys = applied
+            .as_object()
+            .map(|entries| entries.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        tracing::warn!(
+            expected_mode = %expected_mode_name,
+            applied_keys = ?applied_keys,
+            "control onboarding apply result missing mode"
+        );
+        invalid_control_onboarding_apply_result_message()
     })?;
+    let reported_mode =
+        serde_json::from_value::<ControlOnboardingAppliedMode>(reported_mode_value.clone())
+            .map_err(|_| {
+                tracing::warn!(
+                    expected_mode = %expected_mode_name,
+                    reported_mode = ?reported_mode_value,
+                    "control onboarding apply result reported invalid mode"
+                );
+                invalid_control_onboarding_apply_result_message()
+            })?;
 
     if reported_mode != expected_mode {
-        return Err(format!(
-            "Provider onboarding apply result reported unexpected mode `{}` (expected `{expected_mode_name}`)",
-            serialize_control_onboarding_applied_mode(reported_mode),
-        ));
+        let reported_mode_name = serialize_control_onboarding_applied_mode(reported_mode);
+        tracing::warn!(
+            expected_mode = %expected_mode_name,
+            reported_mode = %reported_mode_name,
+            "control onboarding apply result reported unexpected mode"
+        );
+        return Err(invalid_control_onboarding_apply_result_message());
     }
 
     Ok(expected_mode.applied())
@@ -2509,7 +2520,10 @@ mod tests {
             ControlOnboardingAppliedMode::OAuth,
         )
         .expect_err("missing mode should be rejected");
-        assert!(err.contains("missing required `mode`"));
+        assert_eq!(
+            err,
+            "Provider onboarding apply result was invalid; check server logs."
+        );
     }
 
     #[test]
@@ -2519,8 +2533,10 @@ mod tests {
             ControlOnboardingAppliedMode::OAuth,
         )
         .expect_err("non-string mode should be rejected");
-        assert!(err.contains("invalid non-string `mode`"));
-        assert!(err.contains("oauth"));
+        assert_eq!(
+            err,
+            "Provider onboarding apply result was invalid; check server logs."
+        );
     }
 
     #[test]
@@ -2530,9 +2546,12 @@ mod tests {
             ControlOnboardingAppliedMode::OAuth,
         )
         .expect_err("unexpected mode should be rejected");
-        assert!(err.contains("unexpected mode"));
-        assert!(err.contains("apiKey"));
-        assert!(err.contains("oauth"));
+        assert_eq!(
+            err,
+            "Provider onboarding apply result was invalid; check server logs."
+        );
+        assert!(!err.contains("apiKey"));
+        assert!(!err.contains("oauth"));
     }
 
     #[test]
