@@ -17,6 +17,41 @@ use crate::auth::profiles::{
     AuthProfileCredentialKind, OAuthProvider, ProfileStore,
 };
 
+/// Open and load the profile store, logging a warning on failure.
+///
+/// Returns `None` if the store cannot be opened or loaded, with a structured
+/// warning that includes the provider name, profile ID, and error. This
+/// replaces the previous silent `.ok()?` pattern that erased failures into
+/// the same state as "no auth profile configured."
+fn open_and_load_profile_store(
+    state_dir: std::path::PathBuf,
+    provider: &str,
+    profile_id: &str,
+) -> Option<ProfileStore> {
+    let store = match ProfileStore::from_env(state_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                provider = provider,
+                profile_id = profile_id,
+                error = %e,
+                "failed to open auth-profile store; check CARAPACE_CONFIG_PASSWORD"
+            );
+            return None;
+        }
+    };
+    if let Err(e) = store.load() {
+        warn!(
+            provider = provider,
+            profile_id = profile_id,
+            error = %e,
+            "failed to load auth-profile store"
+        );
+        return None;
+    }
+    Some(store)
+}
+
 fn resolve_anthropic_auth_profile_id(cfg: &Value) -> Option<String> {
     cfg.get("anthropic")
         .and_then(|v| v.get("authProfile"))
@@ -59,26 +94,7 @@ fn resolve_google_oauth_runtime_config(
     state_dir: &Path,
     profile_id: &str,
 ) -> Option<crate::auth::profiles::OAuthProviderConfig> {
-    let profile_store = match ProfileStore::from_env(state_dir.to_path_buf()) {
-        Ok(store) => store,
-        Err(e) => {
-            warn!(
-                provider = "google",
-                error = %e,
-                "oauth runtime config: failed to open profile store"
-            );
-            return None;
-        }
-    };
-    if let Err(e) = profile_store.load() {
-        warn!(
-            provider = "google",
-            profile_id = %profile_id,
-            error = %e,
-            "oauth runtime config: failed to load profile store"
-        );
-        return None;
-    }
+    let profile_store = open_and_load_profile_store(state_dir.to_path_buf(), "google", profile_id)?;
     let profile = profile_store.get(profile_id)?;
     if profile.provider != OAuthProvider::Google
         || profile.credential_kind != AuthProfileCredentialKind::OAuth
@@ -109,26 +125,7 @@ fn resolve_google_oauth_runtime_config(
 fn resolve_anthropic_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_id = resolve_anthropic_auth_profile_id(cfg)?;
     let state_dir = crate::paths::resolve_state_dir();
-    let profile_store = match ProfileStore::from_env(state_dir) {
-        Ok(store) => store,
-        Err(e) => {
-            warn!(
-                provider = "anthropic",
-                error = %e,
-                "auth-profile fingerprint: failed to open profile store"
-            );
-            return None;
-        }
-    };
-    if let Err(e) = profile_store.load() {
-        warn!(
-            provider = "anthropic",
-            profile_id = %profile_id,
-            error = %e,
-            "auth-profile fingerprint: failed to load profile store"
-        );
-        return None;
-    }
+    let profile_store = open_and_load_profile_store(state_dir, "anthropic", &profile_id)?;
     let profile = profile_store.get(&profile_id)?;
     if profile.provider != OAuthProvider::Anthropic
         || profile.credential_kind != AuthProfileCredentialKind::Token
@@ -150,26 +147,7 @@ fn resolve_openai_oauth_runtime_config(
     state_dir: &Path,
     profile_id: &str,
 ) -> Option<crate::auth::profiles::OAuthProviderConfig> {
-    let profile_store = match ProfileStore::from_env(state_dir.to_path_buf()) {
-        Ok(store) => store,
-        Err(e) => {
-            warn!(
-                provider = "openai",
-                error = %e,
-                "oauth runtime config: failed to open profile store"
-            );
-            return None;
-        }
-    };
-    if let Err(e) = profile_store.load() {
-        warn!(
-            provider = "openai",
-            profile_id = %profile_id,
-            error = %e,
-            "oauth runtime config: failed to load profile store"
-        );
-        return None;
-    }
+    let profile_store = open_and_load_profile_store(state_dir.to_path_buf(), "openai", profile_id)?;
     let profile = profile_store.get(profile_id)?;
     if profile.provider != OAuthProvider::OpenAI
         || profile.credential_kind != AuthProfileCredentialKind::OAuth
@@ -200,26 +178,7 @@ fn resolve_openai_oauth_runtime_config(
 fn resolve_google_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_id = resolve_google_auth_profile_id(cfg)?;
     let state_dir = crate::paths::resolve_state_dir();
-    let profile_store = match ProfileStore::from_env(state_dir) {
-        Ok(store) => store,
-        Err(e) => {
-            warn!(
-                provider = "google",
-                error = %e,
-                "auth-profile fingerprint: failed to open profile store"
-            );
-            return None;
-        }
-    };
-    if let Err(e) = profile_store.load() {
-        warn!(
-            provider = "google",
-            profile_id = %profile_id,
-            error = %e,
-            "auth-profile fingerprint: failed to load profile store"
-        );
-        return None;
-    }
+    let profile_store = open_and_load_profile_store(state_dir, "google", &profile_id)?;
     let profile = profile_store.get(&profile_id)?;
     if profile.provider != OAuthProvider::Google
         || profile.credential_kind != AuthProfileCredentialKind::OAuth
@@ -240,26 +199,7 @@ fn resolve_google_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
 fn resolve_openai_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_id = resolve_openai_auth_profile_id(cfg)?;
     let state_dir = crate::paths::resolve_state_dir();
-    let profile_store = match ProfileStore::from_env(state_dir) {
-        Ok(store) => store,
-        Err(e) => {
-            warn!(
-                provider = "openai",
-                error = %e,
-                "auth-profile fingerprint: failed to open profile store"
-            );
-            return None;
-        }
-    };
-    if let Err(e) = profile_store.load() {
-        warn!(
-            provider = "openai",
-            profile_id = %profile_id,
-            error = %e,
-            "auth-profile fingerprint: failed to load profile store"
-        );
-        return None;
-    }
+    let profile_store = open_and_load_profile_store(state_dir, "openai", &profile_id)?;
     let profile = profile_store.get(&profile_id)?;
     if profile.provider != OAuthProvider::OpenAI
         || profile.credential_kind != AuthProfileCredentialKind::OAuth
@@ -1966,12 +1906,18 @@ mod tests {
         }
     }
 
+    fn random_test_password() -> String {
+        let mut bytes = [0u8; 24];
+        getrandom::fill(&mut bytes).expect("random test password bytes");
+        hex::encode(bytes)
+    }
+
     #[test]
     fn anthropic_auth_profile_fingerprint_with_correct_password() {
         with_clean_provider_env(|| {
             let dir = tempfile::tempdir().unwrap();
-            let password = "test-password-123";
-            let _pw = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", password);
+            let password = random_test_password();
+            let _pw = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
             let _sd = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
 
             let store =
@@ -1994,7 +1940,8 @@ mod tests {
     fn anthropic_auth_profile_fingerprint_differs_with_wrong_password() {
         with_clean_provider_env(|| {
             let dir = tempfile::tempdir().unwrap();
-            let password = "correct-password";
+            let password = random_test_password();
+            let wrong_password = random_test_password();
 
             let store =
                 ProfileStore::with_encryption(dir.path().to_path_buf(), password.as_bytes())
@@ -2004,7 +1951,7 @@ mod tests {
             let cfg = json!({ "anthropic": { "authProfile": "anthropic:default" } });
 
             // Fingerprint with correct password.
-            let _pw = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", password);
+            let _pw = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
             let _sd = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
             let fp_correct = resolve_anthropic_auth_profile_fingerprint(&cfg);
             drop(_pw);
@@ -2012,7 +1959,7 @@ mod tests {
 
             // Fingerprint with wrong password — store loads but token stays
             // encrypted, producing a different fingerprint hash.
-            let _pw2 = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "wrong-password");
+            let _pw2 = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &wrong_password);
             let _sd2 = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
             let fp_wrong = resolve_anthropic_auth_profile_fingerprint(&cfg);
 
