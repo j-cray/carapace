@@ -1272,6 +1272,12 @@ impl ProfileStore {
                 tracing::warn!(
                     "auth profile last_used persistence worker panicked during shutdown"
                 );
+                if let Err(err) = self.flush_pending_last_used_once() {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to flush auth profile last_used metadata after worker panic"
+                    );
+                }
             }
         } else if let Err(err) = self.flush_pending_last_used_once() {
             tracing::warn!(
@@ -2423,6 +2429,55 @@ mod tests {
                 .last_used_ms
                 .is_some(),
             "drop should flush pending last_used metadata"
+        );
+    }
+
+    #[test]
+    fn test_profile_store_shutdown_flushes_pending_last_used_after_worker_panic() {
+        let dir = tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().to_path_buf());
+
+        let original_worker = store
+            .last_used_worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("background worker handle");
+        {
+            let mut state = store.lock_last_used_state();
+            state.shutdown = true;
+            store.shared.last_used_persistence.condvar.notify_all();
+        }
+        original_worker
+            .join()
+            .expect("original background worker should shut down cleanly");
+        {
+            let mut state = store.lock_last_used_state();
+            state.shutdown = false;
+            state.auto_flush_enabled = false;
+            state.reset_generations();
+        }
+
+        store.add(sample_profile("lu-panic")).unwrap();
+        store.update_last_used("lu-panic");
+        *store
+            .last_used_worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::thread::spawn(|| {
+            panic!("forced panic for shutdown fallback test");
+        }));
+
+        store.shutdown_last_used_worker();
+
+        let reopened = ProfileStore::new(dir.path().to_path_buf());
+        reopened.load().unwrap();
+        assert!(
+            reopened
+                .get("lu-panic")
+                .expect("profile after panic fallback flush")
+                .last_used_ms
+                .is_some(),
+            "shutdown should flush pending last_used metadata even if the worker panics"
         );
     }
 
