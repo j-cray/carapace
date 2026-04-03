@@ -2246,6 +2246,7 @@ mod tests {
 
     #[test]
     fn test_load_channel_activity_policy_ignores_defaulted_legacy_typing() {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("carapace.json5");
         fs::write(&config_path, "{}").unwrap();
@@ -2266,6 +2267,7 @@ mod tests {
 
     #[test]
     fn test_load_channel_activity_policy_falls_back_to_defaults_on_load_error() {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         let mut env_guard = crate::test_support::env::ScopedEnv::new();
         env_guard
@@ -2286,6 +2288,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_load_channel_activity_policy_async_uses_cached_snapshot_without_disk_reload() {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         let mut env_guard = crate::test_support::env::ScopedEnv::new();
         env_guard.set(
@@ -2318,6 +2321,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_load_channel_activity_policy_async_refreshes_stale_cache_from_disk() {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("carapace.json5");
@@ -3204,6 +3208,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_collect_configured_unsupported_features_for_registered_channels() {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         crate::config::update_cache(
             serde_json::json!({

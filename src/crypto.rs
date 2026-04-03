@@ -57,7 +57,7 @@ pub(crate) fn derive_key_argon2id(
     #[cfg(test)]
     let _guard = ARGON2_TEST_LOCK
         .lock()
-        .expect("Argon2 test lock should not be poisoned");
+        .unwrap_or_else(|err| err.into_inner());
 
     if salt.len() < ARGON2ID_MIN_SALT_LEN {
         return Err(PasswordKdfError::InvalidSaltLength {
