@@ -273,30 +273,30 @@ mod tests {
         derive_key(FORMAT_VERSION, passphrase, salt).expect("current backup KDF should derive")
     }
 
-    fn encrypt_backup_with_version(
-        version: u8,
-        input: &Path,
-        passphrase: &str,
+    fn write_legacy_v1_backup_fixture(
         output: &Path,
-    ) -> Result<BackupCryptoInfo, BackupCryptoError> {
-        let plaintext = std::fs::read(input).map_err(|e| {
-            BackupCryptoError::IoError(format!("failed to read input {}: {}", input.display(), e))
-        })?;
+        passphrase: &str,
+        plaintext: &[u8],
+    ) -> Result<(), BackupCryptoError> {
+        let salt_digest = sha2::Sha256::digest(b"carapace-backup-v1-fixture-salt");
+        let nonce_digest = sha2::Sha256::digest(b"carapace-backup-v1-fixture-nonce");
+        let salt: [u8; SALT_LEN] = salt_digest.into();
+        let nonce_bytes: [u8; NONCE_LEN] = nonce_digest[..NONCE_LEN]
+            .try_into()
+            .expect("fixture nonce length");
 
-        let mut salt = [0u8; SALT_LEN];
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::fill(&mut salt).map_err(|e| BackupCryptoError::RandomFailure(e.to_string()))?;
-        getrandom::fill(&mut nonce_bytes)
-            .map_err(|e| BackupCryptoError::RandomFailure(e.to_string()))?;
-
-        let mut key = derive_key(version, passphrase.as_bytes(), &salt)?;
+        let mut key = derive_key_reference_pbkdf2(
+            passphrase.as_bytes(),
+            &salt,
+            crate::crypto::LEGACY_PBKDF2_ITERATIONS,
+        );
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
             BackupCryptoError::KeyDerivationFailed(format!("invalid AES-256 key: {}", e))
         })?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
-            .map_err(|_| BackupCryptoError::IoError("encryption failed".to_string()))?;
+            .encrypt(nonce, plaintext)
+            .map_err(|_| BackupCryptoError::IoError("fixture encryption failed".to_string()))?;
         key.zeroize();
 
         let mut file = std::fs::File::create(output).map_err(|e| {
@@ -307,18 +307,13 @@ mod tests {
             ))
         })?;
         file.write_all(MAGIC)?;
-        file.write_all(&[version])?;
+        file.write_all(&[FORMAT_VERSION_V1])?;
         file.write_all(&salt)?;
         file.write_all(&nonce_bytes)?;
         file.write_all(&ciphertext)?;
         file.flush()?;
 
-        let metadata = std::fs::metadata(output)?;
-        Ok(BackupCryptoInfo {
-            output_path: output.to_path_buf(),
-            salt_hex: hex::encode(salt),
-            encrypted_size: metadata.len(),
-        })
+        Ok(())
     }
 
     #[test]
@@ -428,13 +423,11 @@ mod tests {
     #[test]
     fn test_decrypt_legacy_v1_backup() {
         let dir = TempDir::new().unwrap();
-        let input_path = dir.path().join("legacy.dat");
         let encrypted_path = dir.path().join("legacy.enc");
         let decrypted_path = dir.path().join("legacy.dec");
 
-        std::fs::write(&input_path, b"legacy backup payload").unwrap();
         let passphrase = random_passphrase();
-        encrypt_backup_with_version(FORMAT_VERSION_V1, &input_path, &passphrase, &encrypted_path)
+        write_legacy_v1_backup_fixture(&encrypted_path, &passphrase, b"legacy backup payload")
             .unwrap();
 
         decrypt_backup(&encrypted_path, &passphrase, &decrypted_path).unwrap();
