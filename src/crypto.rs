@@ -19,7 +19,7 @@ pub(crate) const LEGACY_PBKDF2_ITERATIONS: u32 = 600_000;
 pub(crate) const ARGON2ID_V2_MEMORY_KIB: u32 = 64 * 1024;
 pub(crate) const ARGON2ID_V2_ITERATIONS: u32 = 3;
 pub(crate) const ARGON2ID_V2_LANES: u32 = 1;
-const ARGON2ID_MIN_SALT_LEN: usize = 16;
+const PASSWORD_KDF_MIN_SALT_LEN: usize = 16;
 
 #[cfg(test)]
 static ARGON2_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -28,7 +28,7 @@ static ARGON2_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 pub(crate) enum PasswordKdfError {
     #[error("invalid Argon2 parameters: {0}")]
     InvalidParams(String),
-    #[error("invalid Argon2 salt length: expected at least {minimum}, got {got}")]
+    #[error("invalid password-KDF salt length: expected at least {minimum}, got {got}")]
     InvalidSaltLength { minimum: usize, got: usize },
     #[error("Argon2 derivation failed: {0}")]
     DerivationFailed(String),
@@ -44,10 +44,17 @@ pub(crate) fn generate_hex_secret(byte_len: usize) -> Result<String, getrandom::
 pub(crate) fn derive_key_pbkdf2_sha256(
     password: &[u8],
     salt: &[u8],
-) -> [u8; PASSWORD_DERIVED_KEY_LEN] {
+) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], PasswordKdfError> {
+    if salt.len() < PASSWORD_KDF_MIN_SALT_LEN {
+        return Err(PasswordKdfError::InvalidSaltLength {
+            minimum: PASSWORD_KDF_MIN_SALT_LEN,
+            got: salt.len(),
+        });
+    }
+
     let mut out = [0u8; PASSWORD_DERIVED_KEY_LEN];
     pbkdf2_hmac::<Sha256>(password, salt, LEGACY_PBKDF2_ITERATIONS, &mut out);
-    out
+    Ok(out)
 }
 
 pub(crate) fn derive_key_argon2id(
@@ -59,9 +66,9 @@ pub(crate) fn derive_key_argon2id(
         .lock()
         .unwrap_or_else(|err| err.into_inner());
 
-    if salt.len() < ARGON2ID_MIN_SALT_LEN {
+    if salt.len() < PASSWORD_KDF_MIN_SALT_LEN {
         return Err(PasswordKdfError::InvalidSaltLength {
-            minimum: ARGON2ID_MIN_SALT_LEN,
+            minimum: PASSWORD_KDF_MIN_SALT_LEN,
             got: salt.len(),
         });
     }
@@ -88,6 +95,20 @@ mod tests {
     use sha2_10::Digest;
 
     #[test]
+    fn test_derive_key_pbkdf2_sha256_rejects_short_salt() {
+        let password = Sha256::digest(b"carapace-pbkdf2-short-salt-password");
+        let salt = Sha256::digest(b"carapace-pbkdf2-short-salt-salt");
+        let err = derive_key_pbkdf2_sha256(password.as_slice(), &salt[..15]).unwrap_err();
+        assert_eq!(
+            err,
+            PasswordKdfError::InvalidSaltLength {
+                minimum: PASSWORD_KDF_MIN_SALT_LEN,
+                got: 15,
+            }
+        );
+    }
+
+    #[test]
     fn test_derive_key_argon2id_rejects_short_salt() {
         let password = Sha256::digest(b"carapace-argon2-short-salt-password");
         let salt = Sha256::digest(b"carapace-argon2-short-salt-salt");
@@ -95,7 +116,7 @@ mod tests {
         assert_eq!(
             err,
             PasswordKdfError::InvalidSaltLength {
-                minimum: ARGON2ID_MIN_SALT_LEN,
+                minimum: PASSWORD_KDF_MIN_SALT_LEN,
                 got: 15,
             }
         );

@@ -94,7 +94,7 @@ impl SecretEnvelopeVersion {
         salt: &[u8; SALT_LEN],
     ) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], PasswordKdfError> {
         match self {
-            Self::V1 => Ok(derive_key_pbkdf2_sha256(password, salt)),
+            Self::V1 => derive_key_pbkdf2_sha256(password, salt),
             Self::V2 => derive_key_argon2id(password, salt),
         }
     }
@@ -1306,9 +1306,9 @@ mod tests {
         // python3 -c 'import hashlib; p=hashlib.sha256(b"carapace-secret-v1-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-secret-v1-kat-salt").digest()[:16]; print(hashlib.pbkdf2_hmac("sha256", p, s, 600000, 32).hex())'
         let expected = "fba539b769b63cfb5a65da14de9267f70c7fa022345df609c146231d5668f5a6";
         let salt_bytes: &[u8; SALT_LEN] = (&salt[..SALT_LEN]).try_into().unwrap();
-        let key = derive_key_pbkdf2_sha256(passphrase.as_slice(), salt_bytes);
+        let key = derive_key_pbkdf2_sha256(passphrase.as_slice(), salt_bytes).unwrap();
         assert_eq!(hex::encode(key), expected);
-        let key2 = derive_key_pbkdf2_sha256(passphrase.as_slice(), salt_bytes);
+        let key2 = derive_key_pbkdf2_sha256(passphrase.as_slice(), salt_bytes).unwrap();
         assert_eq!(key, key2, "PBKDF2 must be deterministic");
     }
 
@@ -1330,7 +1330,7 @@ mod tests {
     fn test_argon2id_current_key_differs_from_legacy_pbkdf2() {
         let password = random_password();
         let salt = random_salt();
-        let legacy = derive_key_pbkdf2_sha256(&password, &salt);
+        let legacy = derive_key_pbkdf2_sha256(&password, &salt).unwrap();
         let current = derive_current_key(&password, &salt);
         assert_ne!(
             legacy, current,

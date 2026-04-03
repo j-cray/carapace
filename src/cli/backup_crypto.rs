@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::crypto::{derive_key_argon2id, derive_key_pbkdf2_sha256, PASSWORD_DERIVED_KEY_LEN};
 
@@ -93,7 +93,8 @@ fn derive_key(
     salt: &[u8],
 ) -> Result<[u8; KEY_LEN], BackupCryptoError> {
     match version {
-        FORMAT_VERSION_V1 => Ok(derive_key_pbkdf2_sha256(passphrase, salt)),
+        FORMAT_VERSION_V1 => derive_key_pbkdf2_sha256(passphrase, salt)
+            .map_err(|e| BackupCryptoError::KeyDerivationFailed(e.to_string())),
         FORMAT_VERSION_V2 => derive_key_argon2id(passphrase, salt)
             .map_err(|e| BackupCryptoError::KeyDerivationFailed(e.to_string())),
         other => Err(BackupCryptoError::UnsupportedVersion(other)),
@@ -119,15 +120,13 @@ pub fn encrypt_backup(
     getrandom::fill(&mut nonce_bytes)
         .map_err(|e| BackupCryptoError::RandomFailure(e.to_string()))?;
 
-    let mut key = derive_key(FORMAT_VERSION, passphrase.as_bytes(), &salt)?;
+    let key = Zeroizing::new(derive_key(FORMAT_VERSION, passphrase.as_bytes(), &salt)?);
 
-    let cipher = Aes256Gcm::new((&key).into());
+    let cipher = Aes256Gcm::new(key.as_ref().into());
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_ref())
         .map_err(|_| BackupCryptoError::IoError("encryption failed".to_string()))?;
-
-    key.zeroize();
 
     let mut file = std::fs::File::create(output).map_err(|e| {
         BackupCryptoError::IoError(format!(
@@ -180,15 +179,13 @@ pub fn decrypt_backup(
     let (salt, rest) = rest.split_at(SALT_LEN);
     let (nonce_bytes, ciphertext) = rest.split_at(NONCE_LEN);
 
-    let mut key = derive_key(version, passphrase.as_bytes(), salt)?;
+    let key = Zeroizing::new(derive_key(version, passphrase.as_bytes(), salt)?);
 
-    let cipher = Aes256Gcm::new((&key).into());
+    let cipher = Aes256Gcm::new(key.as_ref().into());
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| BackupCryptoError::DecryptionFailed)?;
-
-    key.zeroize();
 
     std::fs::write(output, &plaintext).map_err(|e| {
         BackupCryptoError::IoError(format!(
@@ -208,6 +205,7 @@ mod tests {
     use sha2::Digest;
     use sha2::Sha256 as HmacSha256Digest;
     use tempfile::TempDir;
+    use zeroize::Zeroize;
 
     fn random_bytes<const N: usize>() -> [u8; N] {
         let mut bytes = [0u8; N];
