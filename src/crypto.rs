@@ -1,5 +1,8 @@
 //! Shared cryptographic helper utilities.
 
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use pbkdf2::pbkdf2_hmac;
 use sha2_10::Sha256;
@@ -16,7 +19,10 @@ pub(crate) const LEGACY_PBKDF2_ITERATIONS: u32 = 600_000;
 pub(crate) const ARGON2ID_V2_MEMORY_KIB: u32 = 64 * 1024;
 pub(crate) const ARGON2ID_V2_ITERATIONS: u32 = 3;
 pub(crate) const ARGON2ID_V2_LANES: u32 = 1;
-const ARGON2ID_MIN_SALT_LEN: usize = 8;
+const ARGON2ID_MIN_SALT_LEN: usize = 16;
+
+#[cfg(test)]
+static ARGON2_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum PasswordKdfError {
@@ -48,6 +54,11 @@ pub(crate) fn derive_key_argon2id(
     password: &[u8],
     salt: &[u8],
 ) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], PasswordKdfError> {
+    #[cfg(test)]
+    let _guard = ARGON2_TEST_LOCK
+        .lock()
+        .expect("Argon2 test lock should not be poisoned");
+
     if salt.len() < ARGON2ID_MIN_SALT_LEN {
         return Err(PasswordKdfError::InvalidSaltLength {
             minimum: ARGON2ID_MIN_SALT_LEN,
@@ -80,12 +91,12 @@ mod tests {
     fn test_derive_key_argon2id_rejects_short_salt() {
         let password = Sha256::digest(b"carapace-argon2-short-salt-password");
         let salt = Sha256::digest(b"carapace-argon2-short-salt-salt");
-        let err = derive_key_argon2id(password.as_slice(), &salt[..5]).unwrap_err();
+        let err = derive_key_argon2id(password.as_slice(), &salt[..15]).unwrap_err();
         assert_eq!(
             err,
             PasswordKdfError::InvalidSaltLength {
                 minimum: ARGON2ID_MIN_SALT_LEN,
-                got: 5,
+                got: 15,
             }
         );
     }
