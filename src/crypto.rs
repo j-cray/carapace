@@ -74,10 +74,13 @@ pub(crate) fn derive_key_argon2id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2_10::Digest;
 
     #[test]
     fn test_derive_key_argon2id_rejects_short_salt() {
-        let err = derive_key_argon2id(b"password", b"short").unwrap_err();
+        let password = Sha256::digest(b"carapace-argon2-short-salt-password");
+        let salt = Sha256::digest(b"carapace-argon2-short-salt-salt");
+        let err = derive_key_argon2id(password.as_slice(), &salt[..5]).unwrap_err();
         assert_eq!(
             err,
             PasswordKdfError::InvalidSaltLength {
