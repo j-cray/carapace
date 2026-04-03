@@ -3076,6 +3076,7 @@ async fn stage_plugin_file_into_managed_dir(
             }
             return Err(message);
         }
+        reject_if_symlink(&staged, "staged plugin artifact")?;
         if let Err(err) = finalize_staged_plugin_artifact(&staged, &dest).await {
             let mut message = format!(
                 "failed to finalize staged plugin artifact from '{}' to '{}': {}",
