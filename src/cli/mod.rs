@@ -12385,7 +12385,7 @@ mod tests {
         assert!(state.hidden_inputs.is_empty());
 
         let raw = std::fs::read_to_string(state_dir.path().join("auth_profiles.json")).unwrap();
-        assert!(raw.contains("enc:v1:"));
+        assert!(raw.contains("enc:v2:"));
         assert!(!raw.contains(&token));
     }
 

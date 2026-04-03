@@ -68,7 +68,7 @@ graph TB
     end
 
     subgraph "Data at Rest"
-        Secrets["AES-256-GCM Encrypted Secrets<br/>(PBKDF2, 600K iterations)"]
+        Secrets["AES-256-GCM Encrypted Secrets<br/>(Argon2id v2 writes, PBKDF2 legacy reads)"]
         Sessions["HMAC-SHA256 Session Integrity"]
         Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]

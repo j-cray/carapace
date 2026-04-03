@@ -2349,6 +2349,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_run_channel_activity_lifecycle_orders_stop_before_delivery_and_marks_read(
     ) {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         crate::config::update_cache(
             serde_json::json!({
@@ -2451,6 +2452,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_run_channel_activity_preserves_receive_time_read_receipt_context_when_policy_disables_later(
     ) {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
 
@@ -2508,6 +2510,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_run_channel_activity_preserves_receive_time_read_receipt_context_when_capability_probe_fails(
     ) {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
 
@@ -2567,6 +2570,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_run_channel_activity_withholds_receive_time_read_receipt_when_run_errors_after_policy_disables_later(
     ) {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
 
@@ -2817,6 +2821,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_run_skips_channel_activity_when_delivery_disabled() {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         crate::config::update_cache(
             serde_json::json!({

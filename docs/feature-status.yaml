@@ -92,7 +92,7 @@ feature_inventory_markdown: |
   - [x] **Shared config snapshots** — `load_config_shared` cache reused by inbound dispatch and media analysis paths
   - [x] **Schema validation** — error/warning severity
   - [x] **Config defaults** — fallback values
-  - [x] **Secret encryption** — AES-256-GCM at rest with PBKDF2 key derivation
+  - [x] **Secret encryption** — AES-256-GCM at rest with Argon2id for new writes and PBKDF2 legacy-read compatibility
 
   ### Credentials (`src/credentials/`)
 
