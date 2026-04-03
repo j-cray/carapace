@@ -1,26 +1,27 @@
 //! Encrypted secrets-at-rest for configuration values.
 //!
-//! Provides AES-256-GCM encryption with PBKDF2-HMAC-SHA256 key derivation
-//! for storing sensitive configuration values (API keys, tokens, etc.)
-//! in encrypted form on disk.
+//! Provides AES-256-GCM encryption for storing sensitive configuration values
+//! (API keys, tokens, etc.) in encrypted form on disk.
 //!
-//! Encrypted values use the format: `enc:v1:BASE64_NONCE:BASE64_CIPHERTEXT:BASE64_SALT`
+//! Encrypted values use versioned envelopes:
+//! - `enc:v1:BASE64_NONCE:BASE64_CIPHERTEXT:BASE64_SALT` for legacy PBKDF2
+//! - `enc:v2:BASE64_NONCE:BASE64_CIPHERTEXT:BASE64_SALT` for current Argon2id
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use pbkdf2::pbkdf2_hmac;
 use serde_json::Value;
-use sha2_10::{Digest, Sha256};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-/// Prefix identifying encrypted values
-const ENC_PREFIX: &str = "enc:v1:";
+use crate::crypto::{
+    derive_key_argon2id, derive_key_pbkdf2_sha256, PasswordKdfError, PASSWORD_DERIVED_KEY_LEN,
+};
 
-/// Number of PBKDF2 iterations (OWASP recommendation for HMAC-SHA256)
-const PBKDF2_ITERATIONS: u32 = 600_000;
+const ENC_PREFIX_V1: &str = "enc:v1:";
+const ENC_PREFIX_V2: &str = "enc:v2:";
 
 /// Salt length in bytes
 const SALT_LEN: usize = 16;
@@ -54,6 +55,49 @@ pub enum SecretError {
 
     #[error("Encryption failed: {0}")]
     EncryptionFailed(String),
+
+    #[error("Key derivation failed: {0}")]
+    KeyDerivationFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretEnvelopeVersion {
+    V1,
+    V2,
+}
+
+impl SecretEnvelopeVersion {
+    pub(crate) fn current() -> Self {
+        Self::V2
+    }
+
+    pub(crate) fn prefix(self) -> &'static str {
+        match self {
+            Self::V1 => ENC_PREFIX_V1,
+            Self::V2 => ENC_PREFIX_V2,
+        }
+    }
+
+    pub(crate) fn parse_prefix(value: &str) -> Option<Self> {
+        if value.starts_with(ENC_PREFIX_V1) {
+            Some(Self::V1)
+        } else if value.starts_with(ENC_PREFIX_V2) {
+            Some(Self::V2)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn derive_key(
+        self,
+        password: &[u8],
+        salt: &[u8; SALT_LEN],
+    ) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], PasswordKdfError> {
+        match self {
+            Self::V1 => Ok(derive_key_pbkdf2_sha256(password, salt)),
+            Self::V2 => derive_key_argon2id(password, salt),
+        }
+    }
 }
 
 /// Holds a derived AES-256 encryption key for encrypting/decrypting secrets.
@@ -61,9 +105,11 @@ pub enum SecretError {
 /// The key is zeroized on drop to prevent leaking sensitive material.
 pub struct SecretStore {
     /// The derived AES-256 key (32 bytes), wrapped in Zeroizing for secure cleanup
-    key: Zeroizing<[u8; 32]>,
+    key: Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>,
     /// The salt used to derive the key (stored so encrypt can embed it)
     salt: [u8; SALT_LEN],
+    /// The envelope version used for new writes.
+    write_version: SecretEnvelopeVersion,
 }
 
 impl SecretStore {
@@ -71,14 +117,35 @@ impl SecretStore {
     pub fn new(password: &[u8]) -> Result<Self, SecretError> {
         let mut salt = [0u8; SALT_LEN];
         getrandom::fill(&mut salt).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
-        let key = Zeroizing::new(derive_key(password, &salt));
-        Ok(Self { key, salt })
+        let write_version = SecretEnvelopeVersion::current();
+        let key = Zeroizing::new(
+            write_version
+                .derive_key(password, &salt)
+                .map_err(map_kdf_error)?,
+        );
+        Ok(Self {
+            key,
+            salt,
+            write_version,
+        })
     }
 
     /// Create a `SecretStore` from an existing password and salt.
-    pub fn from_password_and_salt(password: &[u8], salt: &[u8; SALT_LEN]) -> Self {
-        let key = Zeroizing::new(derive_key(password, salt));
-        Self { key, salt: *salt }
+    pub fn from_password_and_salt(
+        password: &[u8],
+        salt: &[u8; SALT_LEN],
+    ) -> Result<Self, SecretError> {
+        let write_version = SecretEnvelopeVersion::current();
+        let key = Zeroizing::new(
+            write_version
+                .derive_key(password, salt)
+                .map_err(map_kdf_error)?,
+        );
+        Ok(Self {
+            key,
+            salt: *salt,
+            write_version,
+        })
     }
 
     /// Create a store for rekey-based decryption without random salt generation.
@@ -88,10 +155,18 @@ impl SecretStore {
     /// actual decryption.
     pub fn for_decrypt(password: &[u8]) -> Self {
         let sentinel_salt = derive_decrypt_sentinel_salt(password);
-        Self::from_password_and_salt(password, &sentinel_salt)
+        Self {
+            key: Zeroizing::new(
+                SecretEnvelopeVersion::current()
+                    .derive_key(password, &sentinel_salt)
+                    .expect("current secret envelope parameters must stay valid"),
+            ),
+            salt: sentinel_salt,
+            write_version: SecretEnvelopeVersion::current(),
+        }
     }
 
-    /// Encrypt a plaintext string, returning the `enc:v1:...` formatted string.
+    /// Encrypt a plaintext string, returning the current `enc:vN:...` format.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, SecretError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
@@ -108,15 +183,19 @@ impl SecretStore {
 
         Ok(format!(
             "{}{}:{}:{}",
-            ENC_PREFIX, nonce_b64, ct_b64, salt_b64
+            self.write_version.prefix(),
+            nonce_b64,
+            ct_b64,
+            salt_b64
         ))
     }
 
-    /// Decrypt an `enc:v1:...` formatted string back to plaintext.
+    /// Decrypt an `enc:vN:...` formatted string back to plaintext when it
+    /// matches this store's current salt and write version.
     pub fn decrypt(&self, encrypted: &str) -> Result<String, SecretError> {
         let parts = parse_encrypted(encrypted)?;
 
-        if parts.salt == self.salt {
+        if parts.version == self.write_version && parts.salt == self.salt {
             decrypt_with_key(&self.key, &parts.nonce, &parts.ciphertext)
         } else {
             Err(SecretError::DecryptionFailed)
@@ -127,24 +206,39 @@ impl SecretStore {
     /// This is the general-purpose decryption path.
     pub fn decrypt_rekey(&self, encrypted: &str, password: &[u8]) -> Result<String, SecretError> {
         let parts = parse_encrypted(encrypted)?;
-        let key = Zeroizing::new(derive_key(password, &parts.salt));
+        let key = Zeroizing::new(
+            parts
+                .version
+                .derive_key(password, &parts.salt)
+                .map_err(map_kdf_error)?,
+        );
         decrypt_with_key(&key, &parts.nonce, &parts.ciphertext)
     }
 }
 
 /// Parsed components of an encrypted value.
 pub(crate) struct EncryptedParts {
+    /// The secret envelope version.
+    pub(crate) version: SecretEnvelopeVersion,
     /// The AES-GCM nonce (96-bit)
     pub(crate) nonce: [u8; NONCE_LEN],
     /// The encrypted ciphertext bytes
     pub(crate) ciphertext: Vec<u8>,
-    /// The PBKDF2 salt
+    /// The password-KDF salt
     pub(crate) salt: [u8; SALT_LEN],
 }
 
-/// Parse an `enc:v1:NONCE:CIPHERTEXT:SALT` string into its components.
+/// Parse an `enc:vN:NONCE:CIPHERTEXT:SALT` string into its components.
 pub(crate) fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretError> {
-    let rest = encrypted.strip_prefix(ENC_PREFIX).ok_or_else(|| {
+    let Some(version) = SecretEnvelopeVersion::parse_prefix(encrypted) else {
+        let preview: String = encrypted.chars().take(10).collect();
+        return Err(SecretError::BadFormat(format!(
+            "expected versioned enc:vN prefix, got '{}'",
+            preview
+        )));
+    };
+
+    let rest = encrypted.strip_prefix(version.prefix()).ok_or_else(|| {
         let preview: String = encrypted.chars().take(10).collect();
         SecretError::BadFormat(format!("expected prefix, got '{}'", preview))
     })?;
@@ -211,6 +305,7 @@ pub(crate) fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretE
             })?;
 
     Ok(EncryptedParts {
+        version,
         nonce,
         ciphertext,
         salt,
@@ -219,7 +314,7 @@ pub(crate) fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretE
 
 /// Decrypt ciphertext with a pre-derived key and nonce.
 fn decrypt_with_key(
-    key: &[u8; 32],
+    key: &[u8; PASSWORD_DERIVED_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
 ) -> Result<String, SecretError> {
@@ -231,15 +326,6 @@ fn decrypt_with_key(
         .map_err(|_| SecretError::DecryptionFailed)?;
 
     String::from_utf8(plaintext_bytes).map_err(|_| SecretError::DecryptionFailed)
-}
-
-/// Derive a 256-bit key from a password and salt using PBKDF2-HMAC-SHA256.
-///
-/// Uses 600,000 iterations per OWASP recommendations.
-pub fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
-    let mut out: [u8; 32] = Default::default();
-    pbkdf2_hmac::<Sha256>(password, salt, PBKDF2_ITERATIONS, &mut out);
-    out
 }
 
 /// Derive a deterministic, non-random sentinel salt for password-only
@@ -256,9 +342,13 @@ fn derive_decrypt_sentinel_salt(password: &[u8]) -> [u8; SALT_LEN] {
     derived
 }
 
+fn map_kdf_error(error: PasswordKdfError) -> SecretError {
+    SecretError::KeyDerivationFailed(error.to_string())
+}
+
 /// Check whether a string value is in encrypted format.
 pub fn is_encrypted(value: &str) -> bool {
-    value.starts_with(ENC_PREFIX)
+    SecretEnvelopeVersion::parse_prefix(value).is_some()
 }
 
 /// Maximum recursion depth for `resolve_secrets` to prevent stack overflow
@@ -324,7 +414,7 @@ fn scrub_encrypted_inner(config: &mut Value, depth: usize) {
     }
 }
 
-/// Walk a JSON value tree and decrypt all `enc:v1:` strings in-place.
+/// Walk a JSON value tree and decrypt all `enc:vN:` strings in-place.
 ///
 /// Uses the password to re-derive keys from embedded salts so that values
 /// encrypted with different salts can all be resolved.
@@ -439,12 +529,45 @@ mod tests {
         SecretStore::new(&password).expect("create test secret store")
     }
 
+    fn derive_current_key(
+        password: &[u8],
+        salt: &[u8; SALT_LEN],
+    ) -> [u8; PASSWORD_DERIVED_KEY_LEN] {
+        SecretEnvelopeVersion::current()
+            .derive_key(password, salt)
+            .expect("current Argon2id parameters should stay valid")
+    }
+
+    fn encrypt_with_version(
+        version: SecretEnvelopeVersion,
+        password: &[u8],
+        plaintext: &str,
+    ) -> String {
+        let salt = random_salt();
+        let key = version
+            .derive_key(password, &salt)
+            .expect("test envelope key derivation should succeed");
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce_bytes).expect("random nonce");
+        let cipher = Aes256Gcm::new((&key).into());
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .expect("test encryption should succeed");
+        format!(
+            "{}{}:{}:{}",
+            version.prefix(),
+            BASE64.encode(nonce_bytes),
+            BASE64.encode(ciphertext),
+            BASE64.encode(salt)
+        )
+    }
+
     #[test]
     fn test_derive_key_deterministic() {
         let password = random_password();
         let salt = random_salt();
-        let k1 = derive_key(&password, &salt);
-        let k2 = derive_key(&password, &salt);
+        let k1 = derive_current_key(&password, &salt);
+        let k2 = derive_current_key(&password, &salt);
         assert_eq!(k1, k2, "same password+salt must produce same key");
     }
 
@@ -453,8 +576,8 @@ mod tests {
         let salt = random_salt();
         let p1 = random_password();
         let p2 = random_password_different_from(&p1);
-        let k1 = derive_key(&p1, &salt);
-        let k2 = derive_key(&p2, &salt);
+        let k1 = derive_current_key(&p1, &salt);
+        let k2 = derive_current_key(&p2, &salt);
         assert_ne!(k1, k2, "different passwords must produce different keys");
     }
 
@@ -463,8 +586,8 @@ mod tests {
         let password = random_password();
         let s1 = random_salt();
         let s2 = random_salt_different_from(&s1);
-        let k1 = derive_key(&password, &s1);
-        let k2 = derive_key(&password, &s2);
+        let k1 = derive_current_key(&password, &s1);
+        let k2 = derive_current_key(&password, &s2);
         assert_ne!(k1, k2, "different salts must produce different keys");
     }
 
@@ -472,8 +595,12 @@ mod tests {
     fn test_derive_key_length() {
         let password = random_password();
         let salt = random_salt();
-        let key = derive_key(&password, &salt);
-        assert_eq!(key.len(), 32, "key must be 256 bits (32 bytes)");
+        let key = derive_current_key(&password, &salt);
+        assert_eq!(
+            key.len(),
+            PASSWORD_DERIVED_KEY_LEN,
+            "key must be 256 bits (32 bytes)"
+        );
     }
 
     #[test]
@@ -527,13 +654,13 @@ mod tests {
         let store = new_test_store();
         let encrypted = store.encrypt("test").unwrap();
         assert!(
-            encrypted.starts_with("enc:v1:"),
-            "must start with enc:v1: prefix"
+            encrypted.starts_with("enc:v2:"),
+            "must start with enc:v2: prefix"
         );
         let parts: Vec<&str> = encrypted.splitn(5, ':').collect();
-        assert_eq!(parts.len(), 5, "format: enc:v1:NONCE:CT:SALT");
+        assert_eq!(parts.len(), 5, "format: enc:v2:NONCE:CT:SALT");
         assert_eq!(parts[0], "enc");
-        assert_eq!(parts[1], "v1");
+        assert_eq!(parts[1], "v2");
         assert!(
             BASE64.decode(parts[2]).is_ok(),
             "nonce must be valid base64"
@@ -553,7 +680,12 @@ mod tests {
 
         let parts = parse_encrypted(&encrypted).unwrap();
         let wrong_password = random_password_different_from(&correct_password);
-        let wrong_key = Zeroizing::new(derive_key(&wrong_password, &parts.salt));
+        let wrong_key = Zeroizing::new(
+            parts
+                .version
+                .derive_key(&wrong_password, &parts.salt)
+                .expect("test key derivation should succeed"),
+        );
         let result = decrypt_with_key(&wrong_key, &parts.nonce, &parts.ciphertext);
         assert_eq!(result, Err(SecretError::DecryptionFailed));
     }
@@ -578,6 +710,15 @@ mod tests {
     }
 
     #[test]
+    fn test_decrypt_rekey_legacy_v1_correct_password() {
+        let password = random_password();
+        let store = SecretStore::for_decrypt(&password);
+        let encrypted = encrypt_with_version(SecretEnvelopeVersion::V1, &password, "hello-v1");
+        let decrypted = store.decrypt_rekey(&encrypted, &password).unwrap();
+        assert_eq!(decrypted, "hello-v1");
+    }
+
+    #[test]
     fn test_corrupted_ciphertext() {
         let store = new_test_store();
         let encrypted = store.encrypt("test").unwrap();
@@ -588,7 +729,8 @@ mod tests {
             ct_bytes[0] ^= 0xFF;
         }
         let corrupted = format!(
-            "enc:v1:{}:{}:{}",
+            "enc:{}:{}:{}:{}",
+            parts[1],
             parts[2],
             BASE64.encode(&ct_bytes),
             parts[4]
@@ -607,7 +749,8 @@ mod tests {
         let mut nonce_bytes = BASE64.decode(parts[2]).unwrap();
         nonce_bytes[0] ^= 0xFF;
         let corrupted = format!(
-            "enc:v1:{}:{}:{}",
+            "enc:{}:{}:{}:{}",
+            parts[1],
             BASE64.encode(&nonce_bytes),
             parts[3],
             parts[4]
@@ -627,14 +770,14 @@ mod tests {
     #[test]
     fn test_bad_format_wrong_prefix() {
         let store = new_test_store();
-        let result = store.decrypt("enc:v2:aaa:bbb:ccc");
+        let result = store.decrypt("enc:v3:aaa:bbb:ccc");
         assert!(matches!(result, Err(SecretError::BadFormat(_))));
     }
 
     #[test]
     fn test_bad_format_missing_segments() {
         let store = new_test_store();
-        let result = store.decrypt("enc:v1:onlyone");
+        let result = store.decrypt("enc:v2:onlyone");
         assert!(matches!(result, Err(SecretError::BadFormat(_))));
     }
 
@@ -643,7 +786,7 @@ mod tests {
         let store = new_test_store();
         let salt_b64 = BASE64.encode(random_salt());
         let ct_b64 = BASE64.encode(random_password());
-        let bad = format!("enc:v1:not+valid+b64!:{}:{}", ct_b64, salt_b64);
+        let bad = format!("enc:v2:not+valid+b64!:{}:{}", ct_b64, salt_b64);
         let result = store.decrypt(&bad);
         assert!(matches!(result, Err(SecretError::Base64Decode { .. })));
     }
@@ -655,7 +798,7 @@ mod tests {
         getrandom::fill(&mut nonce).unwrap();
         let nonce_b64 = BASE64.encode(nonce);
         let salt_b64 = BASE64.encode(random_salt());
-        let bad = format!("enc:v1:{}:not+valid+b64!:{}", nonce_b64, salt_b64);
+        let bad = format!("enc:v2:{}:not+valid+b64!:{}", nonce_b64, salt_b64);
         let result = store.decrypt(&bad);
         assert!(matches!(result, Err(SecretError::Base64Decode { .. })));
     }
@@ -668,7 +811,7 @@ mod tests {
         let nonce_b64 = BASE64.encode(nonce);
         let ct_b64 = BASE64.encode(random_password());
         let salt_b64 = BASE64.encode(random_salt());
-        let bad = format!("enc:v1:{}:{}:{}", nonce_b64, ct_b64, salt_b64);
+        let bad = format!("enc:v2:{}:{}:{}", nonce_b64, ct_b64, salt_b64);
         let result = store.decrypt(&bad);
         assert!(matches!(
             result,
@@ -689,7 +832,7 @@ mod tests {
         let mut short_salt = [0u8; 8];
         getrandom::fill(&mut short_salt).unwrap();
         let salt_b64 = BASE64.encode(short_salt);
-        let bad = format!("enc:v1:{}:{}:{}", nonce_b64, ct_b64, salt_b64);
+        let bad = format!("enc:v2:{}:{}:{}", nonce_b64, ct_b64, salt_b64);
         let result = store.decrypt(&bad);
         assert!(matches!(
             result,
@@ -703,13 +846,14 @@ mod tests {
     #[test]
     fn test_is_encrypted_true() {
         assert!(is_encrypted("enc:v1:abc:def:ghi"));
+        assert!(is_encrypted("enc:v2:abc:def:ghi"));
     }
 
     #[test]
     fn test_is_encrypted_false() {
         assert!(!is_encrypted("plain-text-value"));
         assert!(!is_encrypted(""));
-        assert!(!is_encrypted("enc:v2:abc:def:ghi"));
+        assert!(!is_encrypted("enc:v3:abc:def:ghi"));
         assert!(!is_encrypted("ENC:V1:abc:def:ghi"));
     }
 
@@ -947,7 +1091,7 @@ mod tests {
     fn test_from_password_and_salt() {
         let password = random_password();
         let salt = random_salt();
-        let store = SecretStore::from_password_and_salt(&password, &salt);
+        let store = SecretStore::from_password_and_salt(&password, &salt).unwrap();
         let encrypted = store.encrypt("hello").unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, "hello");
@@ -989,26 +1133,38 @@ mod tests {
 
     #[test]
     fn test_pbkdf2_known_vector() {
-        let mut key = [0u8; 32];
-        pbkdf2_hmac::<Sha256>(b"password", b"salt", 1, &mut key);
-        let expected = "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b";
+        let key = derive_key_pbkdf2_sha256(b"password", b"salt");
+        // Expected output generated independently via Python hashlib.pbkdf2_hmac:
+        // python3 -c 'import hashlib; print(hashlib.pbkdf2_hmac("sha256", b"password", b"salt", 600000, 32).hex())'
+        let expected = "669cfe52482116fda1aa2cbe409b2f56c8e4563752b7a28f6eaab614ee005178";
         assert_eq!(hex::encode(key), expected);
-        let mut key2 = [0u8; 32];
-        pbkdf2_hmac::<Sha256>(b"password", b"salt", 1, &mut key2);
+        let key2 = derive_key_pbkdf2_sha256(b"password", b"salt");
         assert_eq!(key, key2, "PBKDF2 must be deterministic");
     }
 
     #[test]
-    fn test_pbkdf2_more_iterations_changes_output() {
-        let mut k1 = [0u8; 32];
-        let mut k2 = [0u8; 32];
+    fn test_current_argon2id_known_answer_vector() {
+        let passphrase = sha2::Sha256::digest(b"carapace-secret-kat-passphrase");
+        let salt = sha2::Sha256::digest(b"carapace-secret-kat-salt");
+        // Expected output generated independently via Python argon2-cffi:
+        // python3 -c 'import hashlib; from argon2.low_level import hash_secret_raw, Type; p=hashlib.sha256(b"carapace-secret-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-secret-kat-salt").digest()[:16]; print(hash_secret_raw(p, s, time_cost=3, memory_cost=64*1024, parallelism=1, hash_len=32, type=Type.ID, version=19).hex())'
+        let expected_hex = "1e5f1e8521e6e00542bf00a0bfea29f962b9ebab0796548d79492b83b4e445ee";
+        let key = derive_current_key(
+            passphrase.as_slice(),
+            (&salt[..SALT_LEN]).try_into().unwrap(),
+        );
+        assert_eq!(hex::encode(key), expected_hex);
+    }
+
+    #[test]
+    fn test_argon2id_current_key_differs_from_legacy_pbkdf2() {
         let password = random_password();
         let salt = random_salt();
-        pbkdf2_hmac::<Sha256>(&password, &salt, 1, &mut k1);
-        pbkdf2_hmac::<Sha256>(&password, &salt, 2, &mut k2);
+        let legacy = derive_key_pbkdf2_sha256(&password, &salt);
+        let current = derive_current_key(&password, &salt);
         assert_ne!(
-            k1, k2,
-            "different iteration counts must produce different keys"
+            legacy, current,
+            "legacy PBKDF2 and current Argon2id derivation must not alias"
         );
     }
 

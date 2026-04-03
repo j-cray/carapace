@@ -1301,7 +1301,7 @@ impl ProfileStore {
     /// Load profiles from disk. Replaces any in-memory data.
     ///
     /// If a `SecretStore` is configured, encrypted token fields are decrypted
-    /// transparently.  Plaintext values (no `enc:v1:` prefix) are left as-is
+    /// transparently. Plaintext values (no `enc:vN:` prefix) are left as-is
     /// for backward compatibility.
     pub fn load(&self) -> Result<(), AuthProfileError> {
         let _persist_guard = self.lock_persist();
@@ -1425,7 +1425,7 @@ impl ProfileStore {
     }
 
     /// Encrypt sensitive token fields in-place.  Already-encrypted values
-    /// (prefixed with `enc:v1:`) are skipped to avoid double-encryption.
+    /// (prefixed with `enc:vN:`) are skipped to avoid double-encryption.
     fn encrypt_tokens(
         tokens: &mut OAuthTokens,
         store: &SecretStore,
@@ -1482,8 +1482,8 @@ impl ProfileStore {
         Ok(())
     }
 
-    /// Decrypt sensitive token fields in-place.  Plaintext values (no
-    /// `enc:v1:` prefix) are left as-is for backward compatibility.
+    /// Decrypt sensitive token fields in-place. Plaintext values (no
+    /// `enc:vN:` prefix) are left as-is for backward compatibility.
     ///
     /// Uses `decrypt_rekey` so that values encrypted with a different salt
     /// (e.g. from a previous `SecretStore` instance) are still decryptable
@@ -2844,7 +2844,7 @@ mod tests {
             "refresh_token must not appear in plaintext on disk"
         );
         assert!(
-            raw.contains("enc:v1:"),
+            raw.contains("enc:v2:"),
             "encrypted tokens should be present on disk"
         );
 
@@ -2911,7 +2911,7 @@ mod tests {
             "after save, access_token should be encrypted"
         );
         assert!(
-            raw2.contains("enc:v1:"),
+            raw2.contains("enc:v2:"),
             "after save, encrypted tokens should be on disk"
         );
     }
@@ -2933,7 +2933,7 @@ mod tests {
             "without SecretStore, refresh_token should remain plaintext"
         );
         assert!(
-            !raw.contains("enc:v1:"),
+            !raw.contains("enc:v"),
             "without SecretStore, no encryption prefix should appear"
         );
     }
@@ -3027,7 +3027,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(ciphertext_before.starts_with("enc:v1:"));
+        assert!(ciphertext_before.starts_with("enc:v2:"));
 
         let store =
             ProfileStore::with_encryption(dir.path().to_path_buf(), &wrong_password).unwrap();
