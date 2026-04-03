@@ -255,9 +255,18 @@ impl LlmProvider for ClaudeCliProvider {
             }
 
             if !cancelled {
-                // Wait for the process to finish and check exit code.
+                // Wait for the process to finish. Send Stop only on success;
+                // send Error on failure (not both).
                 match child.wait().await {
-                    Ok(status) if !status.success() => {
+                    Ok(status) if status.success() => {
+                        let _ = tx
+                            .send(StreamEvent::Stop {
+                                reason: StopReason::EndTurn,
+                                usage: TokenUsage::default(),
+                            })
+                            .await;
+                    }
+                    Ok(status) => {
                         let _ = tx
                             .send(StreamEvent::Error {
                                 message: format!("Claude CLI exited with status {status}"),
@@ -271,16 +280,7 @@ impl LlmProvider for ClaudeCliProvider {
                             })
                             .await;
                     }
-                    _ => {}
                 }
-
-                // Send stop event only on normal completion.
-                let _ = tx
-                    .send(StreamEvent::Stop {
-                        reason: StopReason::EndTurn,
-                        usage: TokenUsage::default(),
-                    })
-                    .await;
             }
 
             // Clean up system prompt temp file after the process exits.
