@@ -2996,8 +2996,7 @@ async fn stage_plugin_file_into_managed_dir(
                 ));
             }
         }
-        // SECURITY: symlink-resistant staging — see docs/security.md for the
-        // filesystem trust model.
+        // SECURITY: symlink-resistant staging for loopback-only --file workflow.
         match tokio::fs::symlink_metadata(&backup).await {
             Ok(_) => {
                 return Err(format!(
