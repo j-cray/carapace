@@ -74,8 +74,11 @@ impl ClaudeCliProvider {
                     format!("failed to spawn Claude CLI: {e}")
                 }
             })?
-            .wait_with_output()
+            .wait_with_output();
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), output)
             .await
+            .map_err(|_| "Claude CLI auth status check timed out after 10s".to_string())?
             .map_err(|e| format!("failed to check Claude CLI auth status: {e}"))?;
 
         if output.status.success() {
@@ -156,10 +159,19 @@ impl LlmProvider for ClaudeCliProvider {
             cmd.arg("--model").arg(model);
         }
 
-        // Add system prompt if present.
-        if let Some(ref system) = request.system {
-            cmd.arg("--system-prompt").arg(system);
-        }
+        // Write system prompt to a temp file to avoid exposing it in process
+        // arguments. The file is cleaned up after the process spawns.
+        let system_prompt_path = if let Some(ref system) = request.system {
+            let path =
+                std::env::temp_dir().join(format!("carapace-sysprompt-{}.txt", std::process::id()));
+            std::fs::write(&path, system.as_bytes()).map_err(|e| {
+                AgentError::Provider(format!("failed to write system prompt temp file: {e}"))
+            })?;
+            cmd.arg("--system-prompt-file").arg(&path);
+            Some(path)
+        } else {
+            None
+        };
 
         // Suppress telemetry/updates in subprocess mode.
         cmd.env("DISABLE_NONESSENTIAL_TRAFFIC", "1");
@@ -178,6 +190,11 @@ impl LlmProvider for ClaudeCliProvider {
                 AgentError::Provider(format!("failed to spawn Claude CLI: {e}"))
             }
         })?;
+
+        // Clean up the system prompt temp file now that the CLI has read it.
+        if let Some(ref path) = system_prompt_path {
+            let _ = std::fs::remove_file(path);
+        }
 
         // Write prompt to stdin and close it so the CLI starts processing.
         if let Some(mut stdin) = child.stdin.take() {
