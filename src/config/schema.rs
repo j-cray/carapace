@@ -1062,9 +1062,21 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
         || crate::agent::codex::is_codex_model(model)
         || crate::agent::venice::is_venice_model(model)
         || crate::agent::claude_cli::is_claude_cli_model(model);
-    // Check for provider prefix with empty model name (e.g. "openai:" or "anthropic:")
+    // Check for whitespace around the colon (e.g. "anthropic: claude-3-sonnet")
     if let Some((prefix, suffix)) = model.split_once(':') {
-        if suffix.is_empty() && !prefix.contains('.') {
+        if prefix != prefix.trim() || suffix != suffix.trim() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: path.to_string(),
+                message: format!(
+                    "`{path}` = \"{model}\" has whitespace around the colon separator; \
+                     remove spaces (e.g. `{prefix}:{suffix}` → `{}:{}`)",
+                    prefix.trim(),
+                    suffix.trim()
+                ),
+            });
+        }
+        if suffix.trim().is_empty() && !prefix.contains('.') {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
                 path: path.to_string(),

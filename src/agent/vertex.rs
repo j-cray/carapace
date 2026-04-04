@@ -520,9 +520,9 @@ impl VertexProvider {
     /// Resolves the Google-published Gemini model target on Vertex AI.
     ///
     /// Rules:
-    /// - `vertex/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
-    /// - `vertex/google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
-    /// - `vertex` / `vertex:default` -> use `default_model`
+    /// - `vertex:gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex:google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex:default` -> use `default_model`
     /// - non-Gemini model IDs and other publisher namespaces are rejected in this scoped implementation
     fn resolve_model_target(
         &self,
@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn test_gemini_adapter_build_body() {
         let request = CompletionRequest {
-            model: "vertex/gemini-1.5-pro".to_string(),
+            model: "gemini-1.5-pro".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -987,7 +987,7 @@ mod tests {
     #[test]
     fn test_gemini_adapter_build_body_preserves_text_thought_signature() {
         let request = CompletionRequest {
-            model: "vertex/gemini-1.5-pro".to_string(),
+            model: "gemini-1.5-pro".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::Assistant,
                 content: vec![ContentBlock::Text {
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn test_gemini_adapter_build_body_preserves_tool_call_thought_signature() {
         let request = CompletionRequest {
-            model: "vertex/gemini-1.5-pro".to_string(),
+            model: "gemini-1.5-pro".to_string(),
             messages: vec![
                 LlmMessage {
                     role: LlmRole::Assistant,
@@ -1176,7 +1176,7 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let err = provider
-            .resolve_request_config("vertex/anthropic/claude-3-opus")
+            .resolve_request_config("anthropic/claude-3-opus")
             .expect_err("unsupported publisher namespace should fail");
         assert!(
             err.to_string()
@@ -1190,7 +1190,7 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let err = provider
-            .resolve_request_config("vertex/claude-3-opus")
+            .resolve_request_config("claude-3-opus")
             .expect_err("unsupported bare model should fail");
         assert!(
             err.to_string()
