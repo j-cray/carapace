@@ -477,12 +477,9 @@ fn handle_content_block_stop(
     }
 }
 
-/// Determine whether a model identifier should route to the Anthropic provider
-/// via explicit prefix.
+/// Determine whether a model identifier should route to the Anthropic provider.
 ///
 /// Requires the canonical `anthropic:` prefix (e.g. `anthropic:claude-sonnet-4-20250514`).
-/// Models without any recognized provider prefix still fall through to Anthropic
-/// as the default in `MultiProvider::select_provider`.
 pub fn is_anthropic_model(model: &str) -> bool {
     model.len() > 10
         && model.as_bytes()[..9].eq_ignore_ascii_case(b"anthropic")
@@ -948,6 +945,39 @@ mod tests {
         assert!(
             err_msg.contains("message_stop"),
             "error should mention message_stop: {err_msg}",
+        );
+    }
+
+    // ==================== is_anthropic_model / strip_anthropic_prefix tests ====================
+
+    #[test]
+    fn test_is_anthropic_model() {
+        assert!(is_anthropic_model("anthropic:claude-sonnet-4-20250514"));
+        assert!(is_anthropic_model("Anthropic:claude-opus-4-20250514"));
+        assert!(is_anthropic_model("ANTHROPIC:claude-3-haiku"));
+    }
+
+    #[test]
+    fn test_is_not_anthropic_model() {
+        assert!(!is_anthropic_model("claude-sonnet-4-20250514")); // bare
+        assert!(!is_anthropic_model("openai:gpt-4o"));
+        assert!(!is_anthropic_model("anthropic:")); // prefix only, no model
+        assert!(!is_anthropic_model("anthropic")); // bare word
+    }
+
+    #[test]
+    fn test_strip_anthropic_prefix() {
+        assert_eq!(
+            strip_anthropic_prefix("anthropic:claude-sonnet-4-20250514"),
+            "claude-sonnet-4-20250514"
+        );
+        assert_eq!(
+            strip_anthropic_prefix("Anthropic:claude-opus-4-20250514"),
+            "claude-opus-4-20250514"
+        );
+        assert_eq!(
+            strip_anthropic_prefix("openai:gpt-4o"),
+            "openai:gpt-4o" // not anthropic, passes through
         );
     }
 }

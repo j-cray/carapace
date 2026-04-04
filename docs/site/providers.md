@@ -148,9 +148,8 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Canonical Provider Prefix**: All providers use the same `provider:model` colon syntax: `anthropic:claude-sonnet-4-20250514`, `openai:gpt-4o`, `gemini:gemini-2.0-flash`, `vertex:gemini-2.5-flash`, `bedrock:anthropic.claude-3-sonnet`, `ollama:llama3`, `codex:gpt-5.4`, `venice:llama-3.3-70b`, `claude-cli:opus`.
-- **Anthropic Default**: Models without any recognized provider prefix default to Anthropic. Bare `claude-sonnet-4-20250514` routes to Anthropic without needing the `anthropic:` prefix.
-  - If the system default model is requested and Anthropic is not configured, it will fall back to Vertex AI (`vertex:default`).
+- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-20250514`, `openai:gpt-4o`, `gemini:gemini-2.0-flash`, `vertex:gemini-2.5-flash`, `bedrock:anthropic.claude-3-sonnet`, `ollama:llama3`, `codex:gpt-5.4`, `venice:llama-3.3-70b`, `claude-cli:opus`.
+- **No implicit routing**: Bare model names (without a `provider:` prefix) are rejected with a clear error. Always specify the provider.
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
 
