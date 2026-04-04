@@ -16,8 +16,10 @@ pub mod opencode;
 pub(crate) fn prefix_bare_model(model: &str) -> String {
     let lower = model.to_ascii_lowercase();
     if lower.starts_with("gpt-")
-        || lower.starts_with("o1")
-        || lower.starts_with("o3")
+        || lower == "o1"
+        || lower.starts_with("o1-")
+        || lower == "o3"
+        || lower.starts_with("o3-")
         || lower.starts_with("chatgpt-")
     {
         format!("openai:{model}")

@@ -455,8 +455,8 @@ impl MultiProvider {
                     "model \"{model}\" requires Bedrock provider, but no AWS credentials are configured"
                 ))
             })
-        } else {
-            // Default to Anthropic — handles both `anthropic:model` and bare model IDs.
+        } else if crate::agent::anthropic::is_anthropic_model(model) || !model.contains(':') {
+            // Explicit `anthropic:model` or bare model IDs (no colon) → Anthropic.
             if let Some(provider) = self.anthropic.as_deref() {
                 Ok(provider)
             } else {
@@ -464,6 +464,14 @@ impl MultiProvider {
                     "model \"{model}\" requires Anthropic provider, but neither an API key (ANTHROPIC_API_KEY env var or anthropic.apiKey config) nor anthropic.authProfile is configured"
                 )))
             }
+        } else {
+            // Model has an unrecognized `something:model` prefix.
+            let prefix = model.split_once(':').map(|(p, _)| p).unwrap_or(model);
+            Err(AgentError::Provider(format!(
+                "model \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
+                 known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
+                 ollama:, codex:, venice:, claude-cli:"
+            )))
         }
     }
 }
@@ -693,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_bedrock_native_id_falls_through_to_anthropic() {
+    fn test_bare_bedrock_native_id_rejected_as_unrecognized_prefix() {
         let provider = MultiProvider::new(None, None);
         let err = provider.select_provider("anthropic.claude-3-sonnet-20240229-v1:0");
         assert!(err.is_err());
@@ -702,8 +710,27 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(
-            msg.contains("Anthropic"),
-            "bare native ID should fall through to Anthropic: {msg}"
+            msg.contains("unrecognized provider prefix"),
+            "Bedrock native ID with colon should be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unrecognized_provider_prefix_gives_clear_error() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("mistral:mixtral");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("unrecognized provider prefix"),
+            "unknown prefix should give clear error: {msg}"
+        );
+        assert!(
+            msg.contains("known prefixes"),
+            "error should list known prefixes: {msg}"
         );
     }
 
