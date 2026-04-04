@@ -107,7 +107,10 @@ pub fn is_enabled(cfg: &serde_json::Value) -> bool {
 ///
 /// Matches `claude-cli` (bare, uses CLI default) or `claude-cli:model`.
 pub fn is_claude_cli_model(model: &str) -> bool {
-    model == "claude-cli" || model.starts_with("claude-cli:")
+    model.eq_ignore_ascii_case("claude-cli")
+        || (model.len() > 11
+            && model.as_bytes()[..10].eq_ignore_ascii_case(b"claude-cli")
+            && model.as_bytes()[10] == b':')
 }
 
 /// Strip the `claude-cli:` prefix from a model ID.
@@ -115,11 +118,16 @@ pub fn is_claude_cli_model(model: &str) -> bool {
 /// If the model is bare `claude-cli` or `claude-cli:default`, returns an
 /// empty string to let the CLI use its own default model.
 pub fn strip_claude_cli_prefix(model: &str) -> &str {
-    if model == "claude-cli" || model == "claude-cli:default" {
+    if model.eq_ignore_ascii_case("claude-cli") {
         return "";
     }
-    if let Some(rest) = model.strip_prefix("claude-cli:") {
-        rest
+    if is_claude_cli_model(model) {
+        let rest = &model[11..];
+        if rest.eq_ignore_ascii_case("default") {
+            ""
+        } else {
+            rest
+        }
     } else {
         model
     }
@@ -368,6 +376,8 @@ mod tests {
         assert!(is_claude_cli_model("claude-cli:default"));
         assert!(is_claude_cli_model("claude-cli:opus"));
         assert!(is_claude_cli_model("claude-cli"));
+        assert!(is_claude_cli_model("Claude-CLI:default")); // case insensitive
+        assert!(is_claude_cli_model("CLAUDE-CLI"));
     }
 
     #[test]
@@ -381,6 +391,8 @@ mod tests {
     fn strip_prefix_default() {
         assert_eq!(strip_claude_cli_prefix("claude-cli"), "");
         assert_eq!(strip_claude_cli_prefix("claude-cli:default"), "");
+        assert_eq!(strip_claude_cli_prefix("Claude-CLI"), "");
+        assert_eq!(strip_claude_cli_prefix("Claude-CLI:Default"), "");
     }
 
     #[test]
@@ -390,6 +402,7 @@ mod tests {
             strip_claude_cli_prefix("claude-cli:claude-sonnet-4-20250514"),
             "claude-sonnet-4-20250514"
         );
+        assert_eq!(strip_claude_cli_prefix("Claude-CLI:opus"), "opus");
     }
 
     #[test]

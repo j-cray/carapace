@@ -412,8 +412,8 @@ pub fn remap_model_id(openclaw_model: &str) -> String {
             _ => openclaw_model.to_string(), // Unknown provider, keep as-is
         }
     } else {
-        // No provider prefix — pass through as-is (bare Anthropic models).
-        openclaw_model.to_string()
+        // No provider prefix — apply well-known model family prefixes.
+        crate::migration::prefix_bare_model(openclaw_model)
     }
 }
 

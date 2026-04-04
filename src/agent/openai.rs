@@ -610,7 +610,7 @@ async fn flush_tool_calls_and_stop(
 /// Requires the canonical `openai:` prefix (e.g. `openai:gpt-4o`).
 pub fn is_openai_model(model: &str) -> bool {
     model.len() > 7
-        && model.as_bytes()[..7].eq_ignore_ascii_case(b"openai:")
+        && model.as_bytes()[..6].eq_ignore_ascii_case(b"openai")
         && model.as_bytes()[6] == b':'
 }
 

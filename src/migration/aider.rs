@@ -269,6 +269,14 @@ mod tests {
     }
 
     #[test]
+    fn remap_model_bare_o1_o3() {
+        assert_eq!(remap_model_id("o1"), "openai:o1");
+        assert_eq!(remap_model_id("o1-preview"), "openai:o1-preview");
+        assert_eq!(remap_model_id("o3"), "openai:o3");
+        assert_eq!(remap_model_id("o3-mini"), "openai:o3-mini");
+    }
+
+    #[test]
     fn remap_model_bedrock() {
         assert_eq!(
             remap_model_id("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"),

@@ -1467,9 +1467,12 @@ fn model_provider_for_local_chat(model: &str) -> Option<SetupProvider> {
         Some(SetupProvider::OpenAi)
     } else if agent::bedrock::is_bedrock_model(model) {
         Some(SetupProvider::Bedrock)
-    } else {
-        // Anthropic is the default — explicit `anthropic:` prefix or bare model IDs.
+    } else if agent::anthropic::is_anthropic_model(model) || !model.contains(':') {
+        // Explicit `anthropic:` prefix or bare model IDs (no colon) → Anthropic.
         Some(SetupProvider::Anthropic)
+    } else {
+        // Unrecognized `something:model` prefix — not a known provider.
+        None
     }
 }
 
@@ -2321,7 +2324,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assess_provider_setup_reports_mismatched_model_route() {
+    fn test_assess_provider_setup_reports_unrecognized_provider_prefix() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
             "agents": { "defaults": { "model": "mistral:mixtral" } },
@@ -2334,7 +2337,7 @@ mod tests {
         assert!(assessment.checks.iter().any(|check| {
             check.name == "Default model route"
                 && check.status == SetupCheckStatus::Fail
-                && check.detail.contains("routes to Anthropic")
+                && check.detail.contains("unrecognized provider route")
         }));
     }
 
