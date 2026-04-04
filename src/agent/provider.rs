@@ -399,7 +399,7 @@ impl MultiProvider {
 
         // Check for provider prefix with empty model name (e.g. "openai:" or "anthropic:")
         if let Some((prefix, suffix)) = model.split_once(':') {
-            if suffix.is_empty() && !prefix.contains('.') {
+            if suffix.trim().is_empty() && !prefix.contains('.') {
                 return Err(AgentError::Provider(format!(
                     "model \"{model}\" has a provider prefix but no model name; \
                      specify the model after the colon (e.g. `{prefix}:your-model`)"

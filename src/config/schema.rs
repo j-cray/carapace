@@ -1066,15 +1066,16 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
     if let Some((prefix, suffix)) = model.split_once(':') {
         if prefix != prefix.trim() || suffix != suffix.trim() {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: path.to_string(),
                 message: format!(
                     "`{path}` = \"{model}\" has whitespace around the colon separator; \
-                     remove spaces (e.g. `{prefix}:{suffix}` → `{}:{}`)",
+                     use `{}:{}` instead",
                     prefix.trim(),
                     suffix.trim()
                 ),
             });
+            return;
         }
         if suffix.trim().is_empty() && !prefix.contains('.') {
             issues.push(SchemaIssue {
