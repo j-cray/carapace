@@ -1288,7 +1288,6 @@ async fn dispatch_agent_run(
     })?;
 
     // Validate model before registering the run to avoid orphan entries.
-    let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let mut config = crate::agent::AgentConfig::default();
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
     if let Some(m) = validated.model.clone() {

@@ -2011,7 +2011,7 @@ pub(super) fn handle_agent(
         .and_then(|v| v.as_str());
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
     if let Some(m) = model_param {
-        config.model = m.to_string();
+        config.model = m.trim().to_string();
     }
     if config.model.trim().is_empty() {
         return Err(error_shape(
