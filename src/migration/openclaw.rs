@@ -398,13 +398,13 @@ fn map_provider_name(name: &str, base_url: &str, auth: &str) -> ProviderMapping 
 
 /// Remap an OpenClaw model ID (provider/model format) to Carapace's prefix:model format.
 pub fn remap_model_id(openclaw_model: &str) -> String {
-    // OpenClaw uses "provider/model" format.
+    // OpenClaw uses "provider/model" format; Carapace uses "provider:model".
     if let Some((provider, model)) = openclaw_model.split_once('/') {
         let provider_lower = provider.to_lowercase();
         match provider_lower.as_str() {
-            "anthropic" => model.to_string(), // Anthropic models are bare in Carapace
-            "openai" => model.to_string(),    // OpenAI models are bare
-            "google" | "gemini" => model.to_string(), // Gemini models are bare
+            "anthropic" => format!("anthropic:{model}"),
+            "openai" => format!("openai:{model}"),
+            "google" | "gemini" => format!("gemini:{model}"),
             "bedrock" => format!("bedrock:{model}"),
             "vertex" => format!("vertex:{model}"),
             "ollama" => format!("ollama:{model}"),
@@ -412,8 +412,8 @@ pub fn remap_model_id(openclaw_model: &str) -> String {
             _ => openclaw_model.to_string(), // Unknown provider, keep as-is
         }
     } else {
-        // No provider prefix — pass through as-is (already bare).
-        openclaw_model.to_string()
+        // No provider prefix — apply well-known model family prefixes.
+        crate::migration::prefix_bare_model(openclaw_model)
     }
 }
 
@@ -520,13 +520,25 @@ mod tests {
     fn remap_model_anthropic() {
         assert_eq!(
             remap_model_id("anthropic/claude-opus-4-20250514"),
-            "claude-opus-4-20250514"
+            "anthropic:claude-opus-4-20250514"
         );
     }
 
     #[test]
     fn remap_model_openai() {
-        assert_eq!(remap_model_id("openai/gpt-4o"), "gpt-4o");
+        assert_eq!(remap_model_id("openai/gpt-4o"), "openai:gpt-4o");
+    }
+
+    #[test]
+    fn remap_model_gemini() {
+        assert_eq!(
+            remap_model_id("gemini/gemini-2.0-flash"),
+            "gemini:gemini-2.0-flash"
+        );
+        assert_eq!(
+            remap_model_id("google/gemini-2.5-pro"),
+            "gemini:gemini-2.5-pro"
+        );
     }
 
     #[test]
@@ -554,7 +566,7 @@ mod tests {
     fn remap_model_bare() {
         assert_eq!(
             remap_model_id("claude-sonnet-4-20250514"),
-            "claude-sonnet-4-20250514"
+            "anthropic:claude-sonnet-4-20250514"
         );
     }
 
@@ -615,7 +627,10 @@ mod tests {
             .iter()
             .find(|m| m.carapace_key == "agents.defaults.model")
             .unwrap();
-        assert_eq!(model_mapping.value, json!("claude-sonnet-4-20250514"));
+        assert_eq!(
+            model_mapping.value,
+            json!("anthropic:claude-sonnet-4-20250514")
+        );
     }
 
     #[test]

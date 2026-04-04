@@ -246,8 +246,8 @@ pub fn remap_model_id(aider_model: &str) -> String {
         return format!("ollama:{rest}");
     }
     // openrouter/, azure/, groq/ prefixes have no Carapace equivalent — pass through.
-    // Bare model names (claude-*, gpt-*, gemini-*) work as-is.
-    aider_model.to_string()
+    // Bare well-known model families need a provider prefix for Carapace routing.
+    crate::migration::prefix_bare_model(aider_model)
 }
 
 #[cfg(test)]
@@ -259,13 +259,31 @@ mod tests {
     fn remap_model_bare_claude() {
         assert_eq!(
             remap_model_id("claude-3-5-sonnet-20241022"),
-            "claude-3-5-sonnet-20241022"
+            "anthropic:claude-3-5-sonnet-20241022"
         );
     }
 
     #[test]
     fn remap_model_bare_gpt() {
-        assert_eq!(remap_model_id("gpt-4o"), "gpt-4o");
+        assert_eq!(remap_model_id("gpt-4o"), "openai:gpt-4o");
+    }
+
+    #[test]
+    fn remap_model_bare_o_families() {
+        assert_eq!(remap_model_id("o1"), "openai:o1");
+        assert_eq!(remap_model_id("o1-preview"), "openai:o1-preview");
+        assert_eq!(remap_model_id("o3"), "openai:o3");
+        assert_eq!(remap_model_id("o3-mini"), "openai:o3-mini");
+        assert_eq!(remap_model_id("o4"), "openai:o4");
+        assert_eq!(remap_model_id("o4-mini"), "openai:o4-mini");
+    }
+
+    #[test]
+    fn remap_model_google_canonical_form() {
+        assert_eq!(
+            remap_model_id("models/gemini-2.0-flash"),
+            "gemini:gemini-2.0-flash"
+        );
     }
 
     #[test]

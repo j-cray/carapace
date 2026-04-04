@@ -4025,11 +4025,11 @@ impl SetupProvider {
 
     fn default_model(self) -> &'static str {
         match self {
-            Self::Anthropic => "claude-sonnet-4-20250514",
+            Self::Anthropic => "anthropic:claude-sonnet-4-20250514",
             Self::Codex => "codex:default",
-            Self::OpenAi => "gpt-4o",
+            Self::OpenAi => "openai:gpt-4o",
             Self::Ollama => "ollama:llama3",
-            Self::Gemini => "gemini-2.0-flash",
+            Self::Gemini => "gemini:gemini-2.0-flash",
             Self::Vertex => "vertex:default",
             Self::Venice => "venice:llama-3.3-70b",
             Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
@@ -4362,27 +4362,28 @@ fn single_credential_provider_guidance(
 }
 
 fn local_chat_model(cfg: &Value) -> String {
-    config_string(cfg, &["agents", "defaults", "model"])
-        .unwrap_or_else(|| SetupProvider::Anthropic.default_model().to_string())
+    config_string(cfg, &["agents", "defaults", "model"]).unwrap_or_default()
 }
 
-fn local_chat_provider_route(model: &str) -> ModelProviderRoute {
+fn local_chat_provider_route(model: &str) -> Option<ModelProviderRoute> {
     if crate::agent::ollama::is_ollama_model(model) {
-        ModelProviderRoute::Ollama
+        Some(ModelProviderRoute::Ollama)
     } else if crate::agent::venice::is_venice_model(model) {
-        ModelProviderRoute::Venice
+        Some(ModelProviderRoute::Venice)
     } else if crate::agent::gemini::is_gemini_model(model) {
-        ModelProviderRoute::Gemini
+        Some(ModelProviderRoute::Gemini)
     } else if crate::agent::vertex::is_vertex_model(model) {
-        ModelProviderRoute::Vertex
+        Some(ModelProviderRoute::Vertex)
     } else if crate::agent::codex::is_codex_model(model) {
-        ModelProviderRoute::Codex
+        Some(ModelProviderRoute::Codex)
     } else if crate::agent::openai::is_openai_model(model) {
-        ModelProviderRoute::OpenAi
+        Some(ModelProviderRoute::OpenAi)
     } else if crate::agent::bedrock::is_bedrock_model(model) {
-        ModelProviderRoute::Bedrock
+        Some(ModelProviderRoute::Bedrock)
+    } else if crate::agent::anthropic::is_anthropic_model(model) {
+        Some(ModelProviderRoute::Anthropic)
     } else {
-        ModelProviderRoute::Anthropic
+        None
     }
 }
 
@@ -4517,7 +4518,28 @@ fn codex_provider_guidance(cfg: &Value) -> String {
 
 fn local_chat_verify_next_step(cfg: &Value) -> String {
     let model = local_chat_model(cfg);
-    match local_chat_provider_route(&model) {
+    let Some(route) = local_chat_provider_route(&model) else {
+        if model.is_empty() {
+            return "set `agents.defaults.model` to a provider:model value \
+                    (e.g. `anthropic:claude-sonnet-4-20250514`), then retry \
+                    `cara verify --outcome local-chat`"
+                .to_string();
+        }
+        let suggestion = crate::migration::prefix_bare_model(&model);
+        return if suggestion != model {
+            format!(
+                "`agents.defaults.model` = \"{model}\" needs a provider prefix; \
+                 use `{suggestion}` instead, then retry `cara verify --outcome local-chat`"
+            )
+        } else {
+            format!(
+                "`agents.defaults.model` = \"{model}\" uses an unrecognized provider; \
+                 configure a provider for the selected model, or rerun `cara setup --force`, \
+                 then retry `cara verify --outcome local-chat`"
+            )
+        };
+    };
+    match route {
         ModelProviderRoute::Anthropic => anthropic_provider_guidance(cfg),
         ModelProviderRoute::Codex => codex_provider_guidance(cfg),
         ModelProviderRoute::OpenAi => {
@@ -11240,9 +11262,9 @@ mod tests {
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({});
-        assert_eq!(
-            local_chat_verify_next_step(&cfg),
-            "configure a provider for the selected model, or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`"
+        assert!(
+            local_chat_verify_next_step(&cfg).contains("set `agents.defaults.model`"),
+            "empty config should tell user to set agents.defaults.model"
         );
     }
 
@@ -11251,7 +11273,8 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("ANTHROPIC_API_KEY");
         let cfg = serde_json::json!({
-            "anthropic": { "apiKey": "${ANTHROPIC_API_KEY}" }
+            "anthropic": { "apiKey": "${ANTHROPIC_API_KEY}" },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11263,7 +11286,7 @@ mod tests {
     fn test_local_chat_verify_next_step_for_configured_provider() {
         let cfg = serde_json::json!({
             "openai": { "apiKey": "sk-openai-inline" },
-            "agents": { "defaults": { "model": "gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-4o" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11277,7 +11300,7 @@ mod tests {
         env_guard.set("OPENAI_API_KEY", "sk-openai-env");
         env_guard.unset("ANTHROPIC_API_KEY");
         let cfg = serde_json::json!({
-            "agents": { "defaults": { "model": "gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-4o" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11290,7 +11313,7 @@ mod tests {
         let cfg = serde_json::json!({
             "anthropic": { "apiKey": "sk-anthropic-inline" },
             "openai": { "apiKey": "sk-openai-inline" },
-            "agents": { "defaults": { "model": "gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-4o" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11319,7 +11342,7 @@ mod tests {
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
-            "agents": { "defaults": { "model": "gemini-2.0-flash" } }
+            "agents": { "defaults": { "model": "gemini:gemini-2.0-flash" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11333,7 +11356,7 @@ mod tests {
         env_guard.unset("GOOGLE_API_KEY");
         let cfg = serde_json::json!({
             "google": { "apiKey": "${GOOGLE_API_KEY}" },
-            "agents": { "defaults": { "model": "gemini-2.0-flash" } }
+            "agents": { "defaults": { "model": "gemini:gemini-2.0-flash" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11381,7 +11404,7 @@ mod tests {
                 "projectId": "my-project",
                 "location": "us-central1"
             },
-            "agents": { "defaults": { "model": "vertex/default" } }
+            "agents": { "defaults": { "model": "vertex:default" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11414,7 +11437,8 @@ mod tests {
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
-            "openai": { "apiKey": "sk-openai-inline" }
+            "openai": { "apiKey": "sk-openai-inline" },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11434,7 +11458,8 @@ mod tests {
             "anthropic": {
                 "apiKey": "sk-ant-inline",
                 "authProfile": "anthropic:default"
-            }
+            },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } }
         });
 
         assert_eq!(
@@ -11456,7 +11481,8 @@ mod tests {
             "anthropic": {
                 "apiKey": "${ANTHROPIC_API_KEY}",
                 "authProfile": "anthropic:default"
-            }
+            },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } }
         });
 
         assert_eq!(
@@ -12071,8 +12097,8 @@ mod tests {
             "Default setup should generate a non-empty gateway token"
         );
         assert_eq!(
-            parsed["agents"]["defaults"]["model"], "claude-sonnet-4-20250514",
-            "Default model should be claude-sonnet-4-20250514"
+            parsed["agents"]["defaults"]["model"], "anthropic:claude-sonnet-4-20250514",
+            "Default model should be anthropic:claude-sonnet-4-20250514"
         );
         assert_eq!(parsed["anthropic"]["apiKey"], "${ANTHROPIC_API_KEY}");
     }
@@ -12119,7 +12145,10 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["google"]["apiKey"], "${GOOGLE_API_KEY}");
-        assert_eq!(parsed["agents"]["defaults"]["model"], "gemini-2.0-flash");
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "gemini:gemini-2.0-flash"
+        );
     }
 
     #[test]
@@ -12317,7 +12346,10 @@ mod tests {
 
         assert!(result.observed_checks.is_empty());
         assert_eq!(config["google"]["apiKey"], "AIza-test-key");
-        assert_eq!(config["agents"]["defaults"]["model"], "gemini-2.0-flash");
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            "gemini:gemini-2.0-flash"
+        );
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
         assert!(state.visible_inputs.is_empty());
@@ -12619,7 +12651,7 @@ mod tests {
                 "my-project".to_string(),
                 "us-central1".to_string(),
                 "explicit-model".to_string(),
-                "vertex/google/gemini-1.5-pro".to_string(),
+                "vertex:google/gemini-1.5-pro".to_string(),
                 "n".to_string(),
             ]),
             ..Default::default()

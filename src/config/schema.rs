@@ -1000,6 +1000,123 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     if let Some(v) = defaults.get("contextTokens") {
         check_positive_integer(v, ".agents.defaults.contextTokens", issues);
     }
+
+    // Validate model uses provider:model syntax.
+    if let Some(model) = defaults.get("model") {
+        check_model_field(model, ".agents.defaults.model", issues);
+    }
+
+    // Validate per-agent models.
+    if let Some(list) = agents.get("list").and_then(|v| v.as_array()) {
+        for (i, entry) in list.iter().enumerate() {
+            if let Some(model) = entry.get("model") {
+                check_model_field(model, &format!(".agents.list[{i}].model"), issues);
+            }
+        }
+    }
+}
+
+fn check_model_field(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    match value.as_str() {
+        Some(model) => check_model_has_provider_prefix(model, path, issues),
+        None => issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: format!(
+                "`{path}` must be a string using the provider:model format \
+                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
+            ),
+        }),
+    }
+}
+
+fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<SchemaIssue>) {
+    if model != model.trim() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: path.to_string(),
+            message: format!(
+                "`{path}` has leading or trailing whitespace; \
+                 remove whitespace to avoid routing errors"
+            ),
+        });
+    }
+    let model = model.trim();
+    if model.is_empty() {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: format!(
+                "`{path}` must not be empty; specify a model using the provider:model format \
+                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
+            ),
+        });
+        return;
+    }
+    let has_known_prefix = crate::agent::anthropic::is_anthropic_model(model)
+        || crate::agent::openai::is_openai_model(model)
+        || crate::agent::gemini::is_gemini_model(model)
+        || crate::agent::vertex::is_vertex_model(model)
+        || crate::agent::bedrock::is_bedrock_model(model)
+        || crate::agent::ollama::is_ollama_model(model)
+        || crate::agent::codex::is_codex_model(model)
+        || crate::agent::venice::is_venice_model(model)
+        || crate::agent::claude_cli::is_claude_cli_model(model);
+    // Check for whitespace around the colon (e.g. "anthropic: claude-3-sonnet")
+    if let Some((prefix, suffix)) = model.split_once(':') {
+        if prefix != prefix.trim() || suffix != suffix.trim() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: path.to_string(),
+                message: format!(
+                    "`{path}` = \"{model}\" has whitespace around the colon separator; \
+                     use `{}:{}` instead",
+                    prefix.trim(),
+                    suffix.trim()
+                ),
+            });
+            return;
+        }
+        if suffix.trim().is_empty() && !prefix.contains('.') {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: path.to_string(),
+                message: format!(
+                    "`{path}` = \"{model}\" has a provider prefix but no model name; \
+                     specify the model after the colon (e.g. `{prefix}:your-model`)"
+                ),
+            });
+            return;
+        }
+    }
+
+    if !has_known_prefix {
+        let suggestion = crate::migration::prefix_bare_model(model);
+        let hint = if suggestion != model {
+            let verb = if model.contains('/') {
+                "uses deprecated slash syntax"
+            } else {
+                "is missing a provider prefix"
+            };
+            format!("`{path}` = \"{model}\" {verb}; use `{suggestion}` instead")
+        } else if let Some((prefix, _)) = model.split_once(':').filter(|(p, _)| !p.contains('.')) {
+            format!(
+                "`{path}` = \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
+                 known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
+                 ollama:, codex:, venice:, claude-cli:"
+            )
+        } else {
+            format!(
+                "`{path}` = \"{model}\" is missing a provider prefix; \
+                 use the provider:model format (e.g. `anthropic:{model}`)"
+            )
+        };
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: hint,
+        });
+    }
 }
 
 fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {

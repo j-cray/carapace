@@ -793,12 +793,27 @@ fn execute_tools_with_guards(
 
 /// Record token usage for a single turn via the usage tracker.
 fn record_turn_usage(session_key: &str, model: &str, usage: &TokenUsage) {
-    let provider_name = if crate::agent::venice::is_venice_model(model) {
+    let provider_name = if crate::agent::claude_cli::is_claude_cli_model(model) {
+        "claude-cli"
+    } else if crate::agent::ollama::is_ollama_model(model) {
+        "ollama"
+    } else if crate::agent::venice::is_venice_model(model) {
         "venice"
+    } else if crate::agent::vertex::is_vertex_model(model) {
+        "vertex"
+    } else if crate::agent::gemini::is_gemini_model(model) {
+        "gemini"
+    } else if crate::agent::codex::is_codex_model(model) {
+        "codex"
     } else if crate::agent::openai::is_openai_model(model) {
         "openai"
-    } else {
+    } else if crate::agent::bedrock::is_bedrock_model(model) {
+        "bedrock"
+    } else if crate::agent::anthropic::is_anthropic_model(model) {
         "anthropic"
+    } else {
+        tracing::warn!(model, "unrecognized model prefix for usage recording");
+        "unknown"
     };
     crate::server::ws::record_usage(
         session_key,

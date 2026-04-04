@@ -168,13 +168,19 @@ async fn execute_agent_turn(
         params.execution_limits.max_turns,
     );
 
-    let cancel_token = CancellationToken::new();
-    register_agent_run(state, &run_id, &session_key, params.message, &cancel_token);
-    spawn_timeout_cancellation(state, &run_id, timeout_seconds, cancel_token.clone());
-
+    // Validate provider and model before registering the run to avoid orphan entries.
     let provider = state
         .llm_provider()
         .ok_or(CronExecuteError::LlmNotConfigured)?;
+    if config.model.trim().is_empty() {
+        return Err(CronExecuteError::Other(
+            "no model configured; set `agents.defaults.model` in config or provide a model in the cron task".to_string(),
+        ));
+    }
+
+    let cancel_token = CancellationToken::new();
+    register_agent_run(state, &run_id, &session_key, params.message, &cancel_token);
+    spawn_timeout_cancellation(state, &run_id, timeout_seconds, cancel_token.clone());
 
     spawn_delivery_waiter_if_enabled(
         state,
@@ -314,9 +320,11 @@ fn build_agent_config(
     let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let mut config = crate::agent::AgentConfig::default();
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
-    config.model = model
-        .clone()
-        .unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());
+    if let Some(m) = model.clone() {
+        config.model = m;
+    }
+    // config.model is set from agents.defaults.model via apply_agent_config_from_settings;
+    // the cron-level model override takes precedence if provided.
     if let Some(allow) = allow_unsafe_external_content {
         config.exfiltration_guard = !allow;
     }

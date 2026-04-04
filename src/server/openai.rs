@@ -225,6 +225,23 @@ pub struct OpenAiState {
     pub llm_provider: Option<Arc<dyn LlmProvider>>,
 }
 
+/// Resolve the model from the user's `agents.defaults.model` config setting.
+///
+/// Returns an empty string if no model is configured — `select_provider`
+/// will produce a clear "no model configured" error downstream.
+fn resolve_configured_model() -> String {
+    crate::config::load_config_shared()
+        .ok()
+        .and_then(|cfg| {
+            cfg.pointer("/agents/defaults/model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
+}
+
 /// Parse agent ID from model string
 /// Supports: "carapace", "carapace:agent-id", "agent:agent-id"
 pub fn parse_agent_id(model: &str) -> Option<String> {
@@ -658,12 +675,23 @@ pub async fn chat_completions_handler(
             .into_response();
     }
 
-    // Use the requested model, falling back to the default
-    let model = if req.model == "carapace"
+    // Resolve model: the `carapace` / `agent:` aliases use agents.defaults.model from config.
+    let is_alias = req.model == "carapace"
         || req.model.starts_with("carapace:")
-        || req.model.starts_with("agent:")
-    {
-        crate::agent::DEFAULT_MODEL.to_string()
+        || req.model.starts_with("agent:");
+    let model = if is_alias {
+        let resolved = resolve_configured_model();
+        if resolved.is_empty() {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(OpenAiError::invalid_request(
+                    "no model configured; set `agents.defaults.model` in your config \
+                     (e.g. `anthropic:claude-sonnet-4-20250514`)",
+                )),
+            )
+                .into_response();
+        }
+        resolved
     } else {
         req.model.clone()
     };
@@ -1018,12 +1046,23 @@ pub async fn responses_handler(
             .into_response();
     }
 
-    // Resolve the model name, mapping carapace aliases to the default
-    let model = if req.model == "carapace"
+    // Resolve model: the `carapace` / `agent:` aliases use agents.defaults.model from config.
+    let is_alias = req.model == "carapace"
         || req.model.starts_with("carapace:")
-        || req.model.starts_with("agent:")
-    {
-        crate::agent::DEFAULT_MODEL.to_string()
+        || req.model.starts_with("agent:");
+    let model = if is_alias {
+        let resolved = resolve_configured_model();
+        if resolved.is_empty() {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(OpenAiError::invalid_request(
+                    "no model configured; set `agents.defaults.model` in your config \
+                     (e.g. `anthropic:claude-sonnet-4-20250514`)",
+                )),
+            )
+                .into_response();
+        }
+        resolved
     } else {
         req.model.clone()
     };
@@ -1868,6 +1907,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
+            "model": "anthropic:test-model",
             "messages": [
                 {"role": "system", "content": "Be helpful"},
                 {"role": "user", "content": "Hello"}
@@ -1905,7 +1945,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_chat_completions_carapace_model_maps_to_default() {
+    async fn test_chat_completions_carapace_alias_without_config_returns_error() {
         let provider = Arc::new(MockLlmProvider::text_response("ok", 10, 5));
         let state = OpenAiState {
             chat_completions_enabled: true,
@@ -1931,15 +1971,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-
-        // Model should be mapped from "carapace" to the default model
-        assert_eq!(parsed["model"], crate::agent::DEFAULT_MODEL);
+        // Without agents.defaults.model in config, the carapace alias resolves
+        // to empty — returns 422 with a configuration guidance message.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -1965,6 +1999,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
+            "model": "anthropic:test-model",
             "messages": [{"role": "user", "content": "Hello"}]
         }))
         .unwrap();
@@ -2003,6 +2038,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
+            "model": "anthropic:test-model",
             "messages": [{"role": "user", "content": "Hello"}]
         }))
         .unwrap();
@@ -2058,6 +2094,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
+            "model": "anthropic:test-model",
             "messages": [{"role": "user", "content": "Hello"}],
             "stream": true
         }))
@@ -2113,6 +2150,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
+            "model": "anthropic:test-model",
             "messages": [{"role": "user", "content": "Hello"}],
             "stream": true
         }))
@@ -2159,6 +2197,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
+            "model": "anthropic:test-model",
             "messages": [{"role": "user", "content": "Hello"}],
             "stream": true
         }))
@@ -2336,7 +2375,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "carapace",
+            "model": "anthropic:test-model",
             "input": "Hello"
         }))
         .unwrap();
@@ -2362,7 +2401,7 @@ mod tests {
         assert_eq!(parsed["object"], "response");
         assert_eq!(parsed["status"], "completed");
         assert!(parsed["id"].as_str().unwrap().starts_with("resp_"));
-        assert_eq!(parsed["model"], crate::agent::DEFAULT_MODEL);
+        assert_eq!(parsed["model"], "anthropic:test-model");
         assert_eq!(parsed["output"][0]["type"], "message");
         assert_eq!(parsed["output"][0]["role"], "assistant");
         assert_eq!(parsed["output"][0]["content"][0]["type"], "output_text");
@@ -2424,7 +2463,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "carapace",
+            "model": "anthropic:test-model",
             "input": "Hello",
             "instructions": "Be very helpful"
         }))
@@ -2532,7 +2571,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "carapace",
+            "model": "anthropic:test-model",
             "input": "Hello"
         }))
         .unwrap();

@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::borrow::Cow;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -247,6 +246,34 @@ pub(crate) fn summarize_http_failure_body(body: &str) -> String {
     }
 }
 
+/// Strip the canonical `provider:` prefix from a model identifier.
+///
+/// Checks each known provider prefix in turn and returns the bare model name.
+/// If no known prefix matches, returns the input unchanged.
+pub(crate) fn strip_provider_prefix(model: &str) -> &str {
+    if crate::agent::claude_cli::is_claude_cli_model(model) {
+        crate::agent::claude_cli::strip_claude_cli_prefix(model)
+    } else if crate::agent::ollama::is_ollama_model(model) {
+        crate::agent::ollama::strip_ollama_prefix(model)
+    } else if crate::agent::venice::is_venice_model(model) {
+        crate::agent::venice::strip_venice_prefix(model)
+    } else if crate::agent::vertex::is_vertex_model(model) {
+        crate::agent::vertex::strip_vertex_prefix(model)
+    } else if crate::agent::gemini::is_gemini_model(model) {
+        crate::agent::gemini::strip_gemini_prefix(model)
+    } else if crate::agent::codex::is_codex_model(model) {
+        crate::agent::codex::strip_codex_prefix(model)
+    } else if crate::agent::openai::is_openai_model(model) {
+        crate::agent::openai::strip_openai_prefix(model)
+    } else if crate::agent::bedrock::is_bedrock_model(model) {
+        crate::agent::bedrock::strip_bedrock_prefix(model)
+    } else if crate::agent::anthropic::is_anthropic_model(model) {
+        crate::agent::anthropic::strip_anthropic_prefix(model)
+    } else {
+        model
+    }
+}
+
 /// A provider that dispatches to Anthropic, OpenAI, Ollama, Gemini, or Bedrock
 /// based on the model identifier in the request.
 ///
@@ -357,29 +384,28 @@ impl MultiProvider {
             || self.claude_cli.is_some()
     }
 
-    fn normalize_model_for_routing<'a>(&self, model: &'a str) -> Cow<'a, str> {
-        if model == crate::agent::DEFAULT_MODEL && self.anthropic.is_none() && self.vertex.is_some()
-        {
-            Cow::Borrowed("vertex:default")
-        } else {
-            Cow::Borrowed(model)
-        }
-    }
-
     /// Select the appropriate backend provider for the given model.
     ///
-    /// Dispatch order:
-    /// 1. Models prefixed with `ollama:` or `ollama/` -> Ollama
-    /// 2. Models prefixed with `venice:` -> Venice
-    /// 3. Models matching Gemini patterns (gemini-*, gemini/*, models/gemini-*) -> Gemini
-    /// 4. Models prefixed with `codex:` or `codex/` -> Codex
-    /// 5. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
-    /// 6. Models matching Bedrock patterns (bedrock:*, anthropic.claude-*, etc.) -> Bedrock
-    /// 7. Models matching Vertex patterns (vertex:*, vertex/*) -> Vertex
-    /// 8. Everything else -> Anthropic (default)
+    /// All providers require the canonical `provider:model` colon prefix.
+    /// Bare models without a prefix are rejected.
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
-        let normalized_model = self.normalize_model_for_routing(model);
-        let model = normalized_model.as_ref();
+        if model.is_empty() {
+            return Err(AgentError::Provider(
+                "no model configured; set `agents.defaults.model` in your config \
+                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
+                    .to_string(),
+            ));
+        }
+
+        // Check for provider prefix with empty model name (e.g. "openai:" or "anthropic:")
+        if let Some((prefix, suffix)) = model.split_once(':') {
+            if suffix.trim().is_empty() && !prefix.contains('.') {
+                return Err(AgentError::Provider(format!(
+                    "model \"{model}\" has a provider prefix but no model name; \
+                     specify the model after the colon (e.g. `{prefix}:your-model`)"
+                )));
+            }
+        }
 
         if crate::agent::claude_cli::is_claude_cli_model(model) {
             self.claude_cli.as_deref().ok_or_else(|| {
@@ -434,15 +460,44 @@ impl MultiProvider {
                     "model \"{model}\" requires Bedrock provider, but no AWS credentials are configured"
                 ))
             })
+        } else if crate::agent::anthropic::is_anthropic_model(model) {
+            self.anthropic.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Anthropic provider, but neither an API key \
+                     (ANTHROPIC_API_KEY env var or anthropic.apiKey config) nor \
+                     anthropic.authProfile is configured"
+                ))
+            })
         } else {
-            // Default to Anthropic for claude-* and unknown models
-            if let Some(provider) = self.anthropic.as_deref() {
-                Ok(provider)
-            } else {
-                Err(AgentError::Provider(format!(
-                    "model \"{model}\" requires Anthropic provider, but neither an API key (ANTHROPIC_API_KEY env var or anthropic.apiKey config) nor anthropic.authProfile is configured"
-                )))
-            }
+            let hint = match model.split_once(':') {
+                Some((prefix, _)) if !prefix.contains('.') => {
+                    // Looks like a provider:model pattern (no dots in prefix).
+                    // Bedrock native IDs like `anthropic.claude-v1:0` contain dots
+                    // before the colon, so they fall to the else branch.
+                    format!(
+                        "model \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
+                         known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
+                         ollama:, codex:, venice:, claude-cli:"
+                    )
+                }
+                _ => {
+                    let suggestion = crate::migration::prefix_bare_model(model);
+                    if suggestion != model {
+                        let verb = if model.contains('/') {
+                            "uses deprecated slash syntax"
+                        } else {
+                            "is missing a provider prefix"
+                        };
+                        format!("model \"{model}\" {verb}; use `{suggestion}` instead")
+                    } else {
+                        format!(
+                            "model \"{model}\" is missing a provider prefix; \
+                             use the provider:model format (e.g. `anthropic:{model}`)"
+                        )
+                    }
+                }
+            };
+            Err(AgentError::Provider(hint))
         }
     }
 }
@@ -454,52 +509,11 @@ impl LlmProvider for MultiProvider {
         mut request: CompletionRequest,
         cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
-        request.model = self
-            .normalize_model_for_routing(&request.model)
-            .into_owned();
         let provider = self.select_provider(&request.model)?;
 
-        // Strip the claude-cli: or claude-cli/ prefix before forwarding.
-        if crate::agent::claude_cli::is_claude_cli_model(&request.model) {
-            request.model =
-                crate::agent::claude_cli::strip_claude_cli_prefix(&request.model).to_string();
-        }
-
-        // Strip the ollama: or ollama/ prefix before forwarding to the provider,
-        // so the Ollama server receives the bare model name (e.g. "llama3").
-        if crate::agent::ollama::is_ollama_model(&request.model) {
-            request.model = crate::agent::ollama::strip_ollama_prefix(&request.model).to_string();
-        }
-
-        // Strip the venice: prefix before forwarding to the provider,
-        // so the Venice API receives the bare model name (e.g. "llama-3.3-70b").
-        if crate::agent::venice::is_venice_model(&request.model) {
-            request.model = crate::agent::venice::strip_venice_prefix(&request.model).to_string();
-        }
-
-        // Strip the gemini/ or models/ prefix before forwarding to the provider,
-        // so the Gemini API receives the bare model name (e.g. "gemini-2.0-flash").
-        if crate::agent::gemini::is_gemini_model(&request.model) {
-            request.model = crate::agent::gemini::strip_gemini_prefix(&request.model).to_string();
-        }
-
-        // Strip the codex: or codex/ prefix before forwarding to the provider,
-        // so the provider receives the bare model name (e.g. "gpt-5.4" or "default").
-        if crate::agent::codex::is_codex_model(&request.model) {
-            request.model = crate::agent::codex::strip_codex_prefix(&request.model).to_string();
-        }
-
-        // Strip the bedrock: or bedrock/ prefix before forwarding to the provider,
-        // so the Bedrock API receives the bare model ID (e.g. "anthropic.claude-3-sonnet-20240229-v1:0").
-        if crate::agent::bedrock::is_bedrock_model(&request.model) {
-            request.model = crate::agent::bedrock::strip_bedrock_prefix(&request.model).to_string();
-        }
-
-        // Strip the vertex: or vertex/ prefix before forwarding to the provider,
-        // so the Vertex API receives the bare model name (e.g. "gemini-2.0-flash").
-        if crate::agent::vertex::is_vertex_model(&request.model) {
-            request.model = crate::agent::vertex::strip_vertex_prefix(&request.model).to_string();
-        }
+        // Strip the provider prefix before forwarding to the backend,
+        // so each API receives the bare model name/ID.
+        request.model = strip_provider_prefix(&request.model).to_string();
 
         provider.complete(request, cancel_token).await
     }
@@ -529,7 +543,7 @@ mod tests {
     #[test]
     fn test_multi_provider_select_anthropic_model() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("claude-sonnet-4-20250514");
+        let err = provider.select_provider("anthropic:claude-sonnet-4-20250514");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -552,13 +566,28 @@ mod tests {
     #[test]
     fn test_multi_provider_select_openai_model() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("gpt-4o");
+        let err = provider.select_provider("openai:gpt-4o");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error"),
         };
         assert!(msg.contains("OpenAI"), "expected OpenAI in error: {msg}");
+    }
+
+    #[test]
+    fn test_bare_model_rejected_with_prefix_hint() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("gpt-4o");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("missing a provider prefix"),
+            "bare model should suggest adding prefix: {msg}"
+        );
     }
 
     #[test]
@@ -586,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_provider_select_ollama_model_slash() {
+    fn test_slash_prefix_rejected_as_bare_model() {
         let provider = MultiProvider::new(None, None);
         let err = provider.select_provider("ollama/mistral");
         assert!(err.is_err());
@@ -594,7 +623,10 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error"),
         };
-        assert!(msg.contains("Ollama"), "expected Ollama in error: {msg}");
+        assert!(
+            msg.contains("deprecated slash syntax"),
+            "slash form should mention deprecated syntax: {msg}"
+        );
     }
 
     #[test]
@@ -619,31 +651,7 @@ mod tests {
     #[test]
     fn test_multi_provider_select_gemini_model() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("gemini-2.0-flash");
-        assert!(err.is_err());
-        let msg = match err {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected error"),
-        };
-        assert!(msg.contains("Gemini"), "expected Gemini in error: {msg}");
-    }
-
-    #[test]
-    fn test_multi_provider_select_gemini_slash_model() {
-        let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("gemini/gemini-2.0-flash");
-        assert!(err.is_err());
-        let msg = match err {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected error"),
-        };
-        assert!(msg.contains("Gemini"), "expected Gemini in error: {msg}");
-    }
-
-    #[test]
-    fn test_multi_provider_select_models_gemini_prefix() {
-        let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("models/gemini-1.5-pro");
+        let err = provider.select_provider("gemini:gemini-2.0-flash");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -657,7 +665,7 @@ mod tests {
         let gemini = crate::agent::gemini::GeminiProvider::new("test-key".to_string()).unwrap();
         let provider =
             MultiProvider::new(None, None).with_gemini(Some(std::sync::Arc::new(gemini)));
-        let result = provider.select_provider("gemini-2.0-flash");
+        let result = provider.select_provider("gemini:gemini-2.0-flash");
         assert!(result.is_ok(), "expected Ok when Gemini is configured");
     }
 
@@ -716,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_provider_select_bedrock_model_native_id() {
+    fn test_bare_bedrock_native_id_gets_missing_prefix_hint() {
         let provider = MultiProvider::new(None, None);
         let err = provider.select_provider("anthropic.claude-3-sonnet-20240229-v1:0");
         assert!(err.is_err());
@@ -724,7 +732,46 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error"),
         };
-        assert!(msg.contains("Bedrock"), "expected Bedrock in error: {msg}");
+        // The colon is embedded in the version suffix, not a provider prefix.
+        // Error should suggest bedrock: prefix, not anthropic:.
+        assert!(
+            msg.contains("missing a provider prefix"),
+            "Bedrock native ID should get missing-prefix hint: {msg}"
+        );
+        assert!(
+            msg.contains("bedrock:"),
+            "hint should suggest bedrock: prefix: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unrecognized_provider_prefix_gives_clear_error() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("mistral:mixtral");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("unrecognized provider prefix"),
+            "unknown prefix should give clear error: {msg}"
+        );
+        assert!(
+            msg.contains("known prefixes"),
+            "error should list known prefixes: {msg}"
+        );
+
+        // Long prefix (>10 chars) should also get "unrecognized prefix", not "missing prefix"
+        let err = provider.select_provider("claude-code:opus");
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("unrecognized provider prefix"),
+            "long unrecognized prefix should still say 'unrecognized': {msg}"
+        );
     }
 
     #[test]
@@ -779,19 +826,32 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_provider_default_model_routes_to_vertex_when_anthropic_missing() {
-        let vertex = crate::agent::vertex::VertexProvider::new(
-            "my-project".to_string(),
-            "us-central1".to_string(),
-            Some("gemini-2.0-flash".to_string()),
-        )
-        .unwrap();
-        let provider =
-            MultiProvider::new(None, None).with_vertex(Some(std::sync::Arc::new(vertex)));
-        let result = provider.select_provider(crate::agent::DEFAULT_MODEL);
+    fn test_empty_model_gives_clear_error() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
         assert!(
-            result.is_ok(),
-            "expected default model to route to Vertex when Anthropic is absent"
+            msg.contains("no model configured"),
+            "empty model should give configuration guidance: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_bare_model_without_prefix_rejected() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("claude-sonnet-4-20250514");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("missing a provider prefix"),
+            "bare model should suggest adding prefix: {msg}"
         );
     }
 
@@ -812,6 +872,33 @@ mod tests {
             summary.len()
         );
         assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn test_strip_provider_prefix() {
+        assert_eq!(strip_provider_prefix("openai:gpt-4o"), "gpt-4o");
+        assert_eq!(strip_provider_prefix("ollama:llama3"), "llama3");
+        assert_eq!(strip_provider_prefix("venice:deepseek-r1"), "deepseek-r1");
+        assert_eq!(
+            strip_provider_prefix("bedrock:anthropic.claude-3-sonnet"),
+            "anthropic.claude-3-sonnet"
+        );
+        assert_eq!(
+            strip_provider_prefix("vertex:gemini-2.0-flash"),
+            "gemini-2.0-flash"
+        );
+        assert_eq!(
+            strip_provider_prefix("gemini:gemini-2.0-flash"),
+            "gemini-2.0-flash"
+        );
+        assert_eq!(strip_provider_prefix("codex:gpt-5.4"), "gpt-5.4");
+        assert_eq!(
+            strip_provider_prefix("anthropic:claude-sonnet-4-20250514"),
+            "claude-sonnet-4-20250514"
+        );
+        assert_eq!(strip_provider_prefix("claude-cli:opus"), "opus");
+        // Unrecognized input passes through unchanged
+        assert_eq!(strip_provider_prefix("unknown"), "unknown");
     }
 
     #[test]

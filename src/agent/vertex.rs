@@ -520,9 +520,9 @@ impl VertexProvider {
     /// Resolves the Google-published Gemini model target on Vertex AI.
     ///
     /// Rules:
-    /// - `vertex/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
-    /// - `vertex/google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
-    /// - `vertex` / `vertex:default` -> use `default_model`
+    /// - `vertex:gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex:google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex:default` -> use `default_model`
     /// - non-Gemini model IDs and other publisher namespaces are rejected in this scoped implementation
     fn resolve_model_target(
         &self,
@@ -703,18 +703,25 @@ fn find_tool_name_for_result<'a>(messages: &'a [LlmMessage], block: &ContentBloc
     "unknown"
 }
 
+/// Strip the `vertex:` prefix from a model identifier.
+///
+/// Returns the bare model name suitable for passing to the Vertex API
+/// (e.g. `gemini-2.0-flash`).
 pub fn strip_vertex_prefix(model: &str) -> &str {
-    if let Some(rest) = model.strip_prefix("vertex/") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("vertex:") {
-        rest
+    if is_vertex_model(model) {
+        &model[7..]
     } else {
         model
     }
 }
 
+/// Determine whether a model identifier should route to the Vertex provider.
+///
+/// Requires the canonical `vertex:` prefix (e.g. `vertex:gemini-2.0-flash`).
 pub fn is_vertex_model(model: &str) -> bool {
-    model.starts_with("vertex/") || model.starts_with("vertex:")
+    model.len() > 7
+        && model.as_bytes()[..6].eq_ignore_ascii_case(b"vertex")
+        && model.as_bytes()[6] == b':'
 }
 
 #[async_trait]
@@ -924,24 +931,25 @@ mod tests {
     #[test]
     fn test_model_utilities() {
         assert_eq!(
-            strip_vertex_prefix("vertex/gemini-1.5-pro"),
+            strip_vertex_prefix("vertex:gemini-1.5-pro"),
             "gemini-1.5-pro"
         );
         assert_eq!(
-            strip_vertex_prefix("vertex:gemini-1.5-pro"),
+            strip_vertex_prefix("Vertex:gemini-1.5-pro"),
             "gemini-1.5-pro"
         );
         assert_eq!(strip_vertex_prefix("gemini-1.5-pro"), "gemini-1.5-pro");
 
-        assert!(is_vertex_model("vertex/gemini-1.5-pro"));
         assert!(is_vertex_model("vertex:gemini-1.5-pro"));
+        assert!(is_vertex_model("Vertex:gemini-1.5-pro"));
+        assert!(!is_vertex_model("vertex/gemini-1.5-pro")); // slash no longer accepted
         assert!(!is_vertex_model("gemini-1.5-pro"));
     }
 
     #[test]
     fn test_gemini_adapter_build_body() {
         let request = CompletionRequest {
-            model: "vertex/gemini-1.5-pro".to_string(),
+            model: "gemini-1.5-pro".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -979,7 +987,7 @@ mod tests {
     #[test]
     fn test_gemini_adapter_build_body_preserves_text_thought_signature() {
         let request = CompletionRequest {
-            model: "vertex/gemini-1.5-pro".to_string(),
+            model: "gemini-1.5-pro".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::Assistant,
                 content: vec![ContentBlock::Text {
@@ -1007,7 +1015,7 @@ mod tests {
     #[test]
     fn test_gemini_adapter_build_body_preserves_tool_call_thought_signature() {
         let request = CompletionRequest {
-            model: "vertex/gemini-1.5-pro".to_string(),
+            model: "gemini-1.5-pro".to_string(),
             messages: vec![
                 LlmMessage {
                     role: LlmRole::Assistant,
@@ -1057,27 +1065,27 @@ mod tests {
         .unwrap();
 
         // Gemini generic fallback
-        let url = provider.resolve_request_config("vertex/default").unwrap();
+        let url = provider.resolve_request_config("vertex:default").unwrap();
         assert!(url.contains("publishers/google/models/gemini-1.5-flash"));
         assert!(url.contains("us-central1"));
 
         // Gemini 1.5 specific
         let url = provider
-            .resolve_request_config("vertex/gemini-1.5-pro")
+            .resolve_request_config("vertex:gemini-1.5-pro")
             .unwrap();
         assert!(url.contains("publishers/google/models/gemini-1.5-pro"));
         assert!(url.contains("us-central1"));
 
         // Gemini 3 (Global endpoint fallback test)
         let url = provider
-            .resolve_request_config("vertex/gemini-3.0-flash")
+            .resolve_request_config("vertex:gemini-3.0-flash")
             .unwrap();
         assert!(url.contains("locations/global"));
         assert!(url.contains("publishers/google/models/gemini-3.0-flash"));
 
         // SSRF Path Traversal test cases
         assert!(provider
-            .resolve_request_config("vertex/gemini-1.5-pro/../../something")
+            .resolve_request_config("vertex:gemini-1.5-pro/../../something")
             .is_err());
         assert!(provider
             .resolve_request_config("gemini-1.5-pro%2f%2e%2e%2f")
@@ -1087,7 +1095,7 @@ mod tests {
         let provider_no_default =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         assert!(provider_no_default
-            .resolve_request_config("vertex/default")
+            .resolve_request_config("vertex:default")
             .is_err());
     }
 
@@ -1168,7 +1176,7 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let err = provider
-            .resolve_request_config("vertex/anthropic/claude-3-opus")
+            .resolve_request_config("anthropic/claude-3-opus")
             .expect_err("unsupported publisher namespace should fail");
         assert!(
             err.to_string()
@@ -1182,7 +1190,7 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let err = provider
-            .resolve_request_config("vertex/claude-3-opus")
+            .resolve_request_config("claude-3-opus")
             .expect_err("unsupported bare model should fail");
         assert!(
             err.to_string()
