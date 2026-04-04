@@ -7,7 +7,6 @@
 use serde_json::{json, Value};
 
 use super::super::*;
-use crate::agent::DEFAULT_MODEL;
 
 /// List available models
 pub(super) fn handle_models_list() -> Result<Value, ErrorShape> {
@@ -78,24 +77,6 @@ pub(super) fn handle_models_list() -> Result<Value, ErrorShape> {
                 }
             }
         }
-    }
-
-    // Add default models if none configured
-    if models.is_empty() {
-        models.push(json!({
-            "id": format!("anthropic:{DEFAULT_MODEL}"),
-            "alias": "sonnet",
-            "label": "Claude Sonnet 4",
-            "provider": "anthropic",
-            "model": DEFAULT_MODEL
-        }));
-        models.push(json!({
-            "id": "anthropic:claude-opus-4-20250514",
-            "alias": "opus",
-            "label": "Claude Opus 4",
-            "provider": "anthropic",
-            "model": "claude-opus-4-20250514"
-        }));
     }
 
     Ok(json!({ "models": models }))
@@ -218,7 +199,7 @@ mod tests {
         let result = handle_models_list().unwrap();
         assert!(result.get("models").is_some());
         let models = result["models"].as_array().unwrap();
-        assert!(!models.is_empty());
+        assert!(models.is_empty());
     }
 
     #[test]

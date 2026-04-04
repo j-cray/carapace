@@ -2012,16 +2012,15 @@ pub(super) fn handle_agent(
 
     // Spawn the agent executor if an LLM provider is configured
     let status = if let Some(provider) = state.llm_provider() {
-        let model = params
-            .and_then(|v| v.get("model"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(crate::agent::DEFAULT_MODEL);
+        let model = params.and_then(|v| v.get("model")).and_then(|v| v.as_str());
         let mut config = crate::agent::AgentConfig::default();
         let agent_id = params
             .and_then(|v| v.get("agentId"))
             .and_then(|v| v.as_str());
         crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
-        config.model = model.to_string();
+        if let Some(m) = model {
+            config.model = m.to_string();
+        }
         config.system = params
             .and_then(|v| v.get("system"))
             .and_then(|v| v.as_str())
@@ -2427,7 +2426,6 @@ fn trigger_agent_if_enabled(
         let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
         crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
-        config.model = crate::agent::DEFAULT_MODEL.to_string();
         config.deliver = true;
         config.extra = extra;
         crate::agent::spawn_run(

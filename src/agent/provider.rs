@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::borrow::Cow;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -385,22 +384,18 @@ impl MultiProvider {
             || self.claude_cli.is_some()
     }
 
-    fn normalize_model_for_routing<'a>(&self, model: &'a str) -> Cow<'a, str> {
-        if model == crate::agent::DEFAULT_MODEL && self.anthropic.is_none() && self.vertex.is_some()
-        {
-            Cow::Borrowed("vertex:default")
-        } else {
-            Cow::Borrowed(model)
-        }
-    }
-
     /// Select the appropriate backend provider for the given model.
     ///
-    /// All providers use the canonical `provider:model` colon prefix.
-    /// Models without a recognized prefix fall through to Anthropic.
+    /// All providers require the canonical `provider:model` colon prefix.
+    /// Bare models without a prefix are rejected.
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
-        let normalized_model = self.normalize_model_for_routing(model);
-        let model = normalized_model.as_ref();
+        if model.is_empty() {
+            return Err(AgentError::Provider(
+                "no model configured; set `agents.defaults.model` in your config \
+                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
+                    .to_string(),
+            ));
+        }
 
         if crate::agent::claude_cli::is_claude_cli_model(model) {
             self.claude_cli.as_deref().ok_or_else(|| {
@@ -455,23 +450,29 @@ impl MultiProvider {
                     "model \"{model}\" requires Bedrock provider, but no AWS credentials are configured"
                 ))
             })
-        } else if crate::agent::anthropic::is_anthropic_model(model) || !model.contains(':') {
-            // Explicit `anthropic:model` or bare model IDs (no colon) → Anthropic.
-            if let Some(provider) = self.anthropic.as_deref() {
-                Ok(provider)
-            } else {
-                Err(AgentError::Provider(format!(
-                    "model \"{model}\" requires Anthropic provider, but neither an API key (ANTHROPIC_API_KEY env var or anthropic.apiKey config) nor anthropic.authProfile is configured"
-                )))
-            }
+        } else if crate::agent::anthropic::is_anthropic_model(model) {
+            self.anthropic.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Anthropic provider, but neither an API key \
+                     (ANTHROPIC_API_KEY env var or anthropic.apiKey config) nor \
+                     anthropic.authProfile is configured"
+                ))
+            })
         } else {
-            // Model has an unrecognized `something:model` prefix.
-            let prefix = model.split_once(':').map(|(p, _)| p).unwrap_or(model);
-            Err(AgentError::Provider(format!(
-                "model \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
-                 known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
-                 ollama:, codex:, venice:, claude-cli:"
-            )))
+            let hint = if !model.contains(':') {
+                format!(
+                    "model \"{model}\" is missing a provider prefix; \
+                     use the provider:model format (e.g. `anthropic:{model}`)"
+                )
+            } else {
+                let prefix = model.split_once(':').map(|(p, _)| p).unwrap_or(model);
+                format!(
+                    "model \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
+                     known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
+                     ollama:, codex:, venice:, claude-cli:"
+                )
+            };
+            Err(AgentError::Provider(hint))
         }
     }
 }
@@ -483,9 +484,6 @@ impl LlmProvider for MultiProvider {
         mut request: CompletionRequest,
         cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
-        request.model = self
-            .normalize_model_for_routing(&request.model)
-            .into_owned();
         let provider = self.select_provider(&request.model)?;
 
         // Strip the provider prefix before forwarding to the backend,
@@ -520,7 +518,7 @@ mod tests {
     #[test]
     fn test_multi_provider_select_anthropic_model() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("claude-sonnet-4-20250514");
+        let err = provider.select_provider("anthropic:claude-sonnet-4-20250514");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -553,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_openai_model_falls_through_to_anthropic() {
+    fn test_bare_model_rejected_with_prefix_hint() {
         let provider = MultiProvider::new(None, None);
         let err = provider.select_provider("gpt-4o");
         assert!(err.is_err());
@@ -562,8 +560,8 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(
-            msg.contains("Anthropic"),
-            "bare gpt-4o should fall through to Anthropic: {msg}"
+            msg.contains("missing a provider prefix"),
+            "bare model should suggest adding prefix: {msg}"
         );
     }
 
@@ -592,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn test_slash_prefix_falls_through_to_anthropic() {
+    fn test_slash_prefix_rejected_as_bare_model() {
         let provider = MultiProvider::new(None, None);
         let err = provider.select_provider("ollama/mistral");
         assert!(err.is_err());
@@ -601,8 +599,8 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(
-            msg.contains("Anthropic"),
-            "slash prefix should fall through to Anthropic: {msg}"
+            msg.contains("missing a provider prefix"),
+            "slash form should be rejected as bare model: {msg}"
         );
     }
 
@@ -786,19 +784,32 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_provider_default_model_routes_to_vertex_when_anthropic_missing() {
-        let vertex = crate::agent::vertex::VertexProvider::new(
-            "my-project".to_string(),
-            "us-central1".to_string(),
-            Some("gemini-2.0-flash".to_string()),
-        )
-        .unwrap();
-        let provider =
-            MultiProvider::new(None, None).with_vertex(Some(std::sync::Arc::new(vertex)));
-        let result = provider.select_provider(crate::agent::DEFAULT_MODEL);
+    fn test_empty_model_gives_clear_error() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
         assert!(
-            result.is_ok(),
-            "expected default model to route to Vertex when Anthropic is absent"
+            msg.contains("no model configured"),
+            "empty model should give configuration guidance: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_bare_model_without_prefix_rejected() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("claude-sonnet-4-20250514");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("missing a provider prefix"),
+            "bare model should suggest adding prefix: {msg}"
         );
     }
 
@@ -819,21 +830,6 @@ mod tests {
             summary.len()
         );
         assert!(summary.ends_with("..."));
-    }
-
-    #[test]
-    fn test_multi_provider_explicit_anthropic_prefix_routes_to_anthropic() {
-        let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("anthropic:claude-sonnet-4-20250514");
-        assert!(err.is_err());
-        let msg = match err {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected error"),
-        };
-        assert!(
-            msg.contains("Anthropic"),
-            "explicit anthropic: prefix should route to Anthropic: {msg}"
-        );
     }
 
     #[test]
@@ -859,11 +855,8 @@ mod tests {
             "claude-sonnet-4-20250514"
         );
         assert_eq!(strip_provider_prefix("claude-cli:opus"), "opus");
-        // Bare model without prefix passes through unchanged
-        assert_eq!(
-            strip_provider_prefix("claude-sonnet-4-20250514"),
-            "claude-sonnet-4-20250514"
-        );
+        // Unrecognized input passes through unchanged
+        assert_eq!(strip_provider_prefix("unknown"), "unknown");
     }
 
     #[test]

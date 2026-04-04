@@ -94,7 +94,7 @@ impl SetupProvider {
 
     pub fn default_model(self) -> &'static str {
         match self {
-            Self::Anthropic => "claude-sonnet-4-20250514",
+            Self::Anthropic => "anthropic:claude-sonnet-4-20250514",
             Self::Codex => "codex:default",
             Self::OpenAi => "openai:gpt-4o",
             Self::Ollama => "ollama:llama3",
@@ -977,14 +977,7 @@ fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<
 }
 
 fn vertex_route_requires_default_model(cfg: &Value) -> bool {
-    // An unset route still means "use the provider default route"; for Vertex that default is
-    // `vertex:default`, so the shared onboarding contract continues to require `vertex.model`.
-    matches!(
-        config_string(cfg, &["agents", "defaults", "model"])
-            .unwrap_or_else(|| SetupProvider::Vertex.default_model().to_string())
-            .as_str(),
-        "vertex:default"
-    )
+    config_string(cfg, &["agents", "defaults", "model"]).is_some_and(|m| m == "vertex:default")
 }
 
 fn vertex_default_model_check(cfg: &Value, setup_command: Option<&str>) -> SetupCheck {
@@ -1035,8 +1028,13 @@ fn model_route_check(
     provider: SetupProvider,
     setup_command: Option<&str>,
 ) -> SetupCheck {
-    let model = config_string(cfg, &["agents", "defaults", "model"])
-        .unwrap_or_else(|| provider.default_model().to_string());
+    let Some(model) = config_string(cfg, &["agents", "defaults", "model"]) else {
+        return SetupCheck::fail_generic(
+            "Default model route",
+            "`agents.defaults.model` is not configured".to_string(),
+            default_model_route_follow_up(provider, setup_command),
+        );
+    };
     match model_provider_for_local_chat(&model) {
         Some(actual_provider) if actual_provider == provider => SetupCheck::pass_generic(
             "Default model route",
@@ -1467,11 +1465,10 @@ fn model_provider_for_local_chat(model: &str) -> Option<SetupProvider> {
         Some(SetupProvider::OpenAi)
     } else if agent::bedrock::is_bedrock_model(model) {
         Some(SetupProvider::Bedrock)
-    } else if agent::anthropic::is_anthropic_model(model) || !model.contains(':') {
-        // Explicit `anthropic:` prefix or bare model IDs (no colon) → Anthropic.
+    } else if agent::anthropic::is_anthropic_model(model) {
         Some(SetupProvider::Anthropic)
     } else {
-        // Unrecognized `something:model` prefix — not a known provider.
+        // Bare model or unrecognized prefix — not a known provider.
         None
     }
 }
@@ -1530,7 +1527,7 @@ mod tests {
     fn test_assess_provider_setup_flags_missing_placeholder() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
             "anthropic": { "apiKey": "${ANTHROPIC_API_KEY}" }
         });
         let mut env = ScopedEnv::new();
@@ -1568,7 +1565,7 @@ mod tests {
             .unwrap();
 
         let cfg = json!({
-            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
             "auth": { "profiles": { "enabled": true } },
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1607,7 +1604,7 @@ mod tests {
             .unwrap();
 
         let cfg = json!({
-            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
             "auth": { "profiles": { "enabled": true } },
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1655,7 +1652,7 @@ mod tests {
         env.set("CARAPACE_CONFIG_PASSWORD", "wrong-password");
 
         let cfg = json!({
-            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
             "auth": { "profiles": { "enabled": true } },
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1676,7 +1673,7 @@ mod tests {
     fn test_assess_provider_setup_surfaces_dual_anthropic_auth_paths() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
             "auth": { "profiles": { "enabled": true } },
             "anthropic": {
                 "apiKey": "${ANTHROPIC_API_KEY}",

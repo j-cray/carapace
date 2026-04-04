@@ -39,9 +39,6 @@ pub use provider::{LlmProvider, StreamEvent};
 use tokio_util::sync::CancellationToken;
 pub use tool_policy::ToolPolicy;
 
-/// Default LLM model used when none is specified.
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
-
 /// Errors that can occur during agent execution.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -121,7 +118,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: DEFAULT_MODEL.to_string(),
+            model: String::new(),
             system: None,
             max_turns: 25,
             max_tokens: 8192,

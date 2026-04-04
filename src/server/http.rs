@@ -1316,10 +1316,9 @@ async fn dispatch_agent_run(
         let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
         crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
-        config.model = validated
-            .model
-            .clone()
-            .unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());
+        if let Some(m) = validated.model.clone() {
+            config.model = m;
+        }
         config.deliver = validated.deliver;
         config.extra = validated.venice_parameters.clone();
         crate::agent::spawn_run(
@@ -3218,7 +3217,7 @@ mod tests {
         assert_eq!(json["applied"].as_object().map(|it| it.len()), Some(1));
         assert_eq!(json["providerStatus"]["provider"], "gemini");
         assert_eq!(json["providerStatus"]["configured"], true);
-        assert_eq!(json["providerStatus"]["assessment"]["status"], "partial");
+        assert_eq!(json["providerStatus"]["assessment"]["status"], "invalid");
         assert!(json["providerStatus"]["assessment"]
             .get("profileName")
             .is_none());
