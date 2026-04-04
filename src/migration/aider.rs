@@ -259,7 +259,7 @@ mod tests {
     fn remap_model_bare_claude() {
         assert_eq!(
             remap_model_id("claude-3-5-sonnet-20241022"),
-            "claude-3-5-sonnet-20241022"
+            "anthropic:claude-3-5-sonnet-20241022"
         );
     }
 

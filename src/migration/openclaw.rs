@@ -402,7 +402,7 @@ pub fn remap_model_id(openclaw_model: &str) -> String {
     if let Some((provider, model)) = openclaw_model.split_once('/') {
         let provider_lower = provider.to_lowercase();
         match provider_lower.as_str() {
-            "anthropic" => model.to_string(), // Anthropic is the default — bare is fine
+            "anthropic" => format!("anthropic:{model}"),
             "openai" => format!("openai:{model}"),
             "google" | "gemini" => format!("gemini:{model}"),
             "bedrock" => format!("bedrock:{model}"),
@@ -520,7 +520,7 @@ mod tests {
     fn remap_model_anthropic() {
         assert_eq!(
             remap_model_id("anthropic/claude-opus-4-20250514"),
-            "claude-opus-4-20250514"
+            "anthropic:claude-opus-4-20250514"
         );
     }
 
@@ -566,7 +566,7 @@ mod tests {
     fn remap_model_bare() {
         assert_eq!(
             remap_model_id("claude-sonnet-4-20250514"),
-            "claude-sonnet-4-20250514"
+            "anthropic:claude-sonnet-4-20250514"
         );
     }
 
@@ -627,7 +627,10 @@ mod tests {
             .iter()
             .find(|m| m.carapace_key == "agents.defaults.model")
             .unwrap();
-        assert_eq!(model_mapping.value, json!("claude-sonnet-4-20250514"));
+        assert_eq!(
+            model_mapping.value,
+            json!("anthropic:claude-sonnet-4-20250514")
+        );
     }
 
     #[test]

@@ -9,17 +9,23 @@ pub mod opencode;
 
 /// Add a canonical provider prefix to a bare model name for Carapace routing.
 ///
-/// Well-known model families (gpt-*, o1*, o3*, chatgpt-* → `openai:`,
-/// gemini-* → `gemini:`) get the appropriate prefix. Everything else
-/// (including claude-*) passes through bare — Anthropic is the default
-/// fallback in the routing layer.
+/// All well-known model families get the appropriate prefix:
+/// - `claude-*` → `anthropic:`
+/// - `gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt-*` → `openai:`
+/// - `gemini-*` → `gemini:`
+///
+/// Unrecognized models pass through unchanged.
 pub(crate) fn prefix_bare_model(model: &str) -> String {
     let lower = model.to_ascii_lowercase();
-    if lower.starts_with("gpt-")
+    if lower.starts_with("claude-") {
+        format!("anthropic:{model}")
+    } else if lower.starts_with("gpt-")
         || lower == "o1"
         || lower.starts_with("o1-")
         || lower == "o3"
         || lower.starts_with("o3-")
+        || lower == "o4"
+        || lower.starts_with("o4-")
         || lower.starts_with("chatgpt-")
     {
         format!("openai:{model}")
