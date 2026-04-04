@@ -459,17 +459,17 @@ impl MultiProvider {
                 ))
             })
         } else {
-            // Longest known provider prefix is "claude-cli" (10 chars).
-            // If the part before the colon is longer than that, the colon is
-            // likely embedded in the model ID (e.g. Bedrock version suffix
-            // `anthropic.claude-3-sonnet-v1:0`) rather than a provider prefix.
-            const MAX_PROVIDER_LEN: usize = 10;
             let hint = match model.split_once(':') {
-                Some((prefix, _)) if prefix.len() <= MAX_PROVIDER_LEN => format!(
-                    "model \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
-                     known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
-                     ollama:, codex:, venice:, claude-cli:"
-                ),
+                Some((prefix, _)) if !prefix.contains('.') => {
+                    // Looks like a provider:model pattern (no dots in prefix).
+                    // Bedrock native IDs like `anthropic.claude-v1:0` contain dots
+                    // before the colon, so they fall to the else branch.
+                    format!(
+                        "model \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
+                         known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
+                         ollama:, codex:, venice:, claude-cli:"
+                    )
+                }
                 _ => format!(
                     "model \"{model}\" is missing a provider prefix; \
                      use the provider:model format (e.g. `anthropic:{model}`)"
@@ -734,6 +734,17 @@ mod tests {
         assert!(
             msg.contains("known prefixes"),
             "error should list known prefixes: {msg}"
+        );
+
+        // Long prefix (>10 chars) should also get "unrecognized prefix", not "missing prefix"
+        let err = provider.select_provider("claude-code:opus");
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("unrecognized provider prefix"),
+            "long unrecognized prefix should still say 'unrecognized': {msg}"
         );
     }
 
