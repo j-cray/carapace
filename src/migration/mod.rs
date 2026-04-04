@@ -30,6 +30,7 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
             "ollama" => return format!("ollama:{rest}"),
             "codex" => return format!("codex:{rest}"),
             "venice" => return format!("venice:{rest}"),
+            "claude-cli" => return format!("claude-cli:{rest}"),
             "models" if lower.starts_with("models/gemini-") => {
                 return format!("gemini:{}", &model[7..]);
             }
@@ -37,8 +38,12 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
         }
     }
 
-    // Well-known bare model families
-    if lower.starts_with("claude-") {
+    // Well-known bare model families (claude-cli before claude- to avoid mismatch)
+    if lower == "claude-cli" {
+        "claude-cli:default".to_string()
+    } else if lower.starts_with("claude-cli:") {
+        model.to_string() // already prefixed
+    } else if lower.starts_with("claude-") {
         format!("anthropic:{model}")
     } else if lower.starts_with("gpt-")
         || lower == "o1"

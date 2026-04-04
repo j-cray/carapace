@@ -682,8 +682,8 @@ pub async fn chat_completions_handler(
         let resolved = resolve_configured_model();
         if resolved.is_empty() {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(OpenAiError::api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(OpenAiError::invalid_request(
                     "no model configured; set `agents.defaults.model` in your config \
                      (e.g. `anthropic:claude-sonnet-4-20250514`)",
                 )),
@@ -1053,8 +1053,8 @@ pub async fn responses_handler(
         let resolved = resolve_configured_model();
         if resolved.is_empty() {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(OpenAiError::api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(OpenAiError::invalid_request(
                     "no model configured; set `agents.defaults.model` in your config \
                      (e.g. `anthropic:claude-sonnet-4-20250514`)",
                 )),
@@ -1971,8 +1971,8 @@ mod tests {
         .await;
 
         // Without agents.defaults.model in config, the carapace alias resolves
-        // to empty and select_provider returns a "no model configured" error.
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // to empty — returns 422 with a configuration guidance message.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

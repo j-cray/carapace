@@ -809,8 +809,11 @@ fn record_turn_usage(session_key: &str, model: &str, usage: &TokenUsage) {
         "openai"
     } else if crate::agent::bedrock::is_bedrock_model(model) {
         "bedrock"
-    } else {
+    } else if crate::agent::anthropic::is_anthropic_model(model) {
         "anthropic"
+    } else {
+        tracing::warn!(model, "unrecognized model prefix for usage recording");
+        "unknown"
     };
     crate::server::ws::record_usage(
         session_key,

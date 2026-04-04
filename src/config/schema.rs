@@ -1060,6 +1060,13 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
                 "`{path}` = \"{model}\" is missing a provider prefix; \
                  use `{suggestion}` instead"
             )
+        } else if model.contains(':') && !model.split_once(':').unwrap().0.contains('.') {
+            let prefix = model.split_once(':').unwrap().0;
+            format!(
+                "`{path}` = \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
+                 known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
+                 ollama:, codex:, venice:, claude-cli:"
+            )
         } else {
             format!(
                 "`{path}` = \"{model}\" is missing a provider prefix; \
