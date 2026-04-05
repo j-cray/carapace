@@ -164,11 +164,12 @@
   //   // model: "gemini-2.5-flash"               // or VERTEX_MODEL
   // },
   //
-  // Third-party models on Vertex use the publishers/ path as the model:
-  //   "vertex:publishers/anthropic/models/claude-sonnet-4-20250514"
-  //   "vertex:publishers/meta/models/llama-3.1-405b-instruct-maas"
-  //   "vertex:publishers/mistral/models/mistral-large-2411"
-  //   "vertex:publishers/nvidia/models/llama-3.1-nemotron-70b-instruct"
+  // Third-party models on Vertex use the publishers/ path as the model tag:
+  //   "publishers/anthropic/models/claude-sonnet-4-20250514"
+  //   "publishers/meta/models/llama-3.1-405b-instruct-maas"
+  //   "publishers/mistral/models/mistral-large-2411"
+  //   "publishers/nvidia/models/llama-3.1-nemotron-70b-instruct"
+  // In agent routing strings, add the vertex: prefix (e.g. vertex:publishers/anthropic/...)
 
   // --- Provider-specific config --------------------------------------------
   // providers: {

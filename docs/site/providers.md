@@ -108,11 +108,11 @@ Gemini models use the short form:
 Third-party models use the full publisher path from the Vertex AI Model
 Garden. You must enable the model's API in your GCP project first.
 
-```json5
-{ "model": "vertex:publishers/anthropic/models/claude-sonnet-4-20250514" }
-{ "model": "vertex:publishers/meta/models/llama-3.1-405b-instruct-maas" }
-{ "model": "vertex:publishers/mistral/models/mistral-large-2411" }
-{ "model": "vertex:publishers/nvidia/models/llama-3.1-nemotron-70b-instruct" }
+```
+vertex:publishers/anthropic/models/claude-sonnet-4-20250514
+vertex:publishers/meta/models/llama-3.1-405b-instruct-maas
+vertex:publishers/mistral/models/mistral-large-2411
+vertex:publishers/nvidia/models/llama-3.1-nemotron-70b-instruct
 ```
 
 ### Gemini / Bedrock / Venice
@@ -159,6 +159,7 @@ Venice endpoint, the wizard will offer an optional base URL override.
 
 Supported env vars:
 
+- `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL` (Vertex AI)
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
 - `OPENAI_OAUTH_CLIENT_ID` / `OPENAI_OAUTH_CLIENT_SECRET` (Codex OpenAI sign-in)
