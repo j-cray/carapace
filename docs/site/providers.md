@@ -113,6 +113,7 @@ Third-party models use the full publisher path from the Vertex AI Model
 Garden. You must enable the model's API in your GCP project first.
 
 ```
+// agents.defaults.model or agents.list[].model
 vertex:publishers/anthropic/models/claude-sonnet-4-20250514
 vertex:publishers/meta/models/llama-3.1-405b-instruct-maas
 vertex:publishers/mistral/models/mistral-large-2411
