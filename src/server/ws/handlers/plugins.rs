@@ -237,7 +237,6 @@ fn write_plugins_manifest(plugins_dir: &Path, manifest: &Value) -> Result<(), Er
         &manifest_path,
         &bytes,
         "plugins manifest",
-        "plugins manifest",
     )?;
     Ok(())
 }
@@ -267,22 +266,21 @@ fn write_atomic_plugins_file(
     tmp_path: &Path,
     dest_path: &Path,
     bytes: &[u8],
-    write_label: &str,
-    replace_label: &str,
+    label: &str,
 ) -> Result<(), ErrorShape> {
     let write_result = (|| {
-        let mut file = open_plugins_tmp_file(tmp_path, write_label)?;
+        let mut file = open_plugins_tmp_file(tmp_path, label)?;
         file.write_all(bytes).map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("failed to write {write_label}: {e}"),
+                &format!("failed to write {label}: {e}"),
                 None,
             )
         })?;
         file.sync_all().map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("failed to sync {write_label}: {e}"),
+                &format!("failed to sync {label}: {e}"),
                 None,
             )
         })?;
@@ -290,19 +288,30 @@ fn write_atomic_plugins_file(
     })();
 
     if let Err(err) = write_result {
-        let _ = std::fs::remove_file(tmp_path);
+        log_plugins_tmp_cleanup_failure(tmp_path, label);
         return Err(err);
     }
 
     std::fs::rename(tmp_path, dest_path).map_err(|e| {
-        let _ = std::fs::remove_file(tmp_path);
+        log_plugins_tmp_cleanup_failure(tmp_path, label);
         error_shape(
             ERROR_UNAVAILABLE,
-            &format!("failed to replace {replace_label}: {e}"),
+            &format!("failed to replace {label}: {e}"),
             None,
         )
     })?;
     Ok(())
+}
+
+fn log_plugins_tmp_cleanup_failure(tmp_path: &Path, label: &str) {
+    if let Err(cleanup_error) = std::fs::remove_file(tmp_path) {
+        tracing::warn!(
+            path = %tmp_path.display(),
+            %label,
+            %cleanup_error,
+            "failed to clean up temporary plugin file"
+        );
+    }
 }
 
 /// Compute the SHA-256 hash of the given bytes and return it as a lowercase hex string.
@@ -471,7 +480,6 @@ fn atomic_write_plugin_file(
         &tmp_path,
         &dest_path,
         bytes,
-        "plugin binary",
         "plugin binary",
     )?;
 
@@ -2332,7 +2340,6 @@ mod tests {
             &tmp_path,
             &dest_path,
             b"new-plugin-bytes",
-            "plugin binary",
             "plugin binary",
         )
         .unwrap_err();
