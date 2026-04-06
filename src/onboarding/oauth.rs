@@ -5,8 +5,11 @@
 //! is captured via function pointers in [`OAuthOnboardingSpec`]; everything else
 //! (flow state, result types, HTML helpers, config persistence) lives here once.
 
+use parking_lot::RwLock;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use crate::auth::profiles::{
     AuthProfile, OAuthProvider, OAuthProviderConfig, OAuthTokens, UserInfo,
@@ -165,4 +168,73 @@ pub(crate) fn validate_and_persist_config(config: &Value) -> Result<(), String> 
     }
     let config_path = crate::config::get_config_path();
     persist_config_file(&config_path, config).map_err(|err| err.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Shared flow storage
+// ---------------------------------------------------------------------------
+
+static OAUTH_FLOWS: LazyLock<RwLock<HashMap<String, PendingOAuthFlow>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Insert a flow into the shared store, enforcing per-provider limits.
+///
+/// Expired flows for the same provider are pruned first. If the provider
+/// still has `>= spec.max_pending_flows` entries, the insert is rejected.
+pub(crate) fn insert_oauth_flow(flow: PendingOAuthFlow) -> Result<(), String> {
+    let spec = flow.spec;
+    let cutoff = now_ms().saturating_sub(spec.flow_ttl_secs * 1000);
+    let mut flows = OAUTH_FLOWS.write();
+
+    // Evict expired flows for this provider before counting.
+    flows.retain(|_, f| {
+        !std::ptr::eq(f.spec, spec) || f.created_at_ms >= cutoff
+    });
+
+    let provider_count = flows
+        .values()
+        .filter(|f| std::ptr::eq(f.spec, spec))
+        .count();
+    if provider_count >= spec.max_pending_flows {
+        return Err(format!(
+            "Too many active {} sign-in flows. \
+             Wait for an existing flow to finish or expire and retry.",
+            spec.display_name
+        ));
+    }
+
+    flows.insert(flow.id.clone(), flow);
+    Ok(())
+}
+
+/// Look up a pending flow by its OAuth `state` parameter, scoped to a spec.
+pub(crate) fn find_flow_by_state(
+    spec: &'static OAuthOnboardingSpec,
+    state_param: &str,
+) -> Option<PendingOAuthFlow> {
+    OAUTH_FLOWS
+        .read()
+        .values()
+        .find(|f| std::ptr::eq(f.spec, spec) && f.state == state_param)
+        .cloned()
+}
+
+/// Look up a flow by its unique flow ID.
+pub(crate) fn get_flow(flow_id: &str) -> Option<PendingOAuthFlow> {
+    OAUTH_FLOWS.read().get(flow_id).cloned()
+}
+
+/// Mutate a flow's state in place.
+pub(crate) fn update_flow_state(flow_id: &str, new_state: OAuthFlowState) {
+    if let Some(flow) = OAUTH_FLOWS.write().get_mut(flow_id) {
+        flow.flow_state = new_state;
+    }
+}
+
+/// Remove all flows whose TTL has elapsed.
+pub(crate) fn cleanup_expired_flows() {
+    let now = now_ms();
+    OAUTH_FLOWS.write().retain(|_, flow| {
+        now.saturating_sub(flow.created_at_ms) < flow.spec.flow_ttl_secs * 1000
+    });
 }
