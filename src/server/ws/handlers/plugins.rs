@@ -263,8 +263,8 @@ fn write_atomic_plugins_file(
     bytes: &[u8],
     label: &str,
 ) -> Result<(), ErrorShape> {
-    let write_result = (|| {
-        let mut file = open_plugins_tmp_file(tmp_path, label)?;
+    let mut file = open_plugins_tmp_file(tmp_path, label)?;
+    if let Err(err) = (|| {
         file.write_all(bytes).map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
@@ -280,9 +280,7 @@ fn write_atomic_plugins_file(
             )
         })?;
         Ok::<(), ErrorShape>(())
-    })();
-
-    if let Err(err) = write_result {
+    })() {
         log_plugins_tmp_cleanup_failure(tmp_path, label);
         return Err(err);
     }
@@ -300,6 +298,9 @@ fn write_atomic_plugins_file(
 
 fn log_plugins_tmp_cleanup_failure(tmp_path: &Path, label: &str) {
     if let Err(cleanup_error) = std::fs::remove_file(tmp_path) {
+        if cleanup_error.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
         tracing::warn!(
             path = %tmp_path.display(),
             %label,
