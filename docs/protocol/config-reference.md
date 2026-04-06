@@ -280,6 +280,10 @@ These are the most commonly used provider sections for first-run setup and day-1
     - `projectId`: String. Your Google Cloud Project ID.
     - `location`: String. The server location region. (Default: `"us-central1"`)
     - `model`: String. The model tag.
+  - *Model syntax (for `vertex.model` config field):*
+    - Gemini: `gemini-2.5-flash` or `google/gemini-2.5-flash`
+    - Third-party: `publishers/<publisher>/models/<model-id>` where publisher is `anthropic`, `meta`, `mistral`, or `nvidia`. The model ID is found on the model's page in the Vertex AI Model Garden.
+    - Note: in agent `model` routing strings, add the `vertex:` prefix (e.g. `vertex:gemini-2.5-flash`).
 
 - **`auth.profiles`**
   - *What it does:* Defines OAuth provider configuration used by Carapace auth profiles.

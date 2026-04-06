@@ -87,6 +87,39 @@ If your Ollama endpoint requires auth, the wizard will also offer an optional
 API key prompt and can write `providers.ollama.apiKey` from either direct input
 or `${OLLAMA_API_KEY}`.
 
+### Vertex AI
+
+Vertex AI supports Google Gemini models and third-party models from
+Anthropic, Meta, Mistral, and Nvidia. Authentication uses `gcloud` CLI
+credentials or the GCE metadata server.
+
+Prerequisite: authenticate with `gcloud auth application-default login` so
+Carapace can obtain access tokens.
+
+```bash
+export VERTEX_PROJECT_ID='my-gcp-project'
+export VERTEX_LOCATION='us-central1'   # optional, defaults to us-central1
+cara setup --provider vertex
+```
+
+Gemini models use the short form in agent config:
+
+```json5
+// agents.defaults.model or agents.list[].model
+{ "model": "vertex:gemini-2.5-flash" }
+```
+
+Third-party models use the full publisher path from the Vertex AI Model
+Garden. You must enable the model's API in your GCP project first.
+
+```text
+// agents.defaults.model or agents.list[].model
+vertex:publishers/anthropic/models/claude-sonnet-4-20250514
+vertex:publishers/meta/models/llama-3.1-405b-instruct-maas
+vertex:publishers/mistral/models/mistral-large-2411
+vertex:publishers/nvidia/models/llama-3.1-nemotron-70b-instruct
+```
+
 ### Gemini / Bedrock / Venice
 
 These providers are supported directly by the setup wizard now. If multiple
@@ -131,6 +164,7 @@ Venice endpoint, the wizard will offer an optional base URL override.
 
 Supported env vars:
 
+- `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL` (Vertex AI)
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
 - `OPENAI_OAUTH_CLIENT_ID` / `OPENAI_OAUTH_CLIENT_SECRET` (Codex OpenAI sign-in)
@@ -148,7 +182,7 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-20250514`, `openai:gpt-4o`, `gemini:gemini-2.0-flash`, `vertex:gemini-2.5-flash`, `bedrock:anthropic.claude-3-sonnet`, `ollama:llama3`, `codex:gpt-5.4`, `venice:llama-3.3-70b`, `claude-cli:opus`.
+- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-20250514`, `openai:gpt-4o`, `gemini:gemini-2.0-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-20250514`, `bedrock:anthropic.claude-3-sonnet`, `ollama:llama3`, `codex:gpt-5.4`, `venice:llama-3.3-70b`, `claude-cli:opus`.
 - **No implicit routing**: Bare model names (without a `provider:` prefix) are rejected with a clear error. Always specify the provider.
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
