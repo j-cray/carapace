@@ -23,6 +23,15 @@ type CliOAuthSender = std::sync::Arc<
     std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<OAuthCompletion, String>>>>,
 >;
 
+/// Function pointer that resolves provider-specific OAuth configuration.
+type ResolveProviderConfigFn = fn(
+    cfg: &Value,
+    client_id_override: Option<String>,
+    client_secret_override: Option<String>,
+    redirect_uri: String,
+    state_dir: &Path,
+) -> Result<OAuthProviderConfig, String>;
+
 // ---------------------------------------------------------------------------
 // Provider spec
 // ---------------------------------------------------------------------------
@@ -49,13 +58,7 @@ pub(crate) struct OAuthOnboardingSpec {
     /// Resolve provider-specific OAuth configuration from the merged config
     /// value, optional client-id/secret overrides, the redirect URI, and the
     /// state directory.
-    pub resolve_provider_config: fn(
-        cfg: &Value,
-        client_id_override: Option<String>,
-        client_secret_override: Option<String>,
-        redirect_uri: String,
-        state_dir: &Path,
-    ) -> Result<OAuthProviderConfig, String>,
+    pub resolve_provider_config: ResolveProviderConfigFn,
 
     /// Build an [`AuthProfile`] from the tokens, provider config and user info
     /// returned after a successful token exchange.
@@ -110,7 +113,6 @@ pub(crate) struct OAuthStartResult {
 }
 
 pub(crate) enum OAuthStatusResult {
-    Pending,
     InProgress,
     Completed {
         profile_name: String,
@@ -124,7 +126,6 @@ pub(crate) enum OAuthStatusResult {
 
 pub(crate) struct OAuthApplyResult {
     pub profile_id: String,
-    pub client_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +185,7 @@ pub(crate) fn upsert_oauth_profile(
     state_dir: &Path,
     profile: AuthProfile,
 ) -> Result<String, String> {
-    let store =
-        ProfileStore::from_env(state_dir.to_path_buf()).map_err(|err| err.to_string())?;
+    let store = ProfileStore::from_env(state_dir.to_path_buf()).map_err(|err| err.to_string())?;
     store.load().map_err(|err| err.to_string())?;
 
     let existing = store.find_matching(
@@ -224,9 +224,7 @@ pub(crate) fn insert_oauth_flow(flow: PendingOAuthFlow) -> Result<(), String> {
     let mut flows = OAUTH_FLOWS.write();
 
     // Evict expired flows for this provider before counting.
-    flows.retain(|_, f| {
-        !std::ptr::eq(f.spec, spec) || f.created_at_ms >= cutoff
-    });
+    flows.retain(|_, f| !std::ptr::eq(f.spec, spec) || f.created_at_ms >= cutoff);
 
     let provider_count = flows
         .values()
@@ -244,24 +242,13 @@ pub(crate) fn insert_oauth_flow(flow: PendingOAuthFlow) -> Result<(), String> {
     Ok(())
 }
 
-/// Look up a pending flow by its OAuth `state` parameter, scoped to a spec.
-pub(crate) fn find_flow_by_state(
-    spec: &'static OAuthOnboardingSpec,
-    state_param: &str,
-) -> Option<PendingOAuthFlow> {
-    OAUTH_FLOWS
-        .read()
-        .values()
-        .find(|f| std::ptr::eq(f.spec, spec) && f.state == state_param)
-        .cloned()
-}
-
 /// Look up a flow by its unique flow ID.
 pub(crate) fn get_flow(flow_id: &str) -> Option<PendingOAuthFlow> {
     OAUTH_FLOWS.read().get(flow_id).cloned()
 }
 
-/// Mutate a flow's state in place.
+/// Mutate a flow's state in place (test-only helper).
+#[cfg(test)]
 pub(crate) fn update_flow_state(flow_id: &str, new_state: OAuthFlowState) {
     if let Some(flow) = OAUTH_FLOWS.write().get_mut(flow_id) {
         flow.flow_state = new_state;
@@ -271,9 +258,9 @@ pub(crate) fn update_flow_state(flow_id: &str, new_state: OAuthFlowState) {
 /// Remove all flows whose TTL has elapsed.
 pub(crate) fn cleanup_expired_flows() {
     let now = now_ms();
-    OAUTH_FLOWS.write().retain(|_, flow| {
-        now.saturating_sub(flow.created_at_ms) < flow.spec.flow_ttl_secs * 1000
-    });
+    OAUTH_FLOWS
+        .write()
+        .retain(|_, flow| now.saturating_sub(flow.created_at_ms) < flow.spec.flow_ttl_secs * 1000);
 }
 
 /// Remove a flow from the shared store by ID.
@@ -293,9 +280,7 @@ pub(crate) fn remove_flow_for_test(flow_id: &str) {
 
 /// Checks that CARAPACE_CONFIG_PASSWORD is set so profile tokens and OAuth
 /// client secrets are encrypted at rest.
-pub(crate) fn require_encrypted_profile_store(
-    spec: &OAuthOnboardingSpec,
-) -> Result<(), String> {
+pub(crate) fn require_encrypted_profile_store(spec: &OAuthOnboardingSpec) -> Result<(), String> {
     if profile_store_encryption_enabled_from_env() {
         return Ok(());
     }
@@ -375,9 +360,7 @@ pub(crate) async fn complete_oauth_callback(
         let flow = flows
             .values_mut()
             .find(|f| std::ptr::eq(f.spec, spec) && f.state == state_param)
-            .ok_or_else(|| {
-                format!("Unknown or expired {} OAuth flow", spec.display_name)
-            })?;
+            .ok_or_else(|| format!("Unknown or expired {} OAuth flow", spec.display_name))?;
 
         match &flow.flow_state {
             OAuthFlowState::Completed(_) => return Ok(()),
@@ -428,13 +411,9 @@ pub(crate) async fn complete_oauth_callback(
         let tokens = exchange_code(&provider_config, code, &verifier)
             .await
             .map_err(|err| err.to_string())?;
-        let userinfo = fetch_user_info(
-            spec.oauth_provider,
-            &provider_config,
-            &tokens.access_token,
-        )
-        .await
-        .map_err(|err| err.to_string())?;
+        let userinfo = fetch_user_info(spec.oauth_provider, &provider_config, &tokens.access_token)
+            .await
+            .map_err(|err| err.to_string())?;
         Ok::<OAuthCompletion, String>(OAuthCompletion {
             client_id: provider_config.client_id.clone(),
             auth_profile: (spec.build_auth_profile)(tokens, &provider_config, userinfo),
@@ -462,9 +441,7 @@ fn finish_oauth_flow(
             OAuthFlowState::Failed(err) => return Err(err.clone()),
             OAuthFlowState::Pending | OAuthFlowState::InProgress => {
                 flow.flow_state = match &result {
-                    Ok(completion) => {
-                        OAuthFlowState::Completed(Box::new(completion.clone()))
-                    }
+                    Ok(completion) => OAuthFlowState::Completed(Box::new(completion.clone())),
                     Err(err) => OAuthFlowState::Failed(err.clone()),
                 };
             }
@@ -480,16 +457,12 @@ pub(crate) fn oauth_flow_status(flow_id: &str) -> OAuthStatusResult {
     match flows.get(flow_id) {
         None => OAuthStatusResult::NotFound,
         Some(flow) => match &flow.flow_state {
-            OAuthFlowState::Pending | OAuthFlowState::InProgress => {
-                OAuthStatusResult::InProgress
-            }
+            OAuthFlowState::Pending | OAuthFlowState::InProgress => OAuthStatusResult::InProgress,
             OAuthFlowState::Completed(completion) => OAuthStatusResult::Completed {
                 profile_name: completion.auth_profile.name.clone(),
                 email: completion.auth_profile.email.clone(),
             },
-            OAuthFlowState::Failed(err) => OAuthStatusResult::Failed {
-                error: err.clone(),
-            },
+            OAuthFlowState::Failed(err) => OAuthStatusResult::Failed { error: err.clone() },
         },
     }
 }
@@ -501,8 +474,7 @@ pub(crate) fn apply_oauth_flow(
     state_dir: &Path,
     cfg: &mut Value,
 ) -> Result<OAuthApplyResult, String> {
-    let flow = get_flow(flow_id)
-        .ok_or_else(|| "Unknown or expired OAuth flow".to_string())?;
+    let flow = get_flow(flow_id).ok_or_else(|| "Unknown or expired OAuth flow".to_string())?;
 
     let completion = match &flow.flow_state {
         OAuthFlowState::Completed(completion) => completion.as_ref().clone(),
@@ -520,10 +492,7 @@ pub(crate) fn apply_oauth_flow(
     validate_and_persist_config(cfg)?;
     remove_flow(flow_id);
 
-    Ok(OAuthApplyResult {
-        profile_id,
-        client_id: completion.client_id,
-    })
+    Ok(OAuthApplyResult { profile_id })
 }
 
 // ---------------------------------------------------------------------------
@@ -589,8 +558,12 @@ async fn run_cli_oauth_with_timeout(
         &crate::paths::resolve_state_dir(),
     )?;
 
-    let parsed_redirect = url::Url::parse(&provider_config.redirect_uri)
-        .map_err(|err| format!("invalid {} OAuth redirect URI: {err}", spec.idp_display_name))?;
+    let parsed_redirect = url::Url::parse(&provider_config.redirect_uri).map_err(|err| {
+        format!(
+            "invalid {} OAuth redirect URI: {err}",
+            spec.idp_display_name
+        )
+    })?;
     let host = parsed_redirect.host_str().unwrap_or_default();
     if host != "127.0.0.1" && host != "localhost" {
         return Err(format!(
@@ -760,13 +733,9 @@ async fn complete_cli_oauth_callback(
     let tokens = exchange_code(provider_config, code.trim(), code_verifier)
         .await
         .map_err(|err| err.to_string())?;
-    let userinfo = fetch_user_info(
-        spec.oauth_provider,
-        provider_config,
-        &tokens.access_token,
-    )
-    .await
-    .map_err(|err| err.to_string())?;
+    let userinfo = fetch_user_info(spec.oauth_provider, provider_config, &tokens.access_token)
+        .await
+        .map_err(|err| err.to_string())?;
 
     Ok(OAuthCompletion {
         client_id: provider_config.client_id.clone(),

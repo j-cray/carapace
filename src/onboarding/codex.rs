@@ -7,9 +7,7 @@ use crate::auth::profiles::{
     AuthProfile, AuthProfileCredentialKind, OAuthProvider, OAuthProviderConfig, OAuthTokens,
     ProfileStore, StoredOAuthProviderConfig, UserInfo,
 };
-use crate::onboarding::oauth::{
-    self, OAuthCompletion, OAuthOnboardingSpec, OAuthStatusResult,
-};
+use crate::onboarding::oauth::{self, OAuthCompletion, OAuthOnboardingSpec, OAuthStatusResult};
 #[cfg(test)]
 use crate::onboarding::oauth::{OAuthFlowState, PendingOAuthFlow};
 use crate::server::ws::read_config_snapshot;
@@ -202,8 +200,13 @@ pub fn start_control_openai_oauth(
     client_secret_override: Option<String>,
     redirect_base_url: &str,
 ) -> Result<CodexOAuthStart, String> {
-    let result =
-        oauth::start_oauth_flow(&CODEX_SPEC, cfg, client_id_override, client_secret_override, redirect_base_url)?;
+    let result = oauth::start_oauth_flow(
+        &CODEX_SPEC,
+        cfg,
+        client_id_override,
+        client_secret_override,
+        redirect_base_url,
+    )?;
     Ok(CodexOAuthStart {
         flow_id: result.flow_id,
         auth_url: result.auth_url,
@@ -222,7 +225,7 @@ pub async fn complete_control_openai_oauth_callback(
 
 pub fn control_openai_oauth_status(flow_id: &str) -> Result<CodexOAuthStatus, String> {
     match oauth::oauth_flow_status(flow_id) {
-        OAuthStatusResult::Pending | OAuthStatusResult::InProgress => Ok(CodexOAuthStatus {
+        OAuthStatusResult::InProgress => Ok(CodexOAuthStatus {
             flow_id: flow_id.to_string(),
             status: "pending",
             profile_name: None,
@@ -246,9 +249,7 @@ pub fn control_openai_oauth_status(flow_id: &str) -> Result<CodexOAuthStatus, St
             email: None,
             error: Some(error),
         }),
-        OAuthStatusResult::NotFound => {
-            Err("Unknown or expired Codex OAuth flow".to_string())
-        }
+        OAuthStatusResult::NotFound => Err("Unknown or expired Codex OAuth flow".to_string()),
     }
 }
 
@@ -274,9 +275,13 @@ pub async fn run_cli_openai_oauth(
     client_id_override: Option<String>,
     client_secret_override: Option<String>,
 ) -> Result<CodexOAuthCompletion, String> {
-    let completion =
-        oauth::run_cli_oauth(&CODEX_SPEC, &cfg, client_id_override, client_secret_override)
-            .await?;
+    let completion = oauth::run_cli_oauth(
+        &CODEX_SPEC,
+        &cfg,
+        client_id_override,
+        client_secret_override,
+    )
+    .await?;
     Ok(CodexOAuthCompletion {
         client_id: completion.client_id,
         auth_profile: completion.auth_profile,

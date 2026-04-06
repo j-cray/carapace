@@ -7,9 +7,7 @@ use crate::auth::profiles::{
     AuthProfile, AuthProfileCredentialKind, OAuthProvider, OAuthProviderConfig, OAuthTokens,
     ProfileStore, StoredOAuthProviderConfig, UserInfo,
 };
-use crate::onboarding::oauth::{
-    self, OAuthCompletion, OAuthOnboardingSpec, OAuthStatusResult,
-};
+use crate::onboarding::oauth::{self, OAuthCompletion, OAuthOnboardingSpec, OAuthStatusResult};
 #[cfg(test)]
 use crate::onboarding::oauth::{OAuthFlowState, PendingOAuthFlow};
 use crate::server::ws::read_config_snapshot;
@@ -236,7 +234,7 @@ pub async fn complete_control_google_oauth_callback(
 
 pub fn control_google_oauth_status(flow_id: &str) -> Result<GeminiOAuthStatus, String> {
     match oauth::oauth_flow_status(flow_id) {
-        OAuthStatusResult::Pending | OAuthStatusResult::InProgress => Ok(GeminiOAuthStatus {
+        OAuthStatusResult::InProgress => Ok(GeminiOAuthStatus {
             flow_id: flow_id.to_string(),
             status: "pending",
             profile_name: None,
@@ -260,9 +258,7 @@ pub fn control_google_oauth_status(flow_id: &str) -> Result<GeminiOAuthStatus, S
             email: None,
             error: Some(error),
         }),
-        OAuthStatusResult::NotFound => {
-            Err("Unknown or expired Gemini OAuth flow".to_string())
-        }
+        OAuthStatusResult::NotFound => Err("Unknown or expired Gemini OAuth flow".to_string()),
     }
 }
 
@@ -297,9 +293,13 @@ pub async fn run_cli_google_oauth(
     client_id_override: Option<String>,
     client_secret_override: Option<String>,
 ) -> Result<GeminiOAuthCompletion, String> {
-    let completion =
-        oauth::run_cli_oauth(&GEMINI_SPEC, &cfg, client_id_override, client_secret_override)
-            .await?;
+    let completion = oauth::run_cli_oauth(
+        &GEMINI_SPEC,
+        &cfg,
+        client_id_override,
+        client_secret_override,
+    )
+    .await?;
     Ok(GeminiOAuthCompletion {
         client_id: completion.client_id,
         auth_profile: completion.auth_profile,
@@ -531,11 +531,8 @@ mod tests {
                 "http://127.0.0.1:3000/auth/callback",
             )
             .unwrap();
-        let profile = build_gemini_auth_profile(
-            sample_tokens(),
-            &provider_config,
-            sample_user_info(),
-        );
+        let profile =
+            build_gemini_auth_profile(sample_tokens(), &provider_config, sample_user_info());
         let profile_id = profile.id.clone();
         let store = ProfileStore::from_env(state_dir.clone()).expect("profile store from env");
         store.add(profile).expect("store profile");
@@ -573,11 +570,8 @@ mod tests {
                 "http://127.0.0.1:3000/auth/callback",
             )
             .unwrap();
-        let profile = build_gemini_auth_profile(
-            sample_tokens(),
-            &provider_config,
-            sample_user_info(),
-        );
+        let profile =
+            build_gemini_auth_profile(sample_tokens(), &provider_config, sample_user_info());
         let profile_id = profile.id.clone();
         let store = ProfileStore::from_env(state_dir.clone()).expect("profile store from env");
         store.add(profile).expect("store profile");
