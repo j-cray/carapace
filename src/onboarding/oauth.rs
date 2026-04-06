@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use crate::auth::profiles::{
-    AuthProfile, OAuthProvider, OAuthProviderConfig, OAuthTokens, UserInfo,
+    AuthProfile, OAuthProvider, OAuthProviderConfig, OAuthTokens, ProfileStore, UserInfo,
 };
 use crate::server::ws::{map_validation_issues, persist_config_file};
 
@@ -168,6 +168,36 @@ pub(crate) fn validate_and_persist_config(config: &Value) -> Result<(), String> 
     }
     let config_path = crate::config::get_config_path();
     persist_config_file(&config_path, config).map_err(|err| err.to_string())
+}
+
+/// Shared match-and-upsert: loads the profile store from state_dir, finds an
+/// existing profile by provider/user_id/email to preserve its id and created_at_ms,
+/// then upserts.
+pub(crate) fn upsert_oauth_profile(
+    state_dir: &Path,
+    profile: AuthProfile,
+) -> Result<String, String> {
+    let store =
+        ProfileStore::from_env(state_dir.to_path_buf()).map_err(|err| err.to_string())?;
+    store.load().map_err(|err| err.to_string())?;
+
+    let existing = store.find_matching(
+        profile.provider,
+        profile.user_id.as_deref(),
+        profile.email.as_deref(),
+    );
+    let profile = if let Some(existing) = existing {
+        AuthProfile {
+            id: existing.id,
+            created_at_ms: existing.created_at_ms,
+            ..profile
+        }
+    } else {
+        profile
+    };
+    let id = profile.id.clone();
+    store.upsert(profile).map_err(|err| err.to_string())?;
+    Ok(id)
 }
 
 // ---------------------------------------------------------------------------
