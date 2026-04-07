@@ -85,7 +85,7 @@ jobs:
               workflow=true
             fi
 
-            if [[ "$path" == src/* || "$path" == tests/* || "$path" == fuzz/* || "$path" == wit/* || "$path" == ".cargo/"* || "$path" == ".config/nextest.toml" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == "build.rs" || "$path" == "deny.toml" || "$path" == "config.example.json5" ]]; then
+            if [[ "$path" == src/* || "$path" == tests/* || "$path" == fuzz/* || "$path" == wit/* || "$path" == ".cargo/"* || "$path" == ".config/nextest.toml" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == "build.rs" || "$path" == "deny.toml" || "$path" == "config.example.json5" || "$path" == "rust-toolchain.toml" || "$path" == "rust-toolchain" ]]; then
               rust_runtime=true
             fi
 
