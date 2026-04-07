@@ -319,11 +319,6 @@ pub fn persist_cli_google_oauth(
     oauth::persist_cli_oauth(&GEMINI_SPEC, oauth_completion, &state_dir, config)
 }
 
-// Re-export callback_html from the shared module.
-pub(crate) fn callback_html(title: &str, body: &str) -> String {
-    oauth::callback_html(title, body)
-}
-
 // ---------------------------------------------------------------------------
 // Public API: API-key path (unchanged)
 // ---------------------------------------------------------------------------
@@ -723,6 +718,7 @@ mod tests {
         );
         let status = control_google_oauth_status(&flow_id).expect("status");
         assert_eq!(status.status, "completed");
+        oauth::remove_flow_for_test(&flow_id);
     }
 
     #[tokio::test]
@@ -886,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_callback_html_escapes_html() {
-        let html = callback_html("<Gemini>", "\"bad\" & <script>");
+        let html = oauth::callback_html("<Gemini>", "\"bad\" & <script>");
         assert!(html.contains("&lt;Gemini&gt;"));
         assert!(html.contains("&quot;bad&quot; &amp; &lt;script&gt;"));
     }

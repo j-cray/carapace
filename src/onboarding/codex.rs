@@ -301,11 +301,6 @@ pub fn persist_cli_openai_oauth(
     oauth::persist_cli_oauth(&CODEX_SPEC, oauth_completion, &state_dir, config)
 }
 
-// Re-export callback_html from the shared module.
-pub(crate) fn callback_html(title: &str, body: &str) -> String {
-    oauth::callback_html(title, body)
-}
-
 // ---------------------------------------------------------------------------
 // Private helpers (OpenAI-specific config resolution)
 // ---------------------------------------------------------------------------
@@ -562,6 +557,7 @@ mod tests {
         );
         let status = control_openai_oauth_status(&flow_id).expect("status");
         assert_eq!(status.status, "completed");
+        oauth::remove_flow_for_test(&flow_id);
     }
 
     #[tokio::test]
@@ -676,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_callback_html_escapes_html() {
-        let html = callback_html("<Codex>", "\"bad\" & <script>");
+        let html = oauth::callback_html("<Codex>", "\"bad\" & <script>");
         assert!(html.contains("&lt;Codex&gt;"));
         assert!(html.contains("&quot;bad&quot; &amp; &lt;script&gt;"));
     }

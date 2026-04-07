@@ -426,10 +426,7 @@ pub(crate) async fn complete_oauth_callback(
 /// Mirrors the idempotency behaviour of the original per-provider
 /// `finish_control_*_oauth_flow` helpers: if the flow has already reached a
 /// terminal state, that state is returned without modification.
-fn finish_oauth_flow(
-    flow_id: &str,
-    result: Result<OAuthCompletion, String>,
-) -> Result<(), String> {
+fn finish_oauth_flow(flow_id: &str, result: Result<OAuthCompletion, String>) -> Result<(), String> {
     let mut flows = OAUTH_FLOWS.write();
     if let Some(flow) = flows.get_mut(flow_id) {
         match &flow.flow_state {
