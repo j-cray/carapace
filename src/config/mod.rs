@@ -4,6 +4,7 @@
 //! and caching.
 
 pub mod defaults;
+pub mod routes;
 pub mod schema;
 pub mod secrets;
 pub mod watcher;
