@@ -69,6 +69,7 @@ pub async fn execute_payload(
         CronPayload::AgentTurn {
             message,
             model,
+            route,
             thinking,
             timeout_seconds,
             allow_unsafe_external_content,
@@ -77,12 +78,19 @@ pub async fn execute_payload(
             to,
             best_effort_deliver,
         } => {
+            // Reject if both route and model are set — requests must be unambiguous.
+            if route.is_some() && model.is_some() {
+                return Err(CronExecuteError::Other(
+                    "cannot set both `route` and `model` in the same cron task".to_string(),
+                ));
+            }
             execute_agent_turn(
                 job_id,
                 state,
                 AgentTurnParams {
                     message,
                     model,
+                    route,
                     thinking,
                     timeout_seconds: *timeout_seconds,
                     allow_unsafe_external_content: *allow_unsafe_external_content,
@@ -101,6 +109,7 @@ pub async fn execute_payload(
 struct AgentTurnParams<'a> {
     message: &'a str,
     model: &'a Option<String>,
+    route: &'a Option<String>,
     thinking: &'a Option<String>,
     timeout_seconds: Option<u32>,
     allow_unsafe_external_content: Option<bool>,
@@ -163,6 +172,7 @@ async fn execute_agent_turn(
 
     let config = build_agent_config(
         params.model,
+        params.route,
         params.allow_unsafe_external_content,
         params.deliver,
         params.execution_limits.max_turns,
@@ -313,19 +323,20 @@ async fn append_user_message(
 
 fn build_agent_config(
     model: &Option<String>,
+    route: &Option<String>,
     allow_unsafe_external_content: Option<bool>,
     deliver: Option<bool>,
     max_turns_limit: Option<u32>,
 ) -> crate::agent::AgentConfig {
     let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let mut config = crate::agent::AgentConfig::default();
-    // Resolve model through route resolver; cron-level model override is
-    // passed as request_model so it takes highest precedence.
+    // Resolve model through route resolver; cron-level model/route override is
+    // passed as request_model/request_route so it takes highest precedence.
     if let Err(e) = crate::agent::resolve_agent_model(
         &mut config,
         &cfg,
         None,
-        None,
+        route.as_deref(),
         model.as_deref(),
     ) {
         tracing::warn!(error = %e, "cron agent config: model resolution failed");
@@ -527,6 +538,7 @@ mod tests {
         let payload = CronPayload::AgentTurn {
             message: "do something".to_string(),
             model: None,
+            route: None,
             thinking: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
@@ -548,6 +560,7 @@ mod tests {
         let payload = CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: Some("model-x".to_string()),
+            route: None,
             thinking: Some("deep".to_string()),
             timeout_seconds: Some(10),
             allow_unsafe_external_content: Some(false),
@@ -590,6 +603,7 @@ mod tests {
         let payload = CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: Some("new-model".to_string()),
+            route: None,
             thinking: Some("deep".to_string()),
             timeout_seconds: Some(10),
             allow_unsafe_external_content: Some(false),
@@ -637,6 +651,7 @@ mod tests {
         let payload = CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
+            route: None,
             thinking: None,
             timeout_seconds: Some(45),
             allow_unsafe_external_content: None,

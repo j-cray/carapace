@@ -78,6 +78,8 @@ pub struct HookMapping {
     pub to: Option<String>,
     /// Model override (supports templates)
     pub model: Option<String>,
+    /// Route override (supports templates)
+    pub route: Option<String>,
     /// Thinking level (supports templates)
     pub thinking: Option<String>,
     /// Timeout in seconds
@@ -103,6 +105,7 @@ impl HookMapping {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             timeout_seconds: None,
             transform: None,
@@ -152,6 +155,7 @@ pub enum HookMappingResult {
         channel: String,
         to: Option<String>,
         model: Option<String>,
+        route: Option<String>,
         thinking: Option<String>,
         deliver: bool,
         wake_mode: String,
@@ -219,6 +223,7 @@ impl HookRegistry {
                 channel: None,
                 to: None,
                 model: None,
+                route: None,
                 thinking: None,
                 timeout_seconds: None,
                 transform: None,
@@ -333,6 +338,7 @@ impl HookRegistry {
                         .unwrap_or_else(|| "last".to_string()),
                     to: mapping.to.clone(),
                     model: mapping.model.clone(),
+                    route: mapping.route.clone(),
                     thinking: mapping.thinking.clone(),
                     deliver: mapping.deliver.unwrap_or(true),
                     wake_mode: mapping

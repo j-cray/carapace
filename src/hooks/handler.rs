@@ -71,6 +71,7 @@ pub struct AgentRequest {
     pub channel: Option<String>,
     pub to: Option<String>,
     pub model: Option<String>,
+    pub route: Option<String>,
     pub thinking: Option<String>,
     pub deliver: Option<bool>,
     pub wake_mode: Option<String>,
@@ -148,6 +149,7 @@ pub struct ValidatedAgentRequest {
     pub channel: String,
     pub to: Option<String>,
     pub model: Option<String>,
+    pub route: Option<String>,
     pub thinking: Option<String>,
     pub deliver: bool,
     pub wake_mode: WakeMode,
@@ -200,6 +202,22 @@ pub fn validate_agent_request(
         None
     };
 
+    // Validate route if provided (must be non-empty after trim)
+    let route = if let Some(r) = &req.route {
+        let trimmed = r.trim();
+        if trimmed.is_empty() {
+            return Err("route required".to_string());
+        }
+        Some(trimmed.to_string())
+    } else {
+        None
+    };
+
+    // Reject if both route and model are set — requests must be unambiguous
+    if route.is_some() && model.is_some() {
+        return Err("cannot set both `route` and `model` in the same request".to_string());
+    }
+
     // Resolve channel alias and validate
     let channel = resolve_channel_alias(req.channel.as_deref().unwrap_or("last"));
     if !valid_channels.is_empty()
@@ -232,6 +250,7 @@ pub fn validate_agent_request(
         channel,
         to: req.to.clone(),
         model,
+        route,
         thinking: req.thinking.clone(),
         deliver: req.deliver.unwrap_or(true),
         wake_mode: req
@@ -351,6 +370,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -376,6 +396,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -396,6 +417,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -416,6 +438,7 @@ mod tests {
             channel: None,
             to: None,
             model: Some("   ".to_string()),
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -436,6 +459,7 @@ mod tests {
             channel: Some("imsg".to_string()),
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -456,6 +480,7 @@ mod tests {
             channel: Some("sms".to_string()),
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -479,6 +504,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -499,6 +525,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -519,6 +546,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -539,6 +567,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: Some(false),
             wake_mode: None,
@@ -559,6 +588,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -582,6 +612,7 @@ mod tests {
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,

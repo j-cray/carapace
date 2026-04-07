@@ -859,6 +859,7 @@ mod tests {
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
+            route: None,
             thinking: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
@@ -887,6 +888,7 @@ mod tests {
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
+            route: None,
             thinking: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
@@ -972,6 +974,7 @@ mod tests {
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
+            route: None,
             thinking: None,
             timeout_seconds: Some(30),
             allow_unsafe_external_content: None,
@@ -1031,6 +1034,7 @@ mod tests {
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
+            route: None,
             thinking: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
@@ -1060,6 +1064,7 @@ mod tests {
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
+            route: None,
             thinking: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
