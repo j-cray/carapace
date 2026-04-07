@@ -23,6 +23,7 @@ pub(crate) static GEMINI_SPEC: OAuthOnboardingSpec = OAuthOnboardingSpec {
     provider_label: "gemini",
     client_id_env: "GOOGLE_OAUTH_CLIENT_ID",
     client_secret_env: "GOOGLE_OAUTH_CLIENT_SECRET",
+    cli_loopback_error_extra: " or Gemini API key mode",
     max_pending_flows: 20,
     flow_ttl_secs: 30 * 60,
     resolve_provider_config: resolve_google_oauth_provider_config,

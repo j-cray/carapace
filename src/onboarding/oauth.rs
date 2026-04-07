@@ -50,6 +50,11 @@ pub(crate) struct OAuthOnboardingSpec {
     pub client_id_env: &'static str,
     pub client_secret_env: &'static str,
 
+    /// Extra hint appended to the CLI loopback-redirect error, e.g.
+    /// " or Gemini API key mode" for Gemini. Empty string for providers
+    /// without an alternative auth path.
+    pub cli_loopback_error_extra: &'static str,
+
     /// Maximum number of concurrent pending flows per provider.
     pub max_pending_flows: usize,
     /// Time-to-live for a pending flow, in seconds.
@@ -568,8 +573,8 @@ async fn run_cli_oauth_with_timeout(
     let host = parsed_redirect.host_str().unwrap_or_default();
     if host != "127.0.0.1" && host != "localhost" {
         return Err(format!(
-            "CLI {} sign-in requires a loopback redirect URI; use Control UI sign-in.",
-            spec.idp_display_name,
+            "CLI {} sign-in requires a loopback redirect URI; use Control UI sign-in{}.",
+            spec.idp_display_name, spec.cli_loopback_error_extra,
         ));
     }
 

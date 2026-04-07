@@ -23,6 +23,7 @@ pub(crate) static CODEX_SPEC: OAuthOnboardingSpec = OAuthOnboardingSpec {
     provider_label: "codex",
     client_id_env: "OPENAI_OAUTH_CLIENT_ID",
     client_secret_env: "OPENAI_OAUTH_CLIENT_SECRET",
+    cli_loopback_error_extra: "",
     max_pending_flows: 20,
     flow_ttl_secs: 30 * 60,
     resolve_provider_config: resolve_openai_oauth_provider_config,
