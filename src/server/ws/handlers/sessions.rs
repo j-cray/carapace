@@ -2005,9 +2005,7 @@ pub(super) fn handle_agent(
     })?;
     // Validate model before creating the session/run to avoid orphan registrations.
     let model_param = params.and_then(|v| v.get("model")).and_then(|v| v.as_str());
-    let route_param = params
-        .and_then(|v| v.get("route"))
-        .and_then(|v| v.as_str());
+    let route_param = params.and_then(|v| v.get("route")).and_then(|v| v.as_str());
     if route_param.is_some() && model_param.is_some() {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
@@ -2021,13 +2019,9 @@ pub(super) fn handle_agent(
         .and_then(|v| v.as_str());
     // Resolve model through route resolver; request-level model/route param
     // takes highest precedence.
-    if let Err(e) = crate::agent::resolve_agent_model(
-        &mut config,
-        &cfg,
-        agent_id,
-        route_param,
-        model_param,
-    ) {
+    if let Err(e) =
+        crate::agent::resolve_agent_model(&mut config, &cfg, agent_id, route_param, model_param)
+    {
         return Err(error_shape(ERROR_UNAVAILABLE, &e.to_string(), None));
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);

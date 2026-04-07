@@ -308,15 +308,9 @@ mod tests {
         });
         let routes = load_routes(&cfg);
         assert_eq!(routes.len(), 2);
-        assert_eq!(
-            routes["fast"].model,
-            "anthropic:claude-sonnet-4-20250514"
-        );
+        assert_eq!(routes["fast"].model, "anthropic:claude-sonnet-4-20250514");
         assert_eq!(routes["fast"].label.as_deref(), Some("Fast"));
-        assert_eq!(
-            routes["smart"].model,
-            "anthropic:claude-opus-4-20250514"
-        );
+        assert_eq!(routes["smart"].model, "anthropic:claude-opus-4-20250514");
         assert!(routes["smart"].label.is_none());
     }
 

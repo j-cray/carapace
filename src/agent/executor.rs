@@ -71,16 +71,11 @@ fn apply_agent_hook_overrides(config: &mut AgentConfig, payload: &Value) {
     let hook_route = obj.get("route").and_then(|v| v.as_str());
 
     if hook_route.is_some() && hook_model.is_some() {
-        tracing::warn!(
-            "before_agent_start hook returned both `route` and `model`; ignoring both"
-        );
+        tracing::warn!("before_agent_start hook returned both `route` and `model`; ignoring both");
     } else if let Some(route) = hook_route {
         // Resolve model from route via config
-        let cfg =
-            crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
-        if let Err(e) = crate::agent::resolve_agent_model(
-            config, &cfg, None, Some(route), None,
-        ) {
+        let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+        if let Err(e) = crate::agent::resolve_agent_model(config, &cfg, None, Some(route), None) {
             tracing::warn!(
                 error = %e,
                 route = %route,

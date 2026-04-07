@@ -136,7 +136,9 @@ pub async fn dispatch_inbound_text_with_options(
 
     let run_spawned = if let Some(provider) = state.llm_provider() {
         let mut config = crate::agent::AgentConfig::default();
-        if let Err(e) = crate::agent::resolve_agent_model(&mut config, cfg.as_ref(), None, None, None) {
+        if let Err(e) =
+            crate::agent::resolve_agent_model(&mut config, cfg.as_ref(), None, None, None)
+        {
             warn!(error = %e, "inbound agent run skipped: model resolution failed");
             return Ok(InboundDispatchResult {
                 run_id,

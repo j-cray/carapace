@@ -2056,11 +2056,7 @@ fn validate_routes_map(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
         // model field — required, non-empty, valid provider prefix
         match entry_obj.get("model").and_then(|v| v.as_str()) {
             Some(model) if !model.trim().is_empty() => {
-                check_model_has_provider_prefix(
-                    model,
-                    &format!("{path_prefix}.model"),
-                    issues,
-                );
+                check_model_has_provider_prefix(model, &format!("{path_prefix}.model"), issues);
             }
             Some(_) => {
                 issues.push(SchemaIssue {
@@ -2083,10 +2079,7 @@ fn validate_routes_map(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
 /// Check that `agents.defaults.route` and `agents.list[].route` reference
 /// keys that exist in the `routes` map. If `routes` is absent but a route
 /// reference is present, that is an error.
-fn validate_route_references(
-    obj: &serde_json::Map<String, Value>,
-    issues: &mut Vec<SchemaIssue>,
-) {
+fn validate_route_references(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
     let routes_map = obj.get("routes").and_then(|v| v.as_object());
 
     let agents = match obj.get("agents").and_then(|v| v.as_object()) {
@@ -3575,7 +3568,10 @@ mod tests {
         assert!(
             !issues.iter().any(|i| i.path.starts_with(".routes")),
             "expected no route issues, got: {:?}",
-            issues.iter().filter(|i| i.path.starts_with(".routes")).collect::<Vec<_>>()
+            issues
+                .iter()
+                .filter(|i| i.path.starts_with(".routes"))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3602,9 +3598,9 @@ mod tests {
             }
         });
         let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| {
-            i.severity == Severity::Error && i.path == ".routes.my route"
-        }));
+        assert!(issues
+            .iter()
+            .any(|i| { i.severity == Severity::Error && i.path == ".routes.my route" }));
     }
 
     #[test]
@@ -3615,9 +3611,9 @@ mod tests {
             }
         });
         let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| {
-            i.severity == Severity::Error && i.path == ".routes.1fast"
-        }));
+        assert!(issues
+            .iter()
+            .any(|i| { i.severity == Severity::Error && i.path == ".routes.1fast" }));
     }
 
     #[test]
@@ -3796,7 +3792,10 @@ mod tests {
         assert!(
             !issues.iter().any(|i| i.path.contains("route")),
             "expected no route-related issues, got: {:?}",
-            issues.iter().filter(|i| i.path.contains("route")).collect::<Vec<_>>()
+            issues
+                .iter()
+                .filter(|i| i.path.contains("route"))
+                .collect::<Vec<_>>()
         );
     }
 }
