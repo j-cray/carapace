@@ -1188,43 +1188,60 @@ struct LoadedProfileSummary {
     token_still_encrypted: bool,
 }
 
+/// Result of resolving a config value and its env-var references.
+enum ConfigValueResolution {
+    /// Value not configured at the given path.
+    Missing,
+    /// Value references env vars that are not set.
+    UnresolvedEnvVars { env_vars: String },
+    /// Value is configured and fully resolved.
+    Resolved {
+        detail: String,
+        effective_value: String,
+    },
+}
+
+/// Resolve a config value at `path`, checking env-var references.
+fn resolve_config_value(cfg: &Value, path: &[&str], label: &str) -> ConfigValueResolution {
+    let Some(value) = config_string(cfg, path) else {
+        return ConfigValueResolution::Missing;
+    };
+    let references = env_var_references(&value);
+    let missing = missing_env_var_references(&references);
+    if !missing.is_empty() {
+        return ConfigValueResolution::UnresolvedEnvVars {
+            env_vars: format_env_var_list(&missing),
+        };
+    }
+    // Env vars are already confirmed present — substitute directly instead of
+    // calling effective_config_value (which would re-parse references).
+    let (detail, effective) = if !references.is_empty() {
+        let resolved = crate::config::substitute_env_in_string(&value)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(value);
+        (
+            format!("{label} resolves from {}", format_env_var_list(&references)),
+            resolved,
+        )
+    } else {
+        (format!("{label} is written in config"), value)
+    };
+    ConfigValueResolution::Resolved {
+        detail,
+        effective_value: effective,
+    }
+}
+
 fn configured_value_check(
     cfg: &Value,
     path: &[&str],
     label: &str,
     setup_command: Option<&str>,
 ) -> SetupCheck {
-    match config_string(cfg, path) {
-        Some(value) => {
-            let references = env_var_references(&value);
-            let missing = missing_env_var_references(&references);
-            if !missing.is_empty() {
-                let env_vars = format_env_var_list(&missing);
-                let remediation = match setup_command {
-                    Some(command) => format!(
-                        "set {env_vars} in the same shell or rerun `{command}` to rewrite the value"
-                    ),
-                    None => format!(
-                        "set {env_vars} in the same shell or write {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
-                    ),
-                };
-                SetupCheck::fail(
-                    label,
-                    format!("{label} references {env_vars}, but they are not set"),
-                    remediation,
-                    None,
-                )
-            } else if !references.is_empty() {
-                SetupCheck::pass(
-                    label,
-                    format!("{label} resolves from {}", format_env_var_list(&references)),
-                    None,
-                )
-            } else {
-                SetupCheck::pass(label, format!("{label} is written in config"), None)
-            }
-        }
-        None => SetupCheck::fail(
+    match resolve_config_value(cfg, path, label) {
+        ConfigValueResolution::Missing => SetupCheck::fail(
             label,
             format!("{label} is not configured"),
             setup_follow_up(provider_setup_follow_up(
@@ -1234,33 +1251,38 @@ fn configured_value_check(
             )),
             None,
         ),
+        ConfigValueResolution::UnresolvedEnvVars { env_vars } => {
+            let remediation = match setup_command {
+                Some(command) => format!(
+                    "set {env_vars} in the same shell or rerun `{command}` to rewrite the value"
+                ),
+                None => format!(
+                    "set {env_vars} in the same shell or write {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
+                ),
+            };
+            SetupCheck::fail(
+                label,
+                format!("{label} references {env_vars}, but they are not set"),
+                remediation,
+                None,
+            )
+        }
+        ConfigValueResolution::Resolved { detail, .. } => SetupCheck::pass(label, detail, None),
     }
 }
 
 fn optional_configured_value_check(cfg: &Value, path: &[&str], label: &str) -> SetupCheck {
-    match config_string(cfg, path) {
-        Some(value) => {
-            let references = env_var_references(&value);
-            let missing = missing_env_var_references(&references);
-            if !missing.is_empty() {
-                let env_vars = format_env_var_list(&missing);
-                SetupCheck::fail(
-                    label,
-                    format!("{label} references {env_vars}, but they are not set"),
-                    format!("set {env_vars} before starting Carapace"),
-                    None,
-                )
-            } else if !references.is_empty() {
-                SetupCheck::pass(
-                    label,
-                    format!("{label} resolves from {}", format_env_var_list(&references)),
-                    None,
-                )
-            } else {
-                SetupCheck::pass(label, format!("{label} is written in config"), None)
-            }
+    match resolve_config_value(cfg, path, label) {
+        ConfigValueResolution::Missing => {
+            SetupCheck::skip(label, format!("{label} is not configured"), None, None)
         }
-        None => SetupCheck::skip(label, format!("{label} is not configured"), None, None),
+        ConfigValueResolution::UnresolvedEnvVars { env_vars } => SetupCheck::fail(
+            label,
+            format!("{label} references {env_vars}, but they are not set"),
+            format!("set {env_vars} before starting Carapace"),
+            None,
+        ),
+        ConfigValueResolution::Resolved { detail, .. } => SetupCheck::pass(label, detail, None),
     }
 }
 
@@ -1274,42 +1296,41 @@ fn base_url_validation_check<F>(
 where
     F: FnOnce(&str) -> Result<(), String>,
 {
-    let Some(value) = config_string(cfg, path) else {
-        return SetupCheck::skip(label, "no custom base URL configured", None, None);
-    };
-    let references = env_var_references(&value);
-    let missing = missing_env_var_references(&references);
-    if !missing.is_empty() {
-        let env_vars = format_env_var_list(&missing);
-        let remediation = match setup_command {
-            Some(command) => format!(
-                "set {env_vars} in the same shell or rerun `{command}` to rewrite the base URL"
+    match resolve_config_value(cfg, path, label) {
+        ConfigValueResolution::Missing => {
+            SetupCheck::skip(label, "no custom base URL configured", None, None)
+        }
+        ConfigValueResolution::UnresolvedEnvVars { env_vars } => {
+            let remediation = match setup_command {
+                Some(command) => format!(
+                    "set {env_vars} in the same shell or rerun `{command}` to rewrite the base URL"
+                ),
+                None => format!(
+                    "set {env_vars} in the same shell or write a valid {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
+                ),
+            };
+            SetupCheck::fail(
+                label,
+                format!("{label} references {env_vars}, but they are not set"),
+                remediation,
+                None,
+            )
+        }
+        ConfigValueResolution::Resolved {
+            effective_value, ..
+        } => match validator(&effective_value) {
+            Ok(()) => SetupCheck::pass(label, format!("{label} passed local validation"), None),
+            Err(err) => SetupCheck::validation_fail(
+                label,
+                format!("{label} failed local validation: {err}"),
+                setup_follow_up(provider_setup_follow_up(
+                    setup_command,
+                    "and correct the base URL",
+                    format!("write a valid {label} into config"),
+                )),
+                Some(SetupCheckCode::LocalValidationFailed),
             ),
-            None => format!(
-                "set {env_vars} in the same shell or write a valid {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
-            ),
-        };
-        return SetupCheck::fail(
-            label,
-            format!("{label} references {env_vars}, but they are not set"),
-            remediation,
-            None,
-        );
-    }
-
-    let effective = effective_config_value(&value).unwrap_or_else(|| value.clone());
-    match validator(&effective) {
-        Ok(()) => SetupCheck::pass(label, format!("{label} passed local validation"), None),
-        Err(err) => SetupCheck::validation_fail(
-            label,
-            format!("{label} failed local validation: {err}"),
-            setup_follow_up(provider_setup_follow_up(
-                setup_command,
-                "and correct the base URL",
-                format!("write a valid {label} into config"),
-            )),
-            Some(SetupCheckCode::LocalValidationFailed),
-        ),
+        },
     }
 }
 
@@ -1358,23 +1379,6 @@ fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-fn effective_config_value(value: &str) -> Option<String> {
-    let references = env_var_references(value);
-    if references.is_empty() {
-        let trimmed = value.trim();
-        return (!trimmed.is_empty()).then(|| trimmed.to_string());
-    }
-
-    if missing_env_var_references(&references).is_empty() {
-        crate::config::substitute_env_in_string(value)
-            .ok()
-            .map(|resolved| resolved.trim().to_string())
-            .filter(|resolved| !resolved.is_empty())
-    } else {
-        None
-    }
 }
 
 fn env_var_references(value: &str) -> Vec<String> {
