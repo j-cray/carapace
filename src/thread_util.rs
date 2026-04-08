@@ -17,9 +17,9 @@ pub(crate) fn spawn_named_thread(
 #[derive(Debug, Error)]
 #[error("failed to spawn startup thread '{thread_name}': {source}")]
 pub struct StartupThreadSpawnError {
-    pub(crate) thread_name: &'static str,
+    thread_name: &'static str,
     #[source]
-    pub(crate) source: io::Error,
+    source: io::Error,
 }
 
 impl StartupThreadSpawnError {
@@ -28,6 +28,10 @@ impl StartupThreadSpawnError {
             thread_name,
             source,
         }
+    }
+
+    pub fn thread_name(&self) -> &'static str {
+        self.thread_name
     }
 }
 

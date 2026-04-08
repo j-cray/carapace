@@ -10,7 +10,7 @@ fn test_try_new_reports_activity_service_startup_error() {
         WsServerConfig::default(),
         || {
             Err(channels::activity::ActivityStartupError::ThreadSpawn {
-                source: crate::thread_util::StartupThreadSpawnError::new(
+                source: crate::StartupThreadSpawnError::new(
                     "activity-test-thread",
                     std::io::Error::other("simulated activity thread exhaustion"),
                 ),
@@ -37,7 +37,7 @@ fn test_try_new_persistent_unloaded_reports_activity_service_startup_error() {
         temp.path().to_path_buf(),
         |_state_dir| {
             Err(channels::activity::ActivityStartupError::ThreadSpawn {
-                source: crate::thread_util::StartupThreadSpawnError::new(
+                source: crate::StartupThreadSpawnError::new(
                     "activity-persistent-test-thread",
                     std::io::Error::other("simulated persistent activity thread exhaustion"),
                 ),
@@ -62,7 +62,7 @@ fn test_try_new_preserves_activity_startup_error_chain() {
         WsServerConfig::default(),
         || {
             Err(channels::activity::ActivityStartupError::ThreadSpawn {
-                source: crate::thread_util::StartupThreadSpawnError::new(
+                source: crate::StartupThreadSpawnError::new(
                     "activity-chain-test-thread",
                     std::io::Error::from_raw_os_error(11),
                 ),
@@ -81,7 +81,7 @@ fn test_try_new_preserves_activity_startup_error_chain() {
         .source()
         .expect("activity startup error should expose startup thread spawn source");
     let spawn_error = spawn_source
-        .downcast_ref::<crate::thread_util::StartupThreadSpawnError>()
+        .downcast_ref::<crate::StartupThreadSpawnError>()
         .expect("startup thread spawn error should remain in the source chain");
     let io_source = spawn_error
         .source()
@@ -90,7 +90,7 @@ fn test_try_new_preserves_activity_startup_error_chain() {
         .downcast_ref::<std::io::Error>()
         .expect("original io::Error should remain at the end of the source chain");
 
-    assert_eq!(spawn_error.thread_name, "activity-chain-test-thread");
+    assert_eq!(spawn_error.thread_name(), "activity-chain-test-thread");
     assert_eq!(io_error.raw_os_error(), Some(11));
 }
 
@@ -113,7 +113,7 @@ fn test_try_new_persistent_unloaded_builds_registries_before_activity_service() 
         move |_state_dir| {
             activity_factory_called_for_closure.store(true, Ordering::SeqCst);
             Err(channels::activity::ActivityStartupError::ThreadSpawn {
-                source: crate::thread_util::StartupThreadSpawnError::new(
+                source: crate::StartupThreadSpawnError::new(
                     "activity-ordering-test-thread",
                     std::io::Error::other(
                         "activity service factory should not run before registry setup",

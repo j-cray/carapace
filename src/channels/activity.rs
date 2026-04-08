@@ -48,9 +48,8 @@ use crate::plugins::{
 use crate::runtime_bridge::run_sync_blocking_send;
 use crate::server::ws::WsServerState;
 use crate::tasks::{TaskBlockedReason, TaskExecutionOutcome, TaskExecutor, TaskQueue};
-use crate::thread_util::{
-    spawn_startup_named_thread_with_spawner, NamedThreadSpawner, StartupThreadSpawnError,
-};
+use crate::thread_util::{spawn_startup_named_thread_with_spawner, NamedThreadSpawner};
+use crate::StartupThreadSpawnError;
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
@@ -2009,6 +2008,7 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2850,7 +2850,13 @@ mod tests {
         };
 
         let ActivityStartupError::ThreadSpawn { source: err } = err;
-        assert_eq!(err.source.kind(), io::ErrorKind::Other);
+        let io_source = err
+            .source()
+            .expect("thread spawn error should preserve the original io::Error source");
+        let io_error = io_source
+            .downcast_ref::<io::Error>()
+            .expect("thread spawn error source should remain an io::Error");
+        assert_eq!(io_error.kind(), io::ErrorKind::Other);
         assert!(err.to_string().contains("failed to spawn startup thread"));
     }
 
@@ -2859,8 +2865,15 @@ mod tests {
         let err =
             StartupThreadSpawnError::new(STOP_TYPING_THREAD_NAME, io::Error::from_raw_os_error(11));
 
-        assert_eq!(err.thread_name, STOP_TYPING_THREAD_NAME);
-        assert_eq!(err.source.raw_os_error(), Some(11));
+        let io_source = err
+            .source()
+            .expect("thread spawn error should preserve the original io::Error source");
+        let io_error = io_source
+            .downcast_ref::<io::Error>()
+            .expect("thread spawn error source should remain an io::Error");
+
+        assert_eq!(err.thread_name(), STOP_TYPING_THREAD_NAME);
+        assert_eq!(io_error.raw_os_error(), Some(11));
     }
 
     #[test]

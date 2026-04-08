@@ -32,7 +32,7 @@ use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
-use crate::thread_util::{spawn_startup_named_thread, StartupThreadSpawnError};
+use crate::thread_util::spawn_startup_named_thread;
 #[cfg(test)]
 use crate::thread_util::{spawn_startup_named_thread_with_spawner, NamedThreadSpawner};
 
@@ -49,6 +49,7 @@ use super::permissions::{
     compute_effective_permissions, validate_declared_permissions, PermissionConfig,
     PermissionEnforcer,
 };
+use crate::StartupThreadSpawnError;
 
 /// Maximum memory per plugin instance (64MB)
 pub const MAX_PLUGIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -86,17 +87,24 @@ struct EpochTicker {
 }
 
 impl EpochTicker {
+    fn routine(
+        engine: Engine,
+        interval: Duration,
+        stop: Arc<AtomicBool>,
+    ) -> crate::thread_util::NamedThreadRoutine {
+        Box::new(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(interval);
+                engine.increment_epoch();
+            }
+        })
+    }
+
     fn start(engine: Engine, interval: Duration) -> Result<Self, StartupThreadSpawnError> {
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
         let handle = spawn_startup_named_thread(
             EPOCH_TICKER_THREAD_NAME,
-            Box::new(move || {
-                while !stop_clone.load(Ordering::SeqCst) {
-                    std::thread::sleep(interval);
-                    engine.increment_epoch();
-                }
-            }),
+            Self::routine(engine, interval, Arc::clone(&stop)),
         )?;
 
         Ok(Self {
@@ -121,15 +129,9 @@ impl EpochTicker {
         spawner: NamedThreadSpawner,
     ) -> Result<Self, StartupThreadSpawnError> {
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
         let handle = spawn_startup_named_thread_with_spawner(
             EPOCH_TICKER_THREAD_NAME,
-            Box::new(move || {
-                while !stop_clone.load(Ordering::SeqCst) {
-                    std::thread::sleep(interval);
-                    engine.increment_epoch();
-                }
-            }),
+            Self::routine(engine, interval, Arc::clone(&stop)),
             spawner,
         )?;
 
@@ -1877,8 +1879,15 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.source.kind(), io::ErrorKind::Other);
-        assert_eq!(err.thread_name, EPOCH_TICKER_THREAD_NAME);
+        let io_source = err
+            .source()
+            .expect("thread spawn error should preserve the original io::Error source");
+        let io_error = io_source
+            .downcast_ref::<io::Error>()
+            .expect("thread spawn error source should remain an io::Error");
+
+        assert_eq!(io_error.kind(), io::ErrorKind::Other);
+        assert_eq!(err.thread_name(), EPOCH_TICKER_THREAD_NAME);
         assert!(err
             .to_string()
             .contains("simulated epoch ticker thread exhaustion"));
@@ -1927,7 +1936,7 @@ mod tests {
         assert!(matches!(
             err,
             RuntimeError::ThreadSpawn { ref source }
-                if source.thread_name == EPOCH_TICKER_THREAD_NAME
+                if source.thread_name() == EPOCH_TICKER_THREAD_NAME
         ));
     }
 
@@ -1978,7 +1987,7 @@ mod tests {
             .downcast_ref::<io::Error>()
             .expect("original io::Error should remain at the end of the source chain");
 
-        assert_eq!(spawn_error.thread_name, EPOCH_TICKER_THREAD_NAME);
+        assert_eq!(spawn_error.thread_name(), EPOCH_TICKER_THREAD_NAME);
         assert_eq!(io_error.raw_os_error(), Some(11));
     }
 
