@@ -35,13 +35,6 @@ impl StartupThreadSpawnError {
     }
 }
 
-pub(crate) fn spawn_startup_named_thread(
-    thread_name: &'static str,
-    routine: NamedThreadRoutine,
-) -> Result<thread::JoinHandle<()>, StartupThreadSpawnError> {
-    spawn_startup_named_thread_with_spawner(thread_name, routine, spawn_named_thread)
-}
-
 pub(crate) fn spawn_startup_named_thread_with_spawner(
     thread_name: &'static str,
     routine: NamedThreadRoutine,

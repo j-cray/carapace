@@ -520,12 +520,6 @@ impl WsServerState {
         })
     }
 
-    fn map_activity_service_startup_error(
-        err: channels::activity::ActivityStartupError,
-    ) -> WsConfigError {
-        WsConfigError::ActivityStartup(err)
-    }
-
     fn build_in_memory_with_activity_service_factory<F>(
         config: WsServerConfig,
         activity_service_factory: F,
@@ -577,9 +571,7 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
-            activity_service: Arc::new(
-                activity_service_factory().map_err(Self::map_activity_service_startup_error)?,
-            ),
+            activity_service: Arc::new(activity_service_factory()?),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -622,8 +614,7 @@ impl WsServerState {
             config.max_ws_per_ip.unwrap_or(limits::DEFAULT_MAX_PER_IP),
         );
         let activity_state_dir = state_dir.clone();
-        let activity_service = activity_service_factory(activity_state_dir)
-            .map_err(Self::map_activity_service_startup_error)?;
+        let activity_service = activity_service_factory(activity_state_dir)?;
         Ok(Self {
             config,
             start_time: Instant::now(),
@@ -1195,7 +1186,7 @@ pub enum WsConfigError {
     #[error(transparent)]
     Devices(#[from] devices::DevicePairingError),
     #[error("failed to initialize activity service: {0}")]
-    ActivityStartup(#[source] channels::activity::ActivityStartupError),
+    ActivityStartup(#[from] channels::activity::ActivityStartupError),
     #[error("{0}")]
     Runtime(String),
 }

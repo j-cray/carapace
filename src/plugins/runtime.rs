@@ -32,9 +32,9 @@ use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
-use crate::thread_util::spawn_startup_named_thread;
-#[cfg(test)]
-use crate::thread_util::{spawn_startup_named_thread_with_spawner, NamedThreadSpawner};
+use crate::thread_util::{
+    spawn_named_thread, spawn_startup_named_thread_with_spawner, NamedThreadSpawner,
+};
 
 use super::bindings::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
@@ -101,28 +101,9 @@ impl EpochTicker {
     }
 
     fn start(engine: Engine, interval: Duration) -> Result<Self, StartupThreadSpawnError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let handle = spawn_startup_named_thread(
-            EPOCH_TICKER_THREAD_NAME,
-            Self::routine(engine, interval, Arc::clone(&stop)),
-        )?;
-
-        Ok(Self {
-            stop,
-            handle: Some(handle),
-        })
+        Self::start_with_spawner(engine, interval, spawn_named_thread)
     }
 
-    #[cfg(test)]
-    fn start_with_spawner_for_test(
-        engine: Engine,
-        interval: Duration,
-        spawner: NamedThreadSpawner,
-    ) -> Result<Self, StartupThreadSpawnError> {
-        Self::start_with_spawner(engine, interval, spawner)
-    }
-
-    #[cfg(test)]
     fn start_with_spawner(
         engine: Engine,
         interval: Duration,
@@ -1870,7 +1851,7 @@ mod tests {
         }
 
         let engine = Engine::default();
-        let err = match EpochTicker::start_with_spawner_for_test(
+        let err = match EpochTicker::start_with_spawner(
             engine,
             DEFAULT_EPOCH_TICK_INTERVAL,
             fail_spawner,
