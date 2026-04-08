@@ -1,5 +1,6 @@
 ---
 source: src/server/ws/golden_tests.rs
+assertion_line: 838
 expression: normalized
 ---
 {
@@ -53,7 +54,8 @@ expression: normalized
       "slack",
       "classifier",
       "vertex",
-      "filesystem"
+      "filesystem",
+      "routes"
     ],
     "properties": {
       "agents": {
@@ -150,6 +152,9 @@ expression: normalized
         "type": "object"
       },
       "providers": {
+        "type": "object"
+      },
+      "routes": {
         "type": "object"
       },
       "session": {

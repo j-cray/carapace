@@ -1206,6 +1206,7 @@ fn parse_agent_request(
             channel: None,
             to: None,
             model: None,
+            route: None,
             thinking: None,
             deliver: None,
             wake_mode: None,
@@ -1289,10 +1290,22 @@ async fn dispatch_agent_run(
 
     // Validate model before registering the run to avoid orphan entries.
     let mut config = crate::agent::AgentConfig::default();
-    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
-    if let Some(m) = validated.model.clone() {
-        config.model = m;
+    // Resolve model through route resolver; request-level model/route param
+    // takes highest precedence.
+    if let Err(e) = crate::agent::resolve_agent_model(
+        &mut config,
+        &cfg,
+        None,
+        validated.route.as_deref(),
+        validated.model.as_deref(),
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(AgentResponse::error(&e.to_string())),
+        )
+            .into_response());
     }
+    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
     if config.model.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1630,6 +1643,7 @@ async fn hook_result_to_response(
             channel,
             to,
             model,
+            route,
             thinking,
             deliver,
             wake_mode,
@@ -1645,6 +1659,7 @@ async fn hook_result_to_response(
                 channel: Some(channel),
                 to,
                 model,
+                route,
                 thinking,
                 deliver: Some(deliver),
                 wake_mode: Some(wake_mode),

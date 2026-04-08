@@ -90,6 +90,8 @@ pub enum CronPayload {
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
         #[serde(rename = "timeoutSeconds", skip_serializing_if = "Option::is_none")]
         timeout_seconds: Option<u32>,

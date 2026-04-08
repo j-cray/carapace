@@ -76,6 +76,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "classifier",
     "vertex",
     "filesystem",
+    "routes",
 ];
 
 /// Built-in channel IDs that currently accept `channels.<id>.features.*`.
@@ -136,6 +137,9 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_usage(obj, &mut issues);
     validate_vertex(obj, &mut issues);
     validate_filesystem(obj, &mut issues);
+    validate_routes_map(obj, &mut issues);
+    validate_route_references(obj, &mut issues);
+    validate_route_model_both_set(obj, &mut issues);
 
     // Run agent config lint if prompt guard config lint is enabled
     if let Some(agents) = obj.get("agents") {
@@ -1224,7 +1228,7 @@ fn validate_cron(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
             }
         }
 
-        // Validate payload is an object
+        // Validate payload is an object, then check route/model fields
         if let Some(payload) = entry_obj.get("payload") {
             if !payload.is_object() {
                 issues.push(SchemaIssue {
@@ -1232,6 +1236,64 @@ fn validate_cron(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                     path: format!(".cron.entries[{}].payload", i),
                     message: "payload must be an object".to_string(),
                 });
+            } else if let Some(payload_obj) = payload.as_object() {
+                let has_route = payload_obj.get("route").and_then(|v| v.as_str());
+                let has_model = payload_obj.get("model").and_then(|v| v.as_str());
+
+                // Validate route references a defined route
+                if let Some(route_str) = has_route {
+                    let route_str = route_str.trim();
+                    if !route_str.is_empty() {
+                        let routes_map = obj.get("routes").and_then(|v| v.as_object());
+                        match routes_map {
+                            None => {
+                                issues.push(SchemaIssue {
+                                    severity: Severity::Error,
+                                    path: format!(".cron.entries[{}].payload.route", i),
+                                    message: format!(
+                                        "references route \"{route_str}\" but no `routes` map is defined; \
+                                         add a top-level `routes` section"
+                                    ),
+                                });
+                            }
+                            Some(map) if !map.contains_key(route_str) => {
+                                let available: Vec<&String> = map.keys().collect();
+                                issues.push(SchemaIssue {
+                                    severity: Severity::Error,
+                                    path: format!(".cron.entries[{}].payload.route", i),
+                                    message: format!(
+                                        "references unknown route \"{route_str}\"; \
+                                         defined routes are: {available:?}"
+                                    ),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Warn if both route and model are set
+                if has_route.is_some() && has_model.is_some() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!(".cron.entries[{}].payload", i),
+                        message: "both `route` and `model` are set; \
+                                  the cron executor will reject this at runtime"
+                            .to_string(),
+                    });
+                }
+
+                // Validate model has a provider prefix
+                if let Some(model) = has_model {
+                    let model = model.trim();
+                    if !model.is_empty() {
+                        check_model_has_provider_prefix(
+                            model,
+                            &format!(".cron.entries[{}].payload.model", i),
+                            issues,
+                        );
+                    }
+                }
             }
         }
     }
@@ -2003,6 +2065,192 @@ fn check_non_negative_number(value: &Value, path: &str, issues: &mut Vec<SchemaI
                 path: path.to_string(),
                 message: "value must be a number".to_string(),
             });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route validation
+// ---------------------------------------------------------------------------
+
+/// Validate the `routes` map: each key must be a valid route ID and each
+/// value must contain a non-empty `model` field with a recognised provider prefix.
+fn validate_routes_map(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let routes = match obj.get("routes").and_then(|v| v.as_object()) {
+        Some(r) => r,
+        None => return,
+    };
+
+    static ROUTE_ID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let id_re = ROUTE_ID_RE
+        .get_or_init(|| regex::Regex::new(r"^[a-z][a-z0-9-]*$").expect("route id regex"));
+
+    for (key, entry) in routes {
+        let path_prefix = format!(".routes.{key}");
+
+        // Key must match ^[a-z][a-z0-9-]*$
+        if !id_re.is_match(key) {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: path_prefix.clone(),
+                message: format!(
+                    "route id \"{key}\" is invalid; \
+                     must start with a lowercase letter and contain only \
+                     lowercase letters, digits, and hyphens"
+                ),
+            });
+        }
+
+        let Some(entry_obj) = entry.as_object() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: path_prefix,
+                message: format!(
+                    "route entry must be an object, got {}",
+                    json_type_label(entry)
+                ),
+            });
+            continue;
+        };
+
+        // model field — required, non-empty, valid provider prefix
+        match entry_obj.get("model").and_then(|v| v.as_str()) {
+            Some(model) if !model.trim().is_empty() => {
+                check_model_has_provider_prefix(model, &format!("{path_prefix}.model"), issues);
+            }
+            Some(_) => {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!("{path_prefix}.model"),
+                    message: "route model must not be empty".to_string(),
+                });
+            }
+            None => {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!("{path_prefix}.model"),
+                    message: "route entry is missing required `model` field".to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Check that `agents.defaults.route` and `agents.list[].route` reference
+/// keys that exist in the `routes` map. If `routes` is absent but a route
+/// reference is present, that is an error.
+fn validate_route_references(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let routes_map = obj.get("routes").and_then(|v| v.as_object());
+
+    let agents = match obj.get("agents").and_then(|v| v.as_object()) {
+        Some(a) => a,
+        None => return,
+    };
+
+    // Helper: validate a single route reference string.
+    let check_ref = |route_str: &str, path: &str, issues: &mut Vec<SchemaIssue>| {
+        let route_str = route_str.trim();
+        if route_str.is_empty() {
+            return;
+        }
+        match routes_map {
+            None => {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: path.to_string(),
+                    message: format!(
+                        "references route \"{route_str}\" but no `routes` map is defined; \
+                         add a top-level `routes` section"
+                    ),
+                });
+            }
+            Some(map) if !map.contains_key(route_str) => {
+                let available: Vec<&String> = map.keys().collect();
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: path.to_string(),
+                    message: format!(
+                        "references unknown route \"{route_str}\"; \
+                         defined routes are: {available:?}"
+                    ),
+                });
+            }
+            _ => {}
+        }
+    };
+
+    // agents.defaults.route
+    if let Some(defaults) = agents.get("defaults").and_then(|v| v.as_object()) {
+        if let Some(route_val) = defaults.get("route") {
+            match route_val.as_str() {
+                Some(s) => check_ref(s, ".agents.defaults.route", issues),
+                None => {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: ".agents.defaults.route".to_string(),
+                        message: "route must be a string".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // agents.list[].route
+    if let Some(list) = agents.get("list").and_then(|v| v.as_array()) {
+        for (i, entry) in list.iter().enumerate() {
+            if let Some(route_val) = entry.get("route") {
+                let path = format!(".agents.list[{i}].route");
+                match route_val.as_str() {
+                    Some(s) => check_ref(s, &path, issues),
+                    None => {
+                        issues.push(SchemaIssue {
+                            severity: Severity::Error,
+                            path,
+                            message: "route must be a string".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Warn when both `route` and `model` are set on the same scope level,
+/// since `route` silently takes precedence.
+fn validate_route_model_both_set(
+    obj: &serde_json::Map<String, Value>,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    let agents = match obj.get("agents").and_then(|v| v.as_object()) {
+        Some(a) => a,
+        None => return,
+    };
+
+    // agents.defaults
+    if let Some(defaults) = agents.get("defaults").and_then(|v| v.as_object()) {
+        if defaults.contains_key("route") && defaults.contains_key("model") {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".agents.defaults".to_string(),
+                message: "both `route` and `model` are set; `route` takes precedence \
+                          and `model` will be ignored"
+                    .to_string(),
+            });
+        }
+    }
+
+    // agents.list[]
+    if let Some(list) = agents.get("list").and_then(|v| v.as_array()) {
+        for (i, entry) in list.iter().enumerate() {
+            if entry.get("route").is_some() && entry.get("model").is_some() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!(".agents.list[{i}]"),
+                    message: "both `route` and `model` are set; `route` takes precedence \
+                              and `model` will be ignored"
+                        .to_string(),
+                });
+            }
         }
     }
 }
@@ -3364,5 +3612,250 @@ mod tests {
         assert!(!is_plausible_cron("not a cron"));
         assert!(!is_plausible_cron("* * *")); // too few fields
         assert!(!is_plausible_cron(""));
+    }
+
+    // --- routes validation ---
+
+    #[test]
+    fn test_routes_valid_map_passes() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" },
+                "my-route-2": { "model": "openai:gpt-4o", "label": "GPT" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path.starts_with(".routes")),
+            "expected no route issues, got: {:?}",
+            issues
+                .iter()
+                .filter(|i| i.path.starts_with(".routes"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_routes_invalid_id_uppercase() {
+        let cfg = json!({
+            "routes": {
+                "Fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".routes.Fast"
+                && i.message.contains("invalid")
+        }));
+    }
+
+    #[test]
+    fn test_routes_invalid_id_spaces() {
+        let cfg = json!({
+            "routes": {
+                "my route": { "model": "anthropic:claude-sonnet-4-20250514" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| { i.severity == Severity::Error && i.path == ".routes.my route" }));
+    }
+
+    #[test]
+    fn test_routes_invalid_id_starts_with_number() {
+        let cfg = json!({
+            "routes": {
+                "1fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| { i.severity == Severity::Error && i.path == ".routes.1fast" }));
+    }
+
+    #[test]
+    fn test_routes_missing_model_field() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "label": "no model here" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".routes.fast.model"
+                && i.message.contains("missing")
+        }));
+    }
+
+    #[test]
+    fn test_routes_empty_model() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "  " }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".routes.fast.model"
+                && i.message.contains("must not be empty")
+        }));
+    }
+
+    #[test]
+    fn test_routes_invalid_model_prefix() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "badprovider:some-model" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".routes.fast.model"
+                && i.message.contains("unrecognized provider prefix")
+        }));
+    }
+
+    #[test]
+    fn test_route_ref_defaults_unknown() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+            },
+            "agents": {
+                "defaults": { "route": "nonexistent" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".agents.defaults.route"
+                && i.message.contains("unknown route")
+        }));
+    }
+
+    #[test]
+    fn test_route_ref_defaults_valid() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+            },
+            "agents": {
+                "defaults": { "route": "fast" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path == ".agents.defaults.route"),
+            "expected no route reference issue, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_route_ref_agent_list_unknown() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+            },
+            "agents": {
+                "defaults": {},
+                "list": [
+                    { "id": "helper", "route": "doesnt-exist" }
+                ]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".agents.list[0].route"
+                && i.message.contains("unknown route")
+        }));
+    }
+
+    #[test]
+    fn test_route_ref_no_routes_map_is_error() {
+        let cfg = json!({
+            "agents": {
+                "defaults": { "route": "fast" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".agents.defaults.route"
+                && i.message.contains("no `routes` map is defined")
+        }));
+    }
+
+    #[test]
+    fn test_route_and_model_both_set_defaults_warns() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+            },
+            "agents": {
+                "defaults": {
+                    "route": "fast",
+                    "model": "openai:gpt-4o"
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.path == ".agents.defaults"
+                && i.message.contains("route")
+                && i.message.contains("takes precedence")
+        }));
+    }
+
+    #[test]
+    fn test_route_and_model_both_set_agent_list_warns() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+            },
+            "agents": {
+                "defaults": {},
+                "list": [
+                    {
+                        "id": "helper",
+                        "route": "fast",
+                        "model": "openai:gpt-4o"
+                    }
+                ]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.path == ".agents.list[0]"
+                && i.message.contains("route")
+                && i.message.contains("takes precedence")
+        }));
+    }
+
+    #[test]
+    fn test_no_routes_no_refs_no_issues() {
+        let cfg = json!({
+            "agents": {
+                "defaults": { "model": "anthropic:claude-sonnet-4-20250514" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path.contains("route")),
+            "expected no route-related issues, got: {:?}",
+            issues
+                .iter()
+                .filter(|i| i.path.contains("route"))
+                .collect::<Vec<_>>()
+        );
     }
 }

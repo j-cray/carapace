@@ -152,7 +152,8 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `identity.name`: String. Human-visible display name for the agent.
     - `identity.description`: String. Short summary shown in UIs or listings.
     - `identity.avatar`: String. Workspace-relative path or `http(s)` / `data:` URI used as the agent avatar.
-    - `model`: String. The exact LLM name used by this agent, determining both the underlying model and the provider.
+    - `route`: String. Name of a route defined in the top-level `routes` map. When set, the route's `model` string is used instead of the agent's `model` field. `route` is checked before `model` — if both are present, `route` wins.
+    - `model`: String. The exact LLM name used by this agent, determining both the underlying model and the provider. Ignored when `route` is set.
       - **Provider Routing:** Every model requires a canonical `provider:model` colon prefix: `anthropic:model`, `openai:model`, `gemini:model`, `vertex:model`, `bedrock:model`, `ollama:model`, `codex:model`, `venice:model`, `claude-cli:model`. Bare model names without a prefix are rejected. Note: `gemini:model` falls back to Vertex AI if the Gemini provider is not configured.
     - `system`: String. The system prompt or core identity instructions for this agent.
     - `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. (Default: `25`)
@@ -163,6 +164,12 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `exfiltrationGuard`: Boolean. If `true`, blocks tools known to be capable of sending data externally. (Default: `false`)
     - `promptGuard` / `outputSanitizer` / `sandbox` / `classifier`: These agent-specific blocks override the global `agents.*` for this entity.
 
+- **`agents.defaults.route`**
+  - *What it does:* Default route name applied to agents that don't specify their own `route` or `model`. References a key in the top-level `routes` map.
+  - *Possible values:* String. Must match a key in `routes`.
+- **`agents.defaults.model`**
+  - *What it does:* Default model string applied to agents that don't specify their own `route` or `model`. Ignored when `agents.defaults.route` is set.
+  - *Possible values:* String. Must use the `provider:model` colon prefix.
 - **`agents.defaults.maxConcurrent`**
   - *What it does:* Maximum number of simultaneous main AI tasks that run.
   - *Possible values:* Positive integer. (Default: `4`)
@@ -224,6 +231,30 @@ This block shapes how smart your AI behaves and what limits apply during executi
   - *Possible values:*
     - `sanitizeHtml`: `true` or `false`
     - `cspPolicy`: String representing a Content Security Policy
+
+---
+
+## 2a. Named Routes (Optional)
+
+Routes decouple backend selection from agent identity. Instead of embedding `provider:model` strings in every agent, define named routes once and reference them by name.
+
+- **`routes`**
+  - *What it does:* A top-level map of named execution targets. Each key is a route name; the value is an object with a required `model` string and an optional `label`.
+  - *Example:*
+    ```json5
+    routes: {
+      fast: { model: "gemini:gemini-2.0-flash", label: "Fast lookups" },
+      deep: { model: "anthropic:claude-sonnet-4-20250514" },
+      local: { model: "ollama:llama3" },
+    }
+    ```
+  - *Fields per route:*
+    - `model`: String (required). The `provider:model` string this route resolves to.
+    - `label`: String (optional). Human-readable description shown in UIs and diagnostics.
+
+**Precedence:** When resolving which model to use for a request, Carapace checks scopes in order: request, session, agent, defaults. Within each scope, `route` is checked before `model`. A route name that doesn't exist in the map is a hard error — it does not fall back to a sibling `model` field or lower precedence levels.
+
+**Legacy compatibility:** If no `routes` map is defined and agents use `model` directly, everything works as before. Routes are purely additive.
 
 ---
 

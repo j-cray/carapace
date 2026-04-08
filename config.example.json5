@@ -233,12 +233,24 @@
   //   // enabled: false,                          // set to false to disable without removing config
   // },
 
+  // --- Named routes (optional) -------------------------------------------
+  // Routes decouple backend selection from agent identity. Agents reference
+  // routes by name instead of embedding model strings directly.
+  //
+  // routes: {
+  //   fast: { model: "gemini:gemini-2.0-flash", label: "Fast lookups" },
+  //   deep: { model: "anthropic:claude-sonnet-4-20250514" },
+  //   local: { model: "ollama:llama3" },
+  // },
+
   // --- Agents -----------------------------------------------------------
   // agents: {
+  //   defaults: { route: "fast" },
   //   list: [
   //     {
   //       id: "default",
   //       default: true,
+  //       route: "deep",
   //       identity: {
   //         name: "Carapace",
   //         description: "A helpful assistant",

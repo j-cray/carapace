@@ -904,8 +904,27 @@ fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<
     setup_follow_up(follow_up)
 }
 
+/// Resolve the effective default model string from config.
+///
+/// Checks `agents.defaults.route` first — if present, resolves it through
+/// the `routes` map to get the concrete model string.  Falls back to
+/// `agents.defaults.model` only when no route is set at all.
+///
+/// Fail-closed: if a route is set but not found in the routes map, returns
+/// `None` rather than falling back to `agents.defaults.model`. This matches
+/// the runtime resolver's fail-closed semantics — a dangling route reference
+/// must surface as an error, not silently degrade to a different model.
+fn effective_default_model(cfg: &Value) -> Option<String> {
+    if let Some(route_name) = config_string(cfg, &["agents", "defaults", "route"]) {
+        let routes = crate::config::routes::load_routes(cfg);
+        // Route set but missing from map → None (fail-closed).
+        return routes.get(&route_name).map(|rc| rc.model.clone());
+    }
+    config_string(cfg, &["agents", "defaults", "model"])
+}
+
 fn vertex_route_requires_default_model(cfg: &Value) -> bool {
-    config_string(cfg, &["agents", "defaults", "model"]).is_some_and(|m| m == "vertex:default")
+    effective_default_model(cfg).is_some_and(|m| m == "vertex:default")
 }
 
 fn vertex_default_model_check(cfg: &Value, setup_command: Option<&str>) -> SetupCheck {
@@ -960,10 +979,10 @@ fn model_route_check(
     provider: SetupProvider,
     setup_command: Option<&str>,
 ) -> SetupCheck {
-    let Some(model) = config_string(cfg, &["agents", "defaults", "model"]) else {
+    let Some(model) = effective_default_model(cfg) else {
         return SetupCheck::fail(
             "Default model route",
-            "`agents.defaults.model` is not configured".to_string(),
+            "neither `agents.defaults.route` nor `agents.defaults.model` is configured".to_string(),
             default_model_route_follow_up(provider, setup_command),
             None,
         );
@@ -971,13 +990,13 @@ fn model_route_check(
     match model_provider_for_local_chat(&model) {
         Some(actual_provider) if actual_provider == provider => SetupCheck::pass(
             "Default model route",
-            format!("`agents.defaults.model` routes to {}", provider.label()),
+            format!("default model routes to {}", provider.label()),
             None,
         ),
         Some(actual_provider) => SetupCheck::fail(
             "Default model route",
             format!(
-                "`agents.defaults.model` currently routes to {}, not {}",
+                "default model currently routes to {}, not {}",
                 actual_provider.label(),
                 provider.label()
             ),
@@ -986,7 +1005,7 @@ fn model_route_check(
         ),
         None => SetupCheck::fail(
             "Default model route",
-            format!("`agents.defaults.model` uses an unrecognized provider route: `{model}`"),
+            format!("default model uses an unrecognized provider route: `{model}`"),
             default_model_route_follow_up(provider, setup_command),
             None,
         ),

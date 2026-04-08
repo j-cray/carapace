@@ -519,6 +519,10 @@ fn parse_payload(value: Option<&Value>) -> Result<CronPayload, ErrorShape> {
                     .get("model")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
+                route: value
+                    .get("route")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 thinking: value
                     .get("thinking")
                     .and_then(|v| v.as_str())
