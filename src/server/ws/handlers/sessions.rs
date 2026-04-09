@@ -553,9 +553,13 @@ fn enrich_session_list(
                 return true;
             }
 
-            let session = entry
-                .session()
-                .expect("available session entries must carry a session");
+            let Some(session) = entry.session() else {
+                tracing::warn!(
+                    session_id = entry.session_id(),
+                    "skipping inconsistent available session entry during filter"
+                );
+                return false;
+            };
             if !filters.include_global && session.session_key == "global" {
                 return false;
             }
@@ -598,14 +602,18 @@ fn enrich_session_list(
             }
             true
         })
-        .map(|entry| {
+        .filter_map(|entry| {
             if entry.is_locked() {
-                return locked_session_row(entry);
+                return Some(locked_session_row(entry));
             }
 
-            let session = entry
-                .session()
-                .expect("available session entries must carry a session");
+            let Some(session) = entry.session() else {
+                tracing::warn!(
+                    session_id = entry.session_id(),
+                    "skipping inconsistent available session entry during projection"
+                );
+                return None;
+            };
             let mut row = session_row(session);
             if filters.include_last_message {
                 if let Ok(messages) = state.session_store.get_history(&session.id, Some(1), None) {
@@ -632,7 +640,7 @@ fn enrich_session_list(
                     }
                 }
             }
-            row
+            Some(row)
         })
         .collect::<Vec<_>>()
 }

@@ -722,7 +722,7 @@ fn session_list_tool() -> BuiltinTool {
                 Ok(sessions) => {
                     let session_list: Vec<Value> = sessions
                         .iter()
-                        .map(|entry| match (entry.access(), entry.session()) {
+                        .filter_map(|entry| match (entry.access(), entry.session()) {
                             (crate::sessions::SessionAccessState::Available, Some(s)) => json!({
                                 "id": s.id,
                                 "session_key": s.session_key,
@@ -732,7 +732,8 @@ fn session_list_tool() -> BuiltinTool {
                                 "updated_at": s.updated_at,
                                 "name": s.metadata.name,
                                 "access": "available",
-                            }),
+                            })
+                            .into(),
                             (crate::sessions::SessionAccessState::Locked, _) => json!({
                                 "id": entry.session_id(),
                                 "session_key": Value::Null,
@@ -743,8 +744,15 @@ fn session_list_tool() -> BuiltinTool {
                                 "name": Value::Null,
                                 "access": "locked",
                                 "encrypted": true,
-                            }),
-                            _ => unreachable!("session access/session payload mismatch"),
+                            })
+                            .into(),
+                            _ => {
+                                tracing::warn!(
+                                    session_id = entry.session_id(),
+                                    "skipping inconsistent session list entry"
+                                );
+                                None
+                            }
                         })
                         .collect();
                     ToolInvokeResult::success(json!({ "sessions": session_list }))

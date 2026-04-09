@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::file_lock::FileLock;
 
@@ -640,7 +641,7 @@ pub struct SessionStore {
     /// Compaction threshold
     compact_threshold: usize,
     /// Optional HMAC key for session integrity verification.
-    hmac_key: Option<[u8; 32]>,
+    hmac_key: Option<Zeroizing<[u8; 32]>>,
     /// Action to take when integrity verification fails.
     integrity_action: super::integrity::IntegrityAction,
     /// Session encryption mode.
@@ -688,7 +689,7 @@ impl SessionStore {
     }
 
     /// Set the HMAC key for session integrity verification.
-    pub fn with_hmac_key(mut self, key: [u8; 32]) -> Self {
+    pub fn with_hmac_key(mut self, key: Zeroizing<[u8; 32]>) -> Self {
         self.hmac_key = Some(key);
         self
     }
@@ -834,16 +835,12 @@ impl SessionStore {
             .map(|dur| dur.as_millis() as i64)
     }
 
-    fn note_locked_session_present(&self) {
-        self.locked_session_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn reset_locked_session_count(&self) {
-        self.locked_session_count.store(0, Ordering::Relaxed);
+    fn note_locked_session_count(&self, count: usize) {
+        self.locked_session_count.store(count, Ordering::Release);
     }
 
     fn locked_session_count(&self) -> usize {
-        self.locked_session_count.load(Ordering::Relaxed)
+        self.locked_session_count.load(Ordering::Acquire)
     }
 
     fn should_block_unknown_session_key_without_crypto(&self) -> bool {
@@ -1593,14 +1590,21 @@ impl SessionStore {
             if line.trim().is_empty() {
                 continue;
             }
+            let line_bytes = line.as_bytes();
+            let encrypted_line = super::crypto::looks_like_encrypted_payload(line_bytes);
 
-            let msg = match self.decode_history_message(session_id, line.as_bytes()) {
+            let msg = match self.decode_history_message(session_id, line_bytes) {
                 Ok(m) => m,
                 Err(SessionStoreError::Locked(message)) => {
                     return Err(SessionStoreError::Locked(message));
                 }
                 Err(SessionStoreError::DecryptionFailed(message)) => {
                     return Err(SessionStoreError::DecryptionFailed(message));
+                }
+                Err(err) if encrypted_line => {
+                    return Err(SessionStoreError::Crypto(format!(
+                        "invalid encrypted session history line: {err}"
+                    )));
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -2115,6 +2119,14 @@ impl SessionStore {
 
     /// Load a session from disk
     fn load_session(&self, session_id: &str) -> Result<Session, SessionStoreError> {
+        self.load_session_with_locked_tracking(session_id, true)
+    }
+
+    fn load_session_with_locked_tracking(
+        &self,
+        session_id: &str,
+        update_locked_scan_state: bool,
+    ) -> Result<Session, SessionStoreError> {
         self.ensure_required_encryption_available()?;
         let meta_path = self.session_meta_path(session_id)?;
 
@@ -2150,7 +2162,9 @@ impl SessionStore {
         let session = match self.decode_session_metadata(session_id, &content) {
             Ok(session) => session,
             Err(SessionStoreError::Locked(message)) => {
-                self.note_locked_session_present();
+                if update_locked_scan_state {
+                    self.note_locked_session_count(1);
+                }
                 return Err(SessionStoreError::Locked(message));
             }
             Err(err) => return Err(err),
@@ -2180,8 +2194,8 @@ impl SessionStore {
             return Ok(());
         }
 
-        self.reset_locked_session_count();
         let entries = fs::read_dir(&self.base_path)?;
+        let mut locked_session_count = 0usize;
 
         for entry in entries {
             let entry = entry?;
@@ -2197,9 +2211,11 @@ impl SessionStore {
                         }
                     }
 
-                    match self.load_session(stem) {
+                    match self.load_session_with_locked_tracking(stem, false) {
                         Ok(_) => {}
-                        Err(SessionStoreError::Locked(_)) => {}
+                        Err(SessionStoreError::Locked(_)) => {
+                            locked_session_count += 1;
+                        }
                         Err(err) => {
                             tracing::warn!(
                                 session_id = stem,
@@ -2212,6 +2228,7 @@ impl SessionStore {
             }
         }
 
+        self.note_locked_session_count(locked_session_count);
         Ok(())
     }
 
@@ -2388,6 +2405,15 @@ mod tests {
             Some(password),
             EncryptionMode::IfPassword,
         );
+        (store, temp_dir)
+    }
+
+    fn create_encrypted_store_without_hmac(password: &[u8]) -> (SessionStore, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let crypto = SessionCryptoContext::load_or_create(temp_dir.path(), password).unwrap();
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_encryption_mode(EncryptionMode::IfPassword)
+            .with_crypto_context(Arc::new(crypto));
         (store, temp_dir)
     }
 
@@ -3007,7 +3033,7 @@ mod tests {
     #[test]
     fn test_history_hmac_is_written_and_verified() {
         let temp_dir = TempDir::new().unwrap();
-        let key = integrity::derive_hmac_key(b"history-secret");
+        let key = Zeroizing::new(integrity::derive_hmac_key(b"history-secret"));
         let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
             .with_hmac_key(key)
             .with_integrity_action(integrity::IntegrityAction::Reject);
@@ -3048,6 +3074,38 @@ mod tests {
 
         let history = store.get_history(&session.id, None, None).unwrap();
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_get_history_fails_closed_on_invalid_encrypted_line() {
+        let key_material = test_key_material();
+        let (store, _temp) = create_encrypted_store_without_hmac(&key_material);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        fs::write(
+            &history_path,
+            b"{\"format\":\"session-enc-v1\",\"n\":\"%%%\",\"c\":\"bad\"}\n",
+        )
+        .unwrap();
+
+        let err = store.get_history(&session.id, None, None).unwrap_err();
+        match err {
+            SessionStoreError::Crypto(message) => {
+                assert!(
+                    message.contains("invalid encrypted session history line"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected encrypted history corruption to fail closed, got {other:?}"),
+        }
     }
 
     #[test]

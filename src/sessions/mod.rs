@@ -6,6 +6,7 @@
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 pub mod crypto;
 pub mod file_lock;
@@ -135,7 +136,7 @@ pub fn configured_store_with_path(
         if let Some((server_secret, _source)) =
             resolve_session_integrity_secret_from_value(cfg, fallback_integrity_secret)
         {
-            let hmac_key = integrity::derive_hmac_key(server_secret.as_bytes());
+            let hmac_key = Zeroizing::new(integrity::derive_hmac_key(server_secret.as_bytes()));
             store = store.with_hmac_key(hmac_key);
         }
     }

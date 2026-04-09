@@ -27,6 +27,7 @@ const CRYPTO_MANIFEST_PATH: &str = ".crypto-manifest";
 const CRYPTO_MANIFEST_VERSION: u32 = 1;
 const CRYPTO_KDF_ID: &str = "argon2id-v2";
 const SESSION_ENCRYPTED_FORMAT_V1: &str = "session-enc-v1";
+const SESSION_ENCRYPTED_PREFIX_V1: &[u8] = br#"{"format":"session-enc-v1""#;
 const SESSION_ENCRYPTION_ROOT_TAG: &[u8] = b"carapace:session-encryption-root:v1";
 const SESSION_ENCRYPTION_INFO_PREFIX: &[u8] = b"carapace:session-encryption-key:v1:";
 const SESSION_INTEGRITY_INFO: &[u8] = b"carapace:session-integrity-hmac:v2";
@@ -114,6 +115,17 @@ fn manifest_path(base_path: &Path) -> PathBuf {
     base_path.join(CRYPTO_MANIFEST_PATH)
 }
 
+fn trim_ascii_start(mut data: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = data.split_first() {
+        if first.is_ascii_whitespace() {
+            data = rest;
+        } else {
+            break;
+        }
+    }
+    data
+}
+
 fn create_private_file(path: &Path) -> Result<File, SessionCryptoError> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -134,7 +146,10 @@ fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), S
         file.write_all(&serialized)?;
         file.sync_all()?;
     }
-    fs::rename(&temp_path, path)?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -256,10 +271,10 @@ impl SessionCryptoContext {
     }
 
     /// Derive the session-store-wide HMAC key rooted in the encryption master key.
-    pub fn integrity_hmac_key(&self) -> [u8; 32] {
+    pub fn integrity_hmac_key(&self) -> Zeroizing<[u8; 32]> {
         let mut out = [0u8; 32];
         out.copy_from_slice(self.integrity_hmac_key.as_ref());
-        out
+        Zeroizing::new(out)
     }
 
     pub fn encrypt_bytes(
@@ -351,7 +366,14 @@ impl SessionCryptoContext {
     }
 }
 
+pub fn looks_like_encrypted_payload(data: &[u8]) -> bool {
+    trim_ascii_start(data).starts_with(SESSION_ENCRYPTED_PREFIX_V1)
+}
+
 pub fn encrypted_payload(data: &[u8]) -> bool {
+    if !looks_like_encrypted_payload(data) {
+        return false;
+    }
     serde_json::from_slice::<EncryptedEnvelope>(data)
         .map(|env| env.format == SESSION_ENCRYPTED_FORMAT_V1)
         .unwrap_or(false)
