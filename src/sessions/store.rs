@@ -3472,15 +3472,11 @@ mod tests {
         .unwrap();
 
         let err = store.get_history(&session.id, None, None).unwrap_err();
-        match err {
-            SessionStoreError::Crypto(message) => {
-                assert!(
-                    message.contains("invalid encrypted session history line"),
-                    "unexpected error message: {message}"
-                );
-            }
-            other => panic!("expected encrypted history corruption to fail closed, got {other:?}"),
-        }
+        assert!(matches!(
+            err,
+            SessionStoreError::Crypto(ref message)
+                if message.contains("invalid encrypted session history line")
+        ));
     }
 
     #[test]
