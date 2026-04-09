@@ -7,16 +7,132 @@
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
+pub mod crypto;
 pub mod file_lock;
 pub mod integrity;
 pub mod retention;
 pub mod scoping;
 mod store;
 
+pub use crypto::{EncryptionConfig, EncryptionMode};
 pub use store::{
     ArchiveResult, ArchivedSession, ChatMessage, CompactionMetadata, MessageRole, RestoreResult,
-    Session, SessionFilter, SessionMetadata, SessionStatus, SessionStore, SessionStoreError,
+    Session, SessionAccessState, SessionFilter, SessionListEntry, SessionMetadata, SessionStatus,
+    SessionStore, SessionStoreError,
 };
+
+pub(crate) fn resolve_session_integrity_config(
+    cfg: &serde_json::Value,
+) -> integrity::IntegrityConfig {
+    let Some(integrity_cfg) = cfg.get("sessions").and_then(|s| s.get("integrity")) else {
+        return integrity::IntegrityConfig::default();
+    };
+
+    match serde_json::from_value::<integrity::IntegrityConfig>(integrity_cfg.clone()) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "invalid sessions.integrity config; using secure defaults"
+            );
+            integrity::IntegrityConfig::default()
+        }
+    }
+}
+
+pub(crate) fn resolve_session_encryption_config(
+    cfg: &serde_json::Value,
+) -> crypto::EncryptionConfig {
+    let Some(encryption_cfg) = cfg.get("sessions").and_then(|s| s.get("encryption")) else {
+        return crypto::EncryptionConfig::default();
+    };
+
+    match serde_json::from_value::<crypto::EncryptionConfig>(encryption_cfg.clone()) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "invalid sessions.encryption config; using secure defaults"
+            );
+            crypto::EncryptionConfig::default()
+        }
+    }
+}
+
+pub(crate) fn resolve_session_integrity_secret_from_value(
+    cfg: &serde_json::Value,
+) -> Option<(String, &'static str)> {
+    if let Some(secret) = std::env::var("CARAPACE_SERVER_SECRET")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Some((secret, "CARAPACE_SERVER_SECRET"));
+    }
+    if let Some(secret) = cfg
+        .pointer("/gateway/auth/token")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some((secret.to_string(), "gateway.auth.token"));
+    }
+    if let Some(secret) = cfg
+        .pointer("/gateway/auth/password")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some((secret.to_string(), "gateway.auth.password"));
+    }
+    None
+}
+
+/// Build a session store from the current config shape and environment.
+pub fn configured_store_with_path(
+    base_path: std::path::PathBuf,
+    cfg: &serde_json::Value,
+) -> Result<SessionStore, SessionStoreError> {
+    let integrity_config = resolve_session_integrity_config(cfg);
+    let encryption_config = resolve_session_encryption_config(cfg);
+
+    let mut store = SessionStore::with_base_path(base_path)
+        .with_integrity_action(integrity_config.action)
+        .with_encryption_mode(encryption_config.mode);
+
+    let password = crate::config::config_password();
+    if let Some(password) = password
+        .as_ref()
+        .filter(|_| encryption_config.mode.uses_encryption())
+    {
+        let crypto =
+            crypto::SessionCryptoContext::load_or_create(store.base_path(), password.as_ref())
+                .map_err(SessionStoreError::from)?;
+        let hmac_key = crypto.integrity_hmac_key();
+        store = store
+            .with_crypto_context(Arc::new(crypto))
+            .with_hmac_key(hmac_key);
+        return Ok(store);
+    }
+
+    if integrity_config.enabled {
+        if let Some((server_secret, _source)) = resolve_session_integrity_secret_from_value(cfg) {
+            let hmac_key = integrity::derive_hmac_key(server_secret.as_bytes());
+            store = store.with_hmac_key(hmac_key);
+        }
+    }
+
+    Ok(store)
+}
+
+/// Build a session store from the on-disk config and current environment.
+pub fn configured_store_with_path_from_current_config(
+    base_path: std::path::PathBuf,
+) -> Result<SessionStore, SessionStoreError> {
+    let cfg = crate::config::load_config().map_err(|err| {
+        SessionStoreError::Io(format!("failed to load config for sessions: {err}"))
+    })?;
+    configured_store_with_path(base_path, &cfg)
+}
 
 /// Canonicalize an explicit session hint to a deterministic opaque session ID.
 pub fn canonicalize_session_hint(session_hint: &str) -> String {

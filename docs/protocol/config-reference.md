@@ -394,13 +394,18 @@ Enable Carapace to listen and respond on external chat platforms.
 ## 6. Security, Sessions, and Operations
 
 - **`sessions`**
-  - *What it does:* Governs how long the system remembers long-running chat history and whether it gets automatically purged.
+  - *What it does:* Governs how long the system remembers long-running chat history, whether it gets automatically purged, and whether session artifacts are encrypted at rest.
   - *Common values:*
     - `retention.enabled`: `true` or `false`. (Default: `true`)
     - `retention.days`: Integer. (Default: `30`)
     - `retention.intervalHours`: Integer. (Default: `6`)
     - `integrity.enabled`: `true` or `false`. (Default: `true`)
     - `integrity.action`: `"warn"` (Default) or `"reject"`.
+    - `encryption.mode`: `"off"`, `"if_password"` (Default), or `"required"`.
+  - *Behavior notes:*
+    - When `encryption.mode` is `if_password`, Carapace encrypts session metadata, history, and archives when `CARAPACE_CONFIG_PASSWORD` is available, and still reads older plaintext sessions.
+    - When `encryption.mode` is `required`, session operations fail closed until `CARAPACE_CONFIG_PASSWORD` is set.
+    - Without the password in `if_password` mode, plaintext sessions remain readable but encrypted sessions surface as locked until the password is provided.
 - **`session`**
   - *What it does:* Governs active chat/session scoping behavior and provides a legacy/global fallback for channel typing.
   - *Common values:*

@@ -192,7 +192,7 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ├── devices/
 │   └── paired.json        # Device tokens (hashed)
 ├── agents/<id>/
-│   ├── sessions/*.jsonl   # Session transcripts
+│   ├── sessions/*.jsonl   # Session transcripts (encrypted at rest when sessions.encryption.mode permits it and CARAPACE_CONFIG_PASSWORD is set)
 │   └── auth-profiles.json # API keys, OAuth tokens
 ├── tasks/
 │   └── queue.json         # Durable task payload/state (plaintext operational data)
