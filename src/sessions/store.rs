@@ -1507,7 +1507,11 @@ impl SessionStore {
                         error_kind = session_store_error_kind(&e),
                         "failed to export session history during user data export"
                     );
-                    warnings.push(format!("failed to export session {}: {}", session.id, e));
+                    warnings.push(format!(
+                        "failed to export session {}: {}",
+                        session.id,
+                        session_store_error_kind(&e)
+                    ));
                 }
             }
         }
@@ -4139,6 +4143,40 @@ mod tests {
         }
 
         assert!(result["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_export_user_data_redacts_error_detail_in_warnings() {
+        let temp_dir = TempDir::new().unwrap();
+        let key = Zeroizing::new(integrity::derive_hmac_key(b"history-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let session = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user-1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        fs::write(&history_path, "tampered\n").unwrap();
+
+        let result = store.export_user_data("user-1").unwrap();
+        let warnings = result["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        let warning = warnings[0].as_str().unwrap();
+        assert!(warning.contains("failed to export session"));
+        assert!(warning.ends_with(": io"));
+        assert!(!warning.contains("Session store is locked"));
+        assert!(!warning.contains("history-secret"));
     }
 
     #[test]
