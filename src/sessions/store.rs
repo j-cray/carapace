@@ -767,7 +767,7 @@ impl SessionStore {
         session_id: &str,
         content: &[u8],
     ) -> Result<Session, SessionStoreError> {
-        if super::crypto::encrypted_payload(content) {
+        if super::crypto::looks_like_encrypted_payload(content) {
             let Some(crypto) = self.crypto.as_ref() else {
                 return Err(Self::session_locked_without_password());
             };
@@ -822,7 +822,7 @@ impl SessionStore {
         session_id: &str,
         content: &[u8],
     ) -> Result<ArchivedSession, SessionStoreError> {
-        if super::crypto::encrypted_payload(content) {
+        if super::crypto::looks_like_encrypted_payload(content) {
             let Some(crypto) = self.crypto.as_ref() else {
                 return Err(Self::session_locked_without_password());
             };
@@ -1065,7 +1065,7 @@ impl SessionStore {
             return Ok(());
         };
 
-        if super::crypto::encrypted_payload(line.trim().as_bytes()) {
+        if super::crypto::looks_like_encrypted_payload(line.trim().as_bytes()) {
             return Ok(());
         }
 
@@ -1086,7 +1086,7 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&archive_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let archive_content = fs::read(&archive_path)?;
-        if super::crypto::encrypted_payload(&archive_content) {
+        if super::crypto::looks_like_encrypted_payload(&archive_content) {
             return Ok(());
         }
 
@@ -2110,7 +2110,7 @@ impl SessionStore {
         }
 
         let archive_content = fs::read(&archive_path)?;
-        let archive_was_plaintext = !super::crypto::encrypted_payload(&archive_content);
+        let archive_was_plaintext = !super::crypto::looks_like_encrypted_payload(&archive_content);
         let archived = self.decode_archive(session_id, &archive_content)?;
 
         // Restore messages to history file
@@ -2304,7 +2304,7 @@ impl SessionStore {
         }
 
         let content = fs::read(&meta_path)?;
-        let meta_was_encrypted = super::crypto::encrypted_payload(&content);
+        let meta_was_encrypted = super::crypto::looks_like_encrypted_payload(&content);
 
         // Verify session integrity if HMAC key is configured
         self.verify_integrity_bytes_with_compat(&content, &meta_path)?;
@@ -2844,7 +2844,7 @@ mod tests {
 
         let meta_path = store.session_meta_path(&session.id).unwrap();
         let meta_raw = fs::read(&meta_path).unwrap();
-        assert!(crypto::encrypted_payload(&meta_raw));
+        assert!(crypto::is_encrypted_payload(&meta_raw));
         #[cfg(unix)]
         assert_private_mode(&meta_path);
 
@@ -2854,7 +2854,7 @@ mod tests {
             .lines()
             .find(|line| !line.trim().is_empty())
             .unwrap();
-        assert!(crypto::encrypted_payload(first_line.as_bytes()));
+        assert!(crypto::is_encrypted_payload(first_line.as_bytes()));
         #[cfg(unix)]
         assert_private_mode(&history_path);
 
@@ -2865,7 +2865,7 @@ mod tests {
         let archived = store.archive_session(&session.id, false).unwrap();
         let archive_path = PathBuf::from(&archived.archive_path);
         let archive_raw = fs::read(&archive_path).unwrap();
-        assert!(crypto::encrypted_payload(&archive_raw));
+        assert!(crypto::is_encrypted_payload(&archive_raw));
         #[cfg(unix)]
         assert_private_mode(&archive_path);
     }
@@ -2982,14 +2982,14 @@ mod tests {
         assert_eq!(history.len(), 2);
 
         let meta_raw = fs::read(encrypted_store.session_meta_path(&session.id).unwrap()).unwrap();
-        assert!(crypto::encrypted_payload(&meta_raw));
+        assert!(crypto::is_encrypted_payload(&meta_raw));
         let history_raw =
             fs::read_to_string(encrypted_store.session_history_path(&session.id).unwrap()).unwrap();
         let first_line = history_raw
             .lines()
             .find(|line| !line.trim().is_empty())
             .unwrap();
-        assert!(crypto::encrypted_payload(first_line.as_bytes()));
+        assert!(crypto::is_encrypted_payload(first_line.as_bytes()));
 
         let reopened = reopen_store_with_encryption(
             temp_dir.path(),
@@ -3016,10 +3016,12 @@ mod tests {
         let history_path = plaintext_store.session_history_path(&session.id).unwrap();
         let meta_path = plaintext_store.session_meta_path(&session.id).unwrap();
         let legacy_line = fs::read_to_string(&history_path).unwrap();
-        assert!(!crypto::encrypted_payload(
+        assert!(!crypto::is_encrypted_payload(
             legacy_line.lines().next().unwrap().as_bytes()
         ));
-        assert!(!crypto::encrypted_payload(&fs::read(&meta_path).unwrap()));
+        assert!(!crypto::is_encrypted_payload(
+            &fs::read(&meta_path).unwrap()
+        ));
 
         let encrypted_store = reopen_store_with_encryption(
             temp_dir.path(),
@@ -3034,8 +3036,8 @@ mod tests {
         assert!(history_lines
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .all(|line| crypto::encrypted_payload(line.as_bytes())));
-        assert!(crypto::encrypted_payload(&fs::read(&meta_path).unwrap()));
+            .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
+        assert!(crypto::is_encrypted_payload(&fs::read(&meta_path).unwrap()));
 
         let history = encrypted_store
             .get_history(&session.id, None, None)
@@ -3062,13 +3064,15 @@ mod tests {
         let meta_path = plaintext_store.session_meta_path(&session.id).unwrap();
         let archive_path = plaintext_store.archive_path(&session.id).unwrap();
 
-        assert!(!crypto::encrypted_payload(&fs::read(&meta_path).unwrap()));
+        assert!(!crypto::is_encrypted_payload(
+            &fs::read(&meta_path).unwrap()
+        ));
         assert!(fs::read_to_string(&history_path)
             .unwrap()
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .all(|line| !crypto::encrypted_payload(line.as_bytes())));
-        assert!(!crypto::encrypted_payload(
+            .all(|line| !crypto::is_encrypted_payload(line.as_bytes())));
+        assert!(!crypto::is_encrypted_payload(
             &fs::read(&archive_path).unwrap()
         ));
 
@@ -3083,13 +3087,15 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id(), session.id);
 
-        assert!(crypto::encrypted_payload(&fs::read(&meta_path).unwrap()));
+        assert!(crypto::is_encrypted_payload(&fs::read(&meta_path).unwrap()));
         assert!(fs::read_to_string(&history_path)
             .unwrap()
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .all(|line| crypto::encrypted_payload(line.as_bytes())));
-        assert!(crypto::encrypted_payload(&fs::read(&archive_path).unwrap()));
+            .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
+        assert!(crypto::is_encrypted_payload(
+            &fs::read(&archive_path).unwrap()
+        ));
     }
 
     #[test]
@@ -3115,7 +3121,7 @@ mod tests {
         assert!(history_raw
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .all(|line| crypto::encrypted_payload(line.as_bytes())));
+            .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
 
         let history = store.get_history(&session.id, None, None).unwrap();
         assert_eq!(history.len(), 3);
@@ -3137,7 +3143,7 @@ mod tests {
             .unwrap();
         let archive_result = plaintext_store.archive_session(&session.id, true).unwrap();
         let archive_path = PathBuf::from(&archive_result.archive_path);
-        assert!(!crypto::encrypted_payload(
+        assert!(!crypto::is_encrypted_payload(
             &fs::read(&archive_path).unwrap()
         ));
 
@@ -3151,7 +3157,7 @@ mod tests {
         assert_eq!(restored.message_count, 1);
 
         let archive_raw = fs::read(&archive_path).unwrap();
-        assert!(crypto::encrypted_payload(&archive_raw));
+        assert!(crypto::is_encrypted_payload(&archive_raw));
         #[cfg(unix)]
         assert_private_mode(&archive_path);
 
@@ -3160,7 +3166,7 @@ mod tests {
         assert!(history_raw
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .all(|line| crypto::encrypted_payload(line.as_bytes())));
+            .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
         #[cfg(unix)]
         assert_private_mode(&history_path);
     }

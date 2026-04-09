@@ -370,7 +370,7 @@ pub fn looks_like_encrypted_payload(data: &[u8]) -> bool {
         == Some(SESSION_ENCRYPTED_FORMAT_V1)
 }
 
-pub fn encrypted_payload(data: &[u8]) -> bool {
+pub fn is_encrypted_payload(data: &[u8]) -> bool {
     if !looks_like_encrypted_payload(data) {
         return false;
     }
@@ -396,7 +396,7 @@ mod tests {
         let encrypted = ctx
             .encrypt_bytes("session-1", "metadata", plaintext)
             .unwrap();
-        assert!(encrypted_payload(&encrypted));
+        assert!(is_encrypted_payload(&encrypted));
         let decrypted = ctx
             .decrypt_bytes("session-1", "metadata", &encrypted)
             .unwrap();
