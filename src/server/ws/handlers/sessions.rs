@@ -554,10 +554,7 @@ fn enrich_session_list(
             }
 
             let Some(session) = entry.session() else {
-                tracing::warn!(
-                    session_id = entry.session_id(),
-                    "skipping inconsistent available session entry during filter"
-                );
+                tracing::warn!("skipping inconsistent available session entry during filter");
                 return false;
             };
             if !filters.include_global && session.session_key == "global" {
@@ -608,10 +605,7 @@ fn enrich_session_list(
             }
 
             let Some(session) = entry.session() else {
-                tracing::warn!(
-                    session_id = entry.session_id(),
-                    "skipping inconsistent available session entry during projection"
-                );
+                tracing::warn!("skipping inconsistent available session entry during projection");
                 return None;
             };
             let mut row = session_row(session);

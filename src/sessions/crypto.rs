@@ -23,6 +23,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::crypto::{derive_key_argon2id, PasswordKdfError, PASSWORD_DERIVED_KEY_LEN};
+use crate::sessions::file_lock::FileLock;
 
 const CRYPTO_MANIFEST_PATH: &str = ".crypto-manifest";
 const CRYPTO_MANIFEST_VERSION: u32 = 1;
@@ -195,6 +196,7 @@ impl SessionCryptoContext {
     pub fn load_or_create(base_path: &Path, password: &[u8]) -> Result<Self, SessionCryptoError> {
         fs::create_dir_all(base_path)?;
         let manifest_path = manifest_path(base_path);
+        let _manifest_lock = FileLock::acquire(&manifest_path)?;
         let manifest = if manifest_path.exists() {
             let raw = fs::read_to_string(&manifest_path)?;
             let manifest: CryptoManifest = serde_json::from_str(&raw).map_err(|err| {

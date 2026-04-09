@@ -747,10 +747,7 @@ fn session_list_tool() -> BuiltinTool {
                             })
                             .into(),
                             _ => {
-                                tracing::warn!(
-                                    session_id = entry.session_id(),
-                                    "skipping inconsistent session list entry"
-                                );
+                                tracing::warn!("skipping inconsistent session list entry");
                                 None
                             }
                         })

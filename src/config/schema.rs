@@ -1646,13 +1646,20 @@ fn validate_session_encryption(
     obj: &serde_json::Map<String, Value>,
     issues: &mut Vec<SchemaIssue>,
 ) {
-    let encryption = match obj
-        .get("sessions")
-        .and_then(|s| s.get("encryption"))
-        .and_then(|v| v.as_object())
-    {
+    let Some(encryption_value) = obj.get("sessions").and_then(|s| s.get("encryption")) else {
+        return;
+    };
+
+    let encryption = match encryption_value.as_object() {
         Some(value) => value,
-        None => return,
+        None => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".sessions.encryption".to_string(),
+                message: "encryption must be an object".to_string(),
+            });
+            return;
+        }
     };
 
     if let Some(mode) = encryption.get("mode").and_then(|v| v.as_str()) {
@@ -2870,6 +2877,13 @@ mod tests {
         let cfg = json!({ "sessions": { "encryption": { "mode": "sometimes" } } });
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|i| i.path == ".sessions.encryption.mode"));
+    }
+
+    #[test]
+    fn test_session_encryption_must_be_object() {
+        let cfg = json!({ "sessions": { "encryption": "required" } });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".sessions.encryption"));
     }
 
     #[test]

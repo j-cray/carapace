@@ -403,9 +403,10 @@ Enable Carapace to listen and respond on external chat platforms.
     - `integrity.action`: `"warn"` (Default) or `"reject"`.
     - `encryption.mode`: `"off"`, `"if_password"` (Default), or `"required"`.
   - *Behavior notes:*
-    - When `encryption.mode` is `if_password`, Carapace encrypts session metadata, history, and archives when `CARAPACE_CONFIG_PASSWORD` is available, and still reads older plaintext sessions.
+    - When `encryption.mode` is `if_password`, Carapace encrypts session metadata, history, and archives when `CARAPACE_CONFIG_PASSWORD` is available, still reads older plaintext sessions, and rewrites older plaintext session artifacts into encrypted form on first read or write.
     - When `encryption.mode` is `required`, session operations fail closed until `CARAPACE_CONFIG_PASSWORD` is set.
     - Without the password in `if_password` mode, plaintext sessions remain readable but encrypted sessions surface as locked until the password is provided.
+    - When session encryption is active, Carapace keeps the session HMAC sidecars enabled even if `sessions.integrity.enabled` is `false`, because encrypted histories still rely on file-level integrity to detect ciphertext deletion or reordering.
 - **`session`**
   - *What it does:* Governs active chat/session scoping behavior and provides a legacy/global fallback for channel typing.
   - *Common values:*
