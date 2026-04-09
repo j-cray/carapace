@@ -3066,7 +3066,7 @@ mod tests {
         let crypto =
             sessions::crypto::SessionCryptoContext::load_or_create(&base_path, &key_material)
                 .unwrap();
-        let hmac_key = crypto.integrity_hmac_key();
+        let hmac_key = crypto.integrity_hmac_key().unwrap();
         let unlocked_store = std::sync::Arc::new(
             sessions::SessionStore::with_base_path(base_path.clone())
                 .with_encryption_mode(sessions::EncryptionMode::IfPassword)
@@ -3109,7 +3109,7 @@ mod tests {
         let crypto =
             sessions::crypto::SessionCryptoContext::load_or_create(&base_path, &key_material)
                 .unwrap();
-        let hmac_key = crypto.integrity_hmac_key();
+        let hmac_key = crypto.integrity_hmac_key().unwrap();
         let unlocked_store = std::sync::Arc::new(
             sessions::SessionStore::with_base_path(base_path.clone())
                 .with_encryption_mode(sessions::EncryptionMode::IfPassword)

@@ -15,6 +15,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit as _, Mac};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,11 +30,14 @@ const CRYPTO_MANIFEST_PATH: &str = ".crypto-manifest";
 const CRYPTO_MANIFEST_VERSION: u32 = 1;
 const CRYPTO_KDF_ID: &str = "argon2id-v2";
 const SESSION_ENCRYPTED_FORMAT_V1: &str = "session-enc-v1";
+const SESSION_ENCRYPTED_PREFIX_V1: &[u8] = b"cse1:";
 const SESSION_ENCRYPTION_ROOT_TAG: &[u8] = b"carapace:session-encryption-root:v1";
 const SESSION_ENCRYPTION_INFO_PREFIX: &[u8] = b"carapace:session-encryption-key:v1:";
 const SESSION_INTEGRITY_INFO: &[u8] = b"carapace:session-integrity-hmac:v2";
+const SESSION_MANIFEST_INTEGRITY_INFO: &[u8] = b"carapace:session-manifest-integrity:v1";
 const ROOT_SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
+type HmacSha256 = Hmac<Sha256>;
 
 /// Session encryption policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -66,6 +70,8 @@ struct CryptoManifest {
     version: u32,
     kdf: String,
     root_salt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integrity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +100,8 @@ pub enum SessionCryptoError {
     EncryptionFailed(String),
     #[error("session decryption failed")]
     DecryptionFailed,
+    #[error("session crypto manifest integrity verification failed")]
+    ManifestIntegrityFailed,
 }
 
 impl From<std::io::Error> for SessionCryptoError {
@@ -143,6 +151,14 @@ fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), S
     Ok(())
 }
 
+fn manifest_integrity_input(manifest: &CryptoManifest) -> Vec<u8> {
+    format!(
+        "version={}\nkdf={}\nroot_salt={}",
+        manifest.version, manifest.kdf, manifest.root_salt
+    )
+    .into_bytes()
+}
+
 fn decode_b64<const N: usize>(
     field: &'static str,
     value: &str,
@@ -176,10 +192,47 @@ fn aad_bytes(session_id: &str, purpose: &str) -> Vec<u8> {
     format!("carapace:session:{purpose}:v1:{session_id}").into_bytes()
 }
 
+fn manifest_integrity_tag(
+    master_key: &[u8],
+    manifest: &CryptoManifest,
+) -> Result<String, SessionCryptoError> {
+    let key = expand_hkdf(master_key, SESSION_MANIFEST_INTEGRITY_INFO)?;
+    let mut mac = HmacSha256::new_from_slice(key.as_ref())
+        .map_err(|err| SessionCryptoError::KeyDerivation(err.to_string()))?;
+    mac.update(&manifest_integrity_input(manifest));
+    Ok(BASE64.encode(mac.finalize().into_bytes()))
+}
+
+fn verify_manifest_integrity(
+    master_key: &[u8],
+    manifest: &CryptoManifest,
+    encoded_tag: &str,
+) -> Result<bool, SessionCryptoError> {
+    let key = expand_hkdf(master_key, SESSION_MANIFEST_INTEGRITY_INFO)?;
+    let expected = match BASE64.decode(encoded_tag) {
+        Ok(expected) => expected,
+        Err(_) => return Ok(false),
+    };
+    let mut mac = HmacSha256::new_from_slice(key.as_ref())
+        .map_err(|err| SessionCryptoError::KeyDerivation(err.to_string()))?;
+    mac.update(&manifest_integrity_input(manifest));
+    Ok(mac.verify_slice(&expected).is_ok())
+}
+
+fn has_prefix(data: &[u8]) -> bool {
+    data.starts_with(SESSION_ENCRYPTED_PREFIX_V1)
+}
+
+fn strip_prefix(data: &[u8]) -> &[u8] {
+    data.strip_prefix(SESSION_ENCRYPTED_PREFIX_V1)
+        .unwrap_or(data)
+}
+
 /// Root session-crypto context derived from the config password.
 pub struct SessionCryptoContext {
     master_key: Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>,
     integrity_hmac_key: Zeroizing<[u8; 32]>,
+    manifest_integrity_valid: bool,
 }
 
 impl fmt::Debug for SessionCryptoContext {
@@ -187,6 +240,7 @@ impl fmt::Debug for SessionCryptoContext {
         f.debug_struct("SessionCryptoContext")
             .field("master_key", &"[redacted]")
             .field("integrity_hmac_key", &"[redacted]")
+            .field("manifest_integrity_valid", &self.manifest_integrity_valid)
             .finish()
     }
 }
@@ -197,7 +251,8 @@ impl SessionCryptoContext {
         fs::create_dir_all(base_path)?;
         let manifest_path = manifest_path(base_path);
         let _manifest_lock = FileLock::acquire(&manifest_path)?;
-        let manifest = if manifest_path.exists() {
+        let manifest_exists = manifest_path.exists();
+        let mut manifest = if manifest_exists {
             let raw = fs::read_to_string(&manifest_path)?;
             let manifest: CryptoManifest = serde_json::from_str(&raw).map_err(|err| {
                 SessionCryptoError::Manifest(format!(
@@ -225,24 +280,45 @@ impl SessionCryptoContext {
             let mut salt = [0u8; ROOT_SALT_LEN];
             getrandom::fill(&mut salt)
                 .map_err(|err| SessionCryptoError::RandomFailure(err.to_string()))?;
-            let manifest = CryptoManifest {
+            CryptoManifest {
                 version: CRYPTO_MANIFEST_VERSION,
                 kdf: CRYPTO_KDF_ID.to_string(),
                 root_salt: BASE64.encode(salt),
-            };
-            write_manifest_atomic(&manifest_path, &manifest)?;
-            manifest
+                integrity: None,
+            }
         };
 
         let root_salt = decode_b64::<ROOT_SALT_LEN>("root_salt", &manifest.root_salt)?;
         let master_key =
             Zeroizing::new(derive_key_argon2id(password, &root_salt).map_err(map_kdf_error)?);
+        let manifest_integrity_valid = if !manifest_exists {
+            manifest.integrity = Some(manifest_integrity_tag(master_key.as_ref(), &manifest)?);
+            write_manifest_atomic(&manifest_path, &manifest)?;
+            true
+        } else if let Some(encoded_tag) = manifest.integrity.as_deref() {
+            verify_manifest_integrity(master_key.as_ref(), &manifest, encoded_tag)?
+        } else {
+            false
+        };
         let integrity_hmac_key = expand_hkdf(master_key.as_ref(), SESSION_INTEGRITY_INFO)?;
 
         Ok(Self {
             master_key,
             integrity_hmac_key,
+            manifest_integrity_valid,
         })
+    }
+
+    pub fn manifest_integrity_valid(&self) -> bool {
+        self.manifest_integrity_valid
+    }
+
+    fn ensure_manifest_integrity(&self) -> Result<(), SessionCryptoError> {
+        if self.manifest_integrity_valid {
+            Ok(())
+        } else {
+            Err(SessionCryptoError::ManifestIntegrityFailed)
+        }
     }
 
     /// Derive a per-session encryption key for the given purpose.
@@ -251,6 +327,7 @@ impl SessionCryptoContext {
         session_id: &str,
         purpose: &str,
     ) -> Result<Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>, SessionCryptoError> {
+        self.ensure_manifest_integrity()?;
         let mut info = Vec::with_capacity(
             SESSION_ENCRYPTION_INFO_PREFIX.len() + session_id.len() + purpose.len() + 1,
         );
@@ -262,10 +339,13 @@ impl SessionCryptoContext {
     }
 
     /// Derive the session-store-wide HMAC key rooted in the encryption master key.
-    pub fn integrity_hmac_key(&self) -> Zeroizing<[u8; 32]> {
+    pub fn integrity_hmac_key(&self) -> Option<Zeroizing<[u8; 32]>> {
+        if !self.manifest_integrity_valid {
+            return None;
+        }
         let mut out = [0u8; 32];
         out.copy_from_slice(self.integrity_hmac_key.as_ref());
-        Zeroizing::new(out)
+        Some(Zeroizing::new(out))
     }
 
     pub fn encrypt_bytes(
@@ -297,7 +377,11 @@ impl SessionCryptoContext {
             n: BASE64.encode(nonce_bytes),
             c: BASE64.encode(ciphertext),
         };
-        serde_json::to_vec(&envelope).map_err(Into::into)
+        let envelope = serde_json::to_vec(&envelope).map_err(SessionCryptoError::from)?;
+        let mut out = Vec::with_capacity(SESSION_ENCRYPTED_PREFIX_V1.len() + envelope.len());
+        out.extend_from_slice(SESSION_ENCRYPTED_PREFIX_V1);
+        out.extend_from_slice(&envelope);
+        Ok(out)
     }
 
     pub fn decrypt_bytes(
@@ -306,7 +390,7 @@ impl SessionCryptoContext {
         purpose: &str,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, SessionCryptoError> {
-        let envelope: EncryptedEnvelope = serde_json::from_slice(ciphertext)?;
+        let envelope: EncryptedEnvelope = serde_json::from_slice(strip_prefix(ciphertext))?;
         if envelope.format != SESSION_ENCRYPTED_FORMAT_V1 {
             return Err(SessionCryptoError::BadFormat(format!(
                 "unsupported encrypted session format '{}'",
@@ -357,7 +441,14 @@ impl SessionCryptoContext {
     }
 }
 
+pub fn has_encrypted_payload_prefix(data: &[u8]) -> bool {
+    has_prefix(data)
+}
+
 pub fn looks_like_encrypted_payload(data: &[u8]) -> bool {
+    if has_prefix(data) {
+        return true;
+    }
     serde_json::from_slice::<Value>(data)
         .ok()
         .and_then(|value| {
@@ -374,7 +465,7 @@ pub fn is_encrypted_payload(data: &[u8]) -> bool {
     if !looks_like_encrypted_payload(data) {
         return false;
     }
-    serde_json::from_slice::<EncryptedEnvelope>(data)
+    serde_json::from_slice::<EncryptedEnvelope>(strip_prefix(data))
         .map(|env| env.format == SESSION_ENCRYPTED_FORMAT_V1)
         .unwrap_or(false)
 }
@@ -396,6 +487,7 @@ mod tests {
         let encrypted = ctx
             .encrypt_bytes("session-1", "metadata", plaintext)
             .unwrap();
+        assert!(has_encrypted_payload_prefix(&encrypted));
         assert!(is_encrypted_payload(&encrypted));
         let decrypted = ctx
             .decrypt_bytes("session-1", "metadata", &encrypted)
@@ -422,10 +514,56 @@ mod tests {
             .encrypt_bytes("session-1", "history", br#"{"msg":"hello"}"#)
             .unwrap();
         let wrong = SessionCryptoContext::load_or_create(dir.path(), &wrong_key_material).unwrap();
+        assert!(!wrong.manifest_integrity_valid());
         let err = wrong
             .decrypt_bytes("session-1", "history", &encrypted)
             .unwrap_err();
-        assert_eq!(err, SessionCryptoError::DecryptionFailed);
+        assert_eq!(err, SessionCryptoError::ManifestIntegrityFailed);
+    }
+
+    #[test]
+    fn test_crypto_context_detects_tampered_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let encrypted = ctx
+            .encrypt_bytes("session-1", "metadata", br#"{"hello":"world"}"#)
+            .unwrap();
+
+        let manifest_path = dir.path().join(CRYPTO_MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["root_salt"] = Value::String(BASE64.encode([7u8; ROOT_SALT_LEN]));
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let tampered = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        assert!(!tampered.manifest_integrity_valid());
+        let err = tampered
+            .decrypt_bytes("session-1", "metadata", &encrypted)
+            .unwrap_err();
+        assert_eq!(err, SessionCryptoError::ManifestIntegrityFailed);
+    }
+
+    #[test]
+    fn test_prefixed_encrypted_payload_detection_handles_truncated_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let encrypted = ctx
+            .encrypt_bytes("session-1", "history", br#"{"msg":"hello"}"#)
+            .unwrap();
+        let truncated = encrypted[..SESSION_ENCRYPTED_PREFIX_V1.len() + 8].to_vec();
+
+        assert!(looks_like_encrypted_payload(&truncated));
+        assert!(!is_encrypted_payload(&truncated));
+        assert!(matches!(
+            ctx.decrypt_bytes("session-1", "history", &truncated),
+            Err(SessionCryptoError::BadFormat(_))
+        ));
     }
 
     #[cfg(unix)]

@@ -132,9 +132,15 @@ pub fn configured_store_with_path(
             crypto::SessionCryptoContext::load_or_create(store.base_path(), password.as_ref())
                 .map_err(SessionStoreError::from)?;
         let hmac_key = crypto.integrity_hmac_key();
-        store = store
-            .with_crypto_context(Arc::new(crypto))
-            .with_hmac_key(hmac_key);
+        if !crypto.manifest_integrity_valid() {
+            tracing::warn!(
+                "session crypto manifest integrity verification failed; encrypted session artifacts will remain unavailable until the manifest or password is repaired"
+            );
+        }
+        store = store.with_crypto_context(Arc::new(crypto));
+        if let Some(hmac_key) = hmac_key {
+            store = store.with_hmac_key(hmac_key);
+        }
         if let Some(legacy_hmac_key) = legacy_hmac_key {
             store = store.with_legacy_hmac_key(legacy_hmac_key);
         }

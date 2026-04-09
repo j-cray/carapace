@@ -78,6 +78,11 @@ impl From<super::crypto::SessionCryptoError> for SessionStoreError {
                     "wrong password or corrupted encrypted session data".to_string(),
                 )
             }
+            super::crypto::SessionCryptoError::ManifestIntegrityFailed => {
+                SessionStoreError::DecryptionFailed(
+                    "wrong password or tampered encrypted-session manifest".to_string(),
+                )
+            }
             super::crypto::SessionCryptoError::Io(message)
             | super::crypto::SessionCryptoError::Manifest(message)
             | super::crypto::SessionCryptoError::KeyDerivation(message)
@@ -1076,7 +1081,9 @@ impl SessionStore {
             return Ok(());
         };
 
-        if super::crypto::looks_like_encrypted_payload(line.trim().as_bytes()) {
+        if super::crypto::looks_like_encrypted_payload(line.trim().as_bytes())
+            && super::crypto::has_encrypted_payload_prefix(line.trim().as_bytes())
+        {
             return Ok(());
         }
 
@@ -1097,7 +1104,9 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&archive_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let archive_content = fs::read(&archive_path)?;
-        if super::crypto::looks_like_encrypted_payload(&archive_content) {
+        if super::crypto::looks_like_encrypted_payload(&archive_content)
+            && super::crypto::has_encrypted_payload_prefix(&archive_content)
+        {
             return Ok(());
         }
 
@@ -1122,13 +1131,13 @@ impl SessionStore {
     fn migrate_session_artifacts_if_needed(
         &self,
         session: &Session,
-        meta_was_encrypted: bool,
+        meta_needs_migration: bool,
     ) -> Result<(), SessionStoreError> {
         if !self.encryption_active() {
             return Ok(());
         }
 
-        if !meta_was_encrypted {
+        if meta_needs_migration {
             self.write_session_meta(session)?;
         }
 
@@ -2311,6 +2320,8 @@ impl SessionStore {
 
         let content = fs::read(&meta_path)?;
         let meta_was_encrypted = super::crypto::looks_like_encrypted_payload(&content);
+        let meta_needs_migration =
+            !meta_was_encrypted || !super::crypto::has_encrypted_payload_prefix(&content);
 
         // Verify session integrity if HMAC key is configured
         self.verify_integrity_bytes_with_compat(&content, &meta_path)?;
@@ -2338,7 +2349,7 @@ impl SessionStore {
             Err(err) => return Err(err),
         };
 
-        self.migrate_session_artifacts_if_needed(&session, meta_was_encrypted)?;
+        self.migrate_session_artifacts_if_needed(&session, meta_needs_migration)?;
 
         if update_locked_scan_state {
             self.clear_locked_session_entry(session_id);
@@ -2640,9 +2651,10 @@ mod tests {
         if let Some(password) = password {
             let crypto = SessionCryptoContext::load_or_create(base_path, password).unwrap();
             let hmac_key = crypto.integrity_hmac_key();
-            store = store
-                .with_crypto_context(Arc::new(crypto))
-                .with_hmac_key(hmac_key);
+            store = store.with_crypto_context(Arc::new(crypto));
+            if let Some(hmac_key) = hmac_key {
+                store = store.with_hmac_key(hmac_key);
+            }
         }
         store
     }
@@ -3318,6 +3330,82 @@ mod tests {
             .list_session_entries(SessionFilter::new().with_user_id("user-a"))
             .unwrap_err();
         assert!(matches!(err, SessionStoreError::Locked(_)));
+    }
+
+    #[test]
+    fn test_list_sessions_isolates_truncated_prefixed_encrypted_metadata_to_locked_stub() {
+        let key_material = test_key_material();
+        let (store, temp_dir) = create_encrypted_store(&key_material);
+        let healthy = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("channel-a".into()),
+                    chat_id: Some("chat-a".into()),
+                    user_id: Some("user-a".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let corrupt = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("channel-b".into()),
+                    chat_id: Some("chat-b".into()),
+                    user_id: Some("user-b".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&healthy.id, "still-readable"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&corrupt.id, "will-corrupt"))
+            .unwrap();
+
+        let corrupt_meta_path = store.session_meta_path(&corrupt.id).unwrap();
+        let encrypted = fs::read(&corrupt_meta_path).unwrap();
+        assert!(crypto::has_encrypted_payload_prefix(&encrypted));
+        let truncated = encrypted[..12].to_vec();
+        fs::write(&corrupt_meta_path, &truncated).unwrap();
+        integrity::write_hmac_file(
+            store.hmac_key.as_ref().unwrap(),
+            &truncated,
+            &corrupt_meta_path,
+        )
+        .unwrap();
+
+        let reopened = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        );
+        let entries = reopened
+            .list_session_entries(SessionFilter::default())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.session_id() == healthy.id)
+                .unwrap()
+                .access(),
+            SessionAccessState::Available
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.session_id() == corrupt.id)
+                .unwrap()
+                .access(),
+            SessionAccessState::Locked
+        );
+        assert!(matches!(
+            reopened.get_session(&corrupt.id),
+            Err(SessionStoreError::Crypto(_))
+        ));
     }
 
     #[test]
