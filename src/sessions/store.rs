@@ -3157,8 +3157,7 @@ mod tests {
             .create_session("agent-1", SessionMetadata::default())
             .unwrap();
 
-        let locked_store =
-            reopen_store_with_encryption(temp_dir.path(), None, EncryptionMode::Off);
+        let locked_store = reopen_store_with_encryption(temp_dir.path(), None, EncryptionMode::Off);
         let entries = locked_store
             .list_session_entries(SessionFilter::default())
             .unwrap();
@@ -3531,7 +3530,9 @@ mod tests {
         let join = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             let result = restore_store.restore_session(&session_id);
-            result_tx.send(result.map(|restored| restored.session_id)).unwrap();
+            result_tx
+                .send(result.map(|restored| restored.session_id))
+                .unwrap();
         });
 
         started_rx.recv().unwrap();
