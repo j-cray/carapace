@@ -13,6 +13,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 const HMAC_DIGEST_SIZE: usize = 32;
@@ -308,12 +309,7 @@ fn hmacs_match(stored: &[u8], computed: &[u8; HMAC_DIGEST_SIZE]) -> bool {
     if stored.len() != HMAC_DIGEST_SIZE {
         return false;
     }
-
-    let mut diff = 0u8;
-    for (&stored_byte, &computed_byte) in stored.iter().zip(computed.iter()) {
-        diff |= stored_byte ^ computed_byte;
-    }
-    diff == 0
+    stored.ct_eq(computed.as_ref()).into()
 }
 
 fn verify_hmac_digest(

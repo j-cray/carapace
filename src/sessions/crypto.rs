@@ -516,6 +516,21 @@ mod tests {
     }
 
     #[test]
+    fn test_crypto_context_rejects_cross_session_decryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let encrypted = ctx
+            .encrypt_bytes("session-a", "metadata", br#"{"hello":"world"}"#)
+            .unwrap();
+
+        let err = ctx
+            .decrypt_bytes("session-b", "metadata", &encrypted)
+            .unwrap_err();
+        assert_eq!(err, SessionCryptoError::DecryptionFailed);
+    }
+
+    #[test]
     fn test_crypto_context_detects_tampered_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let key_material = test_key_material();

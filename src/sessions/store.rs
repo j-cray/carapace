@@ -983,6 +983,9 @@ impl SessionStore {
         content: &[u8],
         file_path: &Path,
     ) -> Result<(), SessionStoreError> {
+        if self.encrypted_artifact_locked_without_crypto_bytes(content) {
+            return Err(Self::session_locked_without_password());
+        }
         let Some(ref key) = self.hmac_key else {
             return Ok(());
         };
@@ -993,12 +996,6 @@ impl SessionStore {
         match super::integrity::verify_hmac_file(key, content, file_path, &integrity_config) {
             Ok(()) => Ok(()),
             Err(super::integrity::IntegrityError::Rejected { .. }) => {
-                let locked_without_crypto =
-                    self.encrypted_artifact_locked_without_crypto_bytes(content);
-                if locked_without_crypto {
-                    return Err(Self::session_locked_without_password());
-                }
-
                 let Some(ref legacy_key) = self.legacy_hmac_key else {
                     return Err(SessionStoreError::Io(format!(
                         "session integrity verification failed for {}",
@@ -1028,15 +1025,10 @@ impl SessionStore {
                 })
             }
             Err(err) => {
-                let locked_without_crypto =
-                    self.encrypted_artifact_locked_without_crypto_bytes(content);
                 if matches!(
                     self.integrity_action,
                     super::integrity::IntegrityAction::Reject
                 ) {
-                    if locked_without_crypto {
-                        return Err(Self::session_locked_without_password());
-                    }
                     tracing::warn!(
                         error_kind = integrity_error_kind(&err),
                         "session integrity verification issue"
@@ -3075,6 +3067,29 @@ mod tests {
         ));
         assert!(matches!(
             locked_store.get_session_by_key(&session.session_key),
+            Err(SessionStoreError::Locked(_))
+        ));
+    }
+
+    #[test]
+    fn test_warn_mode_without_password_short_circuits_encrypted_metadata_before_hmac_warning() {
+        let key_material = test_key_material();
+        let server_secret = test_key_material();
+        let (encrypted_store, temp_dir) = create_encrypted_store(&key_material);
+        let session = encrypted_store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        let meta_path = encrypted_store.session_meta_path(&session.id).unwrap();
+        let content = fs::read(&meta_path).unwrap();
+
+        let locked_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_encryption_mode(EncryptionMode::IfPassword)
+            .with_hmac_key(Zeroizing::new(integrity::derive_hmac_key(&server_secret)))
+            .with_integrity_action(integrity::IntegrityAction::Warn);
+
+        assert!(matches!(
+            locked_store.verify_integrity_bytes_with_compat(&content, &meta_path),
             Err(SessionStoreError::Locked(_))
         ));
     }
