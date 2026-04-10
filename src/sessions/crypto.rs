@@ -180,6 +180,10 @@ fn expand_hkdf(
     master_key: &[u8],
     info: &[u8],
 ) -> Result<Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>, SessionCryptoError> {
+    // The Argon2-derived master key is already high-entropy. This fixed HKDF
+    // extract salt is therefore just the stable root-domain label for the
+    // session key hierarchy; per-artifact separation still comes from the
+    // caller-provided Expand `info` values.
     let hk = Hkdf::<Sha256>::new(Some(SESSION_ENCRYPTION_ROOT_TAG), master_key);
     let mut out = [0u8; PASSWORD_DERIVED_KEY_LEN];
     hk.expand(info, &mut out)

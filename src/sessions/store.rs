@@ -1121,21 +1121,7 @@ impl SessionStore {
         }
 
         let archived = self.decode_archive(session_id, &archive_content)?;
-        let temp_path = archive_path.with_extension("json.tmp");
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            let encoded = self.encode_archive(session_id, &archived)?;
-            writer.write_all(&encoded)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
-        }
-
-        fs::rename(&temp_path, &archive_path)?;
-        Ok(())
+        self.write_archive_file(&archive_path, session_id, &archived)
     }
 
     fn migrate_session_artifacts_if_needed(
@@ -1297,6 +1283,80 @@ impl SessionStore {
             })?;
         }
         Ok(())
+    }
+
+    fn prepare_archive_hmac(
+        &self,
+        archive_path: &Path,
+        archive_bytes: &[u8],
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if let Some(ref key) = self.hmac_key {
+            super::integrity::prepare_pending_hmac_file(key, archive_bytes, archive_path).map_err(
+                |e| {
+                    SessionStoreError::Io(format!(
+                        "failed to stage HMAC sidecar for archive {}: {}",
+                        session_id, e
+                    ))
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn commit_archive_hmac(
+        &self,
+        archive_path: &Path,
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if self.hmac_key.is_some() {
+            super::integrity::commit_pending_hmac_sidecar(archive_path).map_err(|e| {
+                SessionStoreError::Io(format!(
+                    "failed to commit HMAC sidecar for archive {}: {}",
+                    session_id, e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn delete_archive_hmac(
+        &self,
+        archive_path: &Path,
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if let Err(e) = super::integrity::delete_hmac_sidecar(archive_path) {
+            return Err(SessionStoreError::Io(format!(
+                "failed to remove HMAC sidecar for archive {}: {}",
+                session_id, e
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_archive_file(
+        &self,
+        archive_path: &Path,
+        session_id: &str,
+        archived: &ArchivedSession,
+    ) -> Result<(), SessionStoreError> {
+        let temp_path = archive_path.with_extension("tmp");
+        let encoded = self.encode_archive(session_id, archived)?;
+
+        {
+            let file = Self::create_private_output_file(&temp_path)?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(&encoded)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
+        }
+
+        self.prepare_archive_hmac(archive_path, &encoded, session_id)?;
+        fs::rename(&temp_path, archive_path)?;
+        self.commit_archive_hmac(archive_path, session_id)
     }
 
     fn delete_history_hmac(
@@ -2073,24 +2133,8 @@ impl SessionStore {
             version: 1,
         };
 
-        // Write archive file
         let archive_path = self.archive_path(session_id)?;
-        let temp_path = archive_path.with_extension("tmp");
-
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            let encoded = self.encode_archive(session_id, &archived)?;
-            writer.write_all(&encoded)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
-        }
-
-        // Atomic rename
-        fs::rename(&temp_path, &archive_path)?;
+        self.write_archive_file(&archive_path, session_id, &archived)?;
 
         // Get archive size
         let archive_size = fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
@@ -2163,19 +2207,7 @@ impl SessionStore {
         self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
 
         if self.encryption_active() && archive_was_plaintext {
-            let temp_path = archive_path.with_extension("tmp");
-            let encoded = self.encode_archive(session_id, &archived)?;
-            {
-                let file = Self::create_private_output_file(&temp_path)?;
-                let mut writer = BufWriter::new(file);
-                writer.write_all(&encoded)?;
-                writer.flush()?;
-                writer
-                    .into_inner()
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
-                    .sync_all()?;
-            }
-            fs::rename(&temp_path, &archive_path)?;
+            self.write_archive_file(&archive_path, session_id, &archived)?;
         }
 
         let message_count = archived.messages.len();
@@ -2239,14 +2271,15 @@ impl SessionStore {
     /// This removes the archive file but keeps the session metadata.
     /// Use this to clean up archives that are no longer needed.
     pub fn delete_archive(&self, session_id: &str) -> Result<bool, SessionStoreError> {
+        self.ensure_required_encryption_available()?;
         let _ = self.get_session(session_id)?;
         let archive_path = self.archive_path(session_id)?;
-        if archive_path.exists() {
+        let existed = archive_path.exists();
+        if existed {
             fs::remove_file(&archive_path)?;
-            Ok(true)
-        } else {
-            Ok(false)
         }
+        self.delete_archive_hmac(&archive_path, session_id)?;
+        Ok(existed)
     }
 
     /// Get archive info for a session
@@ -2675,6 +2708,12 @@ mod tests {
 
     fn test_key_material() -> Vec<u8> {
         format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
+    }
+
+    fn hmac_sidecar_path(path: &Path) -> PathBuf {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(".hmac");
+        PathBuf::from(sidecar)
     }
 
     fn reopen_store_with_encryption(
@@ -3282,6 +3321,61 @@ mod tests {
             .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
         #[cfg(unix)]
         assert_private_mode(&history_path);
+    }
+
+    #[test]
+    fn test_archive_migration_updates_hmac_sidecar_under_reject_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let key_material = test_key_material();
+        let legacy_secret = test_key_material();
+        let legacy_hmac_key = Zeroizing::new(integrity::derive_hmac_key(&legacy_secret));
+
+        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(legacy_hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = plaintext_store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        plaintext_store
+            .append_message(ChatMessage::user(&session.id, "before-archive"))
+            .unwrap();
+        plaintext_store.archive_session(&session.id, false).unwrap();
+
+        let archive_path = plaintext_store.archive_path(&session.id).unwrap();
+        let archive_raw = fs::read(&archive_path).unwrap();
+        let reject = integrity::IntegrityConfig {
+            enabled: true,
+            action: integrity::IntegrityAction::Reject,
+        };
+        integrity::verify_hmac_file(
+            plaintext_store.hmac_key.as_ref().unwrap(),
+            &archive_raw,
+            &archive_path,
+            &reject,
+        )
+        .unwrap();
+
+        let encrypted_store = reopen_store_with_encryption_and_legacy_hmac(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+            Some(&legacy_secret),
+        )
+        .with_integrity_action(integrity::IntegrityAction::Reject);
+        let entries = encrypted_store
+            .list_session_entries(SessionFilter::default())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let migrated_archive_raw = fs::read(&archive_path).unwrap();
+        assert!(crypto::is_encrypted_payload(&migrated_archive_raw));
+        integrity::verify_hmac_file(
+            encrypted_store.hmac_key.as_ref().unwrap(),
+            &migrated_archive_raw,
+            &archive_path,
+            &reject,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4450,6 +4544,30 @@ mod tests {
         // Delete again returns false
         let deleted_again = store.delete_archive(&session.id).unwrap();
         assert!(!deleted_again);
+    }
+
+    #[test]
+    fn test_delete_archive_removes_archive_hmac_sidecar() {
+        let key_material = test_key_material();
+        let (store, _temp) = create_encrypted_store(&key_material);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+        store.archive_session(&session.id, false).unwrap();
+
+        let archive_path = store.archive_path(&session.id).unwrap();
+        let sidecar_path = hmac_sidecar_path(&archive_path);
+        assert!(archive_path.exists());
+        assert!(sidecar_path.exists());
+
+        let deleted = store.delete_archive(&session.id).unwrap();
+        assert!(deleted);
+        assert!(!archive_path.exists());
+        assert!(!sidecar_path.exists());
     }
 
     #[test]
