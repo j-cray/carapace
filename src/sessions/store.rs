@@ -980,27 +980,22 @@ impl SessionStore {
                     )));
                 };
                 super::integrity::verify_hmac_path(legacy_key, file_path, &integrity_config)
-                    .map_err(|err| {
-                        if locked_without_crypto {
-                            return Self::session_locked_without_password();
+                    .map_err(|err| match err {
+                        super::integrity::IntegrityError::Rejected { file } => {
+                            SessionStoreError::Io(format!(
+                                "session integrity verification failed for {}",
+                                file
+                            ))
                         }
-                        match err {
-                            super::integrity::IntegrityError::Rejected { file } => {
-                                SessionStoreError::Io(format!(
-                                    "session integrity verification failed for {}",
-                                    file
-                                ))
-                            }
-                            other => {
-                                tracing::warn!(
-                                    error_kind = integrity_error_kind(&other),
-                                    "session integrity verification issue"
-                                );
-                                SessionStoreError::Io(format!(
-                                    "session integrity verification failed for {}",
-                                    file_path.display()
-                                ))
-                            }
+                        other => {
+                            tracing::warn!(
+                                error_kind = integrity_error_kind(&other),
+                                "session integrity verification issue"
+                            );
+                            SessionStoreError::Io(format!(
+                                "session integrity verification failed for {}",
+                                file_path.display()
+                            ))
                         }
                     })
             }
@@ -1047,27 +1042,19 @@ impl SessionStore {
                     file_path,
                     &integrity_config,
                 )
-                .map_err(|err| {
-                    if locked_without_crypto {
-                        return Self::session_locked_without_password();
-                    }
-                    match err {
-                        super::integrity::IntegrityError::Rejected { file } => {
-                            SessionStoreError::Io(format!(
-                                "session integrity verification failed for {}",
-                                file
-                            ))
-                        }
-                        other => {
-                            tracing::warn!(
-                                error_kind = integrity_error_kind(&other),
-                                "session integrity verification issue"
-                            );
-                            SessionStoreError::Io(format!(
-                                "session integrity verification failed for {}",
-                                file_path.display()
-                            ))
-                        }
+                .map_err(|err| match err {
+                    super::integrity::IntegrityError::Rejected { file } => SessionStoreError::Io(
+                        format!("session integrity verification failed for {}", file),
+                    ),
+                    other => {
+                        tracing::warn!(
+                            error_kind = integrity_error_kind(&other),
+                            "session integrity verification issue"
+                        );
+                        SessionStoreError::Io(format!(
+                            "session integrity verification failed for {}",
+                            file_path.display()
+                        ))
                     }
                 })
             }

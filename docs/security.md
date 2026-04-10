@@ -192,6 +192,7 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ├── devices/
 │   └── paired.json        # Device tokens (hashed)
 ├── agents/<id>/
+│   ├── sessions/.crypto-manifest # Session-encryption root salt + manifest integrity tag; required to decrypt encrypted session artifacts
 │   ├── sessions/*.jsonl   # Session transcripts (encrypted at rest when sessions.encryption.mode permits it and CARAPACE_CONFIG_PASSWORD is set)
 │   └── auth-profiles.json # API keys, OAuth tokens
 ├── tasks/
@@ -200,6 +201,9 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ```
 
 **File permissions**: Directories should be `700`, files `600`.
+**Encrypted-session backup note**: If session encryption is enabled, back up
+`.crypto-manifest` with the rest of the Carapace state. The config password
+alone is not enough to recover encrypted sessions if that manifest is lost.
 **Task payload note**: `tasks/queue.json` is plaintext durable state for operator
 workflows. Do not store raw secrets in task payload text.
 
