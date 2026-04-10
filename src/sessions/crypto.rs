@@ -301,7 +301,13 @@ impl SessionCryptoContext {
         } else if let Some(encoded_tag) = manifest.integrity.as_deref() {
             verify_manifest_integrity(master_key.as_ref(), &manifest, encoded_tag)?
         } else {
-            false
+            tracing::warn!(
+                manifest_path = %manifest_path.display(),
+                "backfilling missing session crypto manifest integrity tag"
+            );
+            manifest.integrity = Some(manifest_integrity_tag(master_key.as_ref(), &manifest)?);
+            write_manifest_atomic(&manifest_path, &manifest)?;
+            true
         };
         let integrity_hmac_key = expand_hkdf(master_key.as_ref(), SESSION_INTEGRITY_INFO)?;
 
@@ -534,6 +540,41 @@ mod tests {
             .decrypt_bytes("session-1", "metadata", &encrypted)
             .unwrap_err();
         assert_eq!(err, SessionCryptoError::ManifestIntegrityFailed);
+    }
+
+    #[test]
+    fn test_crypto_context_backfills_missing_manifest_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let encrypted = ctx
+            .encrypt_bytes("session-1", "metadata", br#"{"hello":"world"}"#)
+            .unwrap();
+
+        let manifest_path = dir.path().join(CRYPTO_MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("integrity");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let backfilled = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        assert!(backfilled.manifest_integrity_valid());
+        let decrypted = backfilled
+            .decrypt_bytes("session-1", "metadata", &encrypted)
+            .unwrap();
+        assert_eq!(decrypted, br#"{"hello":"world"}"#);
+
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let integrity = manifest
+            .get("integrity")
+            .and_then(Value::as_str)
+            .expect("integrity tag backfilled");
+        assert!(!integrity.is_empty());
     }
 
     #[test]

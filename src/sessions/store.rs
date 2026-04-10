@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::warn;
@@ -956,9 +956,23 @@ impl SessionStore {
         }
     }
 
-    fn verify_integrity_path_with_compat(&self, file_path: &Path) -> Result<(), SessionStoreError> {
-        let content = fs::read(file_path)?;
-        self.verify_integrity_bytes_with_compat(&content, file_path)
+    fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map(|index| index + 1)
+            .unwrap_or(start);
+        &bytes[start..end]
+    }
+
+    fn read_verified_history_bytes(&self, history_path: &Path) -> Result<Vec<u8>, SessionStoreError> {
+        let content = fs::read(history_path)?;
+        self.verify_integrity_bytes_with_compat(&content, history_path)?;
+        Ok(content)
     }
 
     fn verify_integrity_bytes_with_compat(
@@ -1079,23 +1093,16 @@ impl SessionStore {
             return Ok(());
         }
 
-        self.verify_history_hmac(history_path, session_id)?;
-        let file = File::open(history_path)?;
-        let reader = BufReader::new(file);
-        let first_non_empty = reader
-            .lines()
-            .find_map(|line| match line {
-                Ok(line) if !line.trim().is_empty() => Some(Ok(line)),
-                Ok(_) => None,
-                Err(err) => Some(Err(err)),
-            })
-            .transpose()?;
-
-        let Some(line) = first_non_empty else {
+        let history_bytes = self.read_verified_history_bytes(history_path)?;
+        let Some(line) = history_bytes
+            .split(|byte| *byte == b'\n')
+            .map(Self::trim_ascii_whitespace)
+            .find(|line| !line.is_empty())
+        else {
             return Ok(());
         };
 
-        if super::crypto::has_encrypted_payload_prefix(line.trim().as_bytes()) {
+        if super::crypto::has_encrypted_payload_prefix(line) {
             return Ok(());
         }
 
@@ -1220,14 +1227,6 @@ impl SessionStore {
         }
 
         Ok(false)
-    }
-
-    fn verify_history_hmac(
-        &self,
-        history_path: &Path,
-        _session_id: &str,
-    ) -> Result<(), SessionStoreError> {
-        self.verify_integrity_path_with_compat(history_path)
     }
 
     fn verify_archive_integrity(
@@ -1885,23 +1884,19 @@ impl SessionStore {
             return Ok(Vec::new());
         }
 
-        self.verify_history_hmac(&history_path, session_id)?;
-
-        let file = File::open(&history_path)?;
-        let reader = BufReader::new(file);
+        let history_bytes = self.read_verified_history_bytes(&history_path)?;
 
         let mut messages: Vec<ChatMessage> = Vec::new();
         let mut found_before = before_id.is_none();
 
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        for raw_line in history_bytes.split(|byte| *byte == b'\n') {
+            let line = Self::trim_ascii_whitespace(raw_line);
+            if line.is_empty() {
                 continue;
             }
-            let line_bytes = line.as_bytes();
-            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line_bytes);
+            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line);
 
-            let msg = match self.decode_history_message(session_id, line_bytes, encrypted_line) {
+            let msg = match self.decode_history_message(session_id, line, encrypted_line) {
                 Ok(m) => m,
                 Err(SessionStoreError::Locked(message)) => {
                     return Err(SessionStoreError::Locked(message));
