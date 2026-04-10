@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -22,7 +22,10 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::crypto::{derive_key_argon2id, PasswordKdfError, PASSWORD_DERIVED_KEY_LEN};
+use crate::crypto::{
+    derive_key_argon2id, PasswordKdfError, ARGON2ID_V2_ITERATIONS, ARGON2ID_V2_LANES,
+    ARGON2ID_V2_MEMORY_KIB, PASSWORD_DERIVED_KEY_LEN,
+};
 use crate::sessions::file_lock::FileLock;
 
 const CRYPTO_MANIFEST_PATH: &str = ".crypto-manifest";
@@ -76,6 +79,9 @@ struct CryptoManifest {
     version: u32,
     kdf: String,
     root_salt: String,
+    memory_kib: u32,
+    iterations: u32,
+    lanes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     integrity: Option<String>,
 }
@@ -158,11 +164,10 @@ fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), S
 }
 
 fn manifest_integrity_input(manifest: &CryptoManifest) -> Vec<u8> {
-    format!(
-        "version={}\nkdf={}\nroot_salt={}",
-        manifest.version, manifest.kdf, manifest.root_salt
-    )
-    .into_bytes()
+    let mut authenticated = manifest.clone();
+    authenticated.integrity = None;
+    serde_json::to_vec(&authenticated)
+        .expect("CryptoManifest serialization for integrity input should not fail")
 }
 
 fn decode_b64<const N: usize>(
@@ -258,6 +263,19 @@ fn decrypt_prefixed_bytes_with_master_key(
         .map_err(|_| SessionCryptoError::DecryptionFailed)
 }
 
+fn read_prefixed_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, SessionCryptoError> {
+    let mut file = File::open(path)?;
+    let mut prefix = [0u8; SESSION_ENCRYPTED_PREFIX_V1.len()];
+    if file.read_exact(&mut prefix).is_err() || prefix != SESSION_ENCRYPTED_PREFIX_V1 {
+        return Ok(None);
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&prefix);
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 fn verify_manifest_backfill_password(
     base_path: &Path,
     master_key: &[u8],
@@ -274,10 +292,9 @@ fn verify_manifest_backfill_password(
                 let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                     continue;
                 };
-                let bytes = fs::read(&path)?;
-                if !has_encrypted_payload_prefix(&bytes) {
+                let Some(bytes) = read_prefixed_file_bytes(&path)? else {
                     continue;
-                }
+                };
                 if decrypt_prefixed_bytes_with_master_key(
                     master_key,
                     session_id,
@@ -332,10 +349,9 @@ fn verify_manifest_backfill_password(
             let Some(session_id) = file_name.strip_suffix(".archive.json") else {
                 continue;
             };
-            let bytes = fs::read(&path)?;
-            if !has_encrypted_payload_prefix(&bytes) {
+            let Some(bytes) = read_prefixed_file_bytes(&path)? else {
                 continue;
-            }
+            };
             if decrypt_prefixed_bytes_with_master_key(
                 master_key,
                 session_id,
@@ -376,6 +392,28 @@ fn verify_manifest_integrity(
         .map_err(|err| SessionCryptoError::KeyDerivation(err.to_string()))?;
     mac.update(&manifest_integrity_input(manifest));
     Ok(mac.verify_slice(&expected).is_ok())
+}
+
+fn validate_manifest_kdf_parameters(
+    manifest: &CryptoManifest,
+    manifest_path: &Path,
+) -> Result<(), SessionCryptoError> {
+    if manifest.memory_kib != ARGON2ID_V2_MEMORY_KIB
+        || manifest.iterations != ARGON2ID_V2_ITERATIONS
+        || manifest.lanes != ARGON2ID_V2_LANES
+    {
+        return Err(SessionCryptoError::Manifest(format!(
+            "unsupported manifest kdf parameters in {}: expected memory_kib={}, iterations={}, lanes={}, got memory_kib={}, iterations={}, lanes={}",
+            manifest_path.display(),
+            ARGON2ID_V2_MEMORY_KIB,
+            ARGON2ID_V2_ITERATIONS,
+            ARGON2ID_V2_LANES,
+            manifest.memory_kib,
+            manifest.iterations,
+            manifest.lanes
+        )));
+    }
+    Ok(())
 }
 
 fn has_prefix(data: &[u8]) -> bool {
@@ -434,6 +472,7 @@ impl SessionCryptoContext {
                     manifest_path.display()
                 )));
             }
+            validate_manifest_kdf_parameters(&manifest, &manifest_path)?;
             manifest
         } else {
             let mut salt = [0u8; ROOT_SALT_LEN];
@@ -443,6 +482,9 @@ impl SessionCryptoContext {
                 version: CRYPTO_MANIFEST_VERSION,
                 kdf: CRYPTO_KDF_ID.to_string(),
                 root_salt: BASE64.encode(salt),
+                memory_kib: ARGON2ID_V2_MEMORY_KIB,
+                iterations: ARGON2ID_V2_ITERATIONS,
+                lanes: ARGON2ID_V2_LANES,
                 integrity: None,
             }
         };
@@ -729,6 +771,30 @@ mod tests {
             err,
             SessionCryptoError::BadFormat(message)
                 if message.contains("invalid base64 in manifest integrity field")
+        ));
+    }
+
+    #[test]
+    fn test_crypto_context_rejects_manifest_with_mismatched_kdf_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let _ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+
+        let manifest_path = dir.path().join(CRYPTO_MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["iterations"] = Value::from(ARGON2ID_V2_ITERATIONS + 1);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionCryptoError::Manifest(message)
+                if message.contains("unsupported manifest kdf parameters")
         ));
     }
 

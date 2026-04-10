@@ -1067,19 +1067,15 @@ impl SessionStore {
     }
 
     fn should_block_unknown_session_key_without_crypto(&self) -> bool {
-        self.crypto.is_none()
-            && self.encryption_mode.uses_encryption()
-            && self.locked_session_count() > 0
+        self.crypto.is_none() && self.locked_session_count() > 0
     }
 
     fn encrypted_artifact_locked_without_crypto_bytes(&self, content: &[u8]) -> bool {
-        self.crypto.is_none()
-            && self.encryption_mode.uses_encryption()
-            && super::crypto::has_encrypted_payload_prefix(content)
+        self.crypto.is_none() && super::crypto::has_encrypted_payload_prefix(content)
     }
 
     fn locked_filter_error(&self) -> SessionStoreError {
-        if self.crypto.is_none() && self.encryption_mode.uses_encryption() {
+        if self.crypto.is_none() && self.locked_session_count() > 0 {
             return Self::lock_message(
                 "encrypted sessions are present; provide the config password to apply metadata-based session filters",
             );
@@ -2341,6 +2337,7 @@ impl SessionStore {
         let archived = self.decode_archive(session_id, &archive_content)?;
 
         let history_path = self.session_history_path(session_id)?;
+        let _history_lock = FileLock::acquire(&history_path)?;
         self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
 
         if self.encryption_active() && archive_was_plaintext {
@@ -3153,6 +3150,33 @@ mod tests {
     }
 
     #[test]
+    fn test_off_mode_without_password_blocks_encrypted_key_lookup_and_create() {
+        let key_material = test_key_material();
+        let (encrypted_store, temp_dir) = create_encrypted_store(&key_material);
+        let session = encrypted_store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        let locked_store =
+            reopen_store_with_encryption(temp_dir.path(), None, EncryptionMode::Off);
+        let entries = locked_store
+            .list_session_entries(SessionFilter::default())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id(), session.id);
+        assert_eq!(entries[0].access(), SessionAccessState::Locked);
+
+        assert!(matches!(
+            locked_store.get_session_by_key(&session.session_key),
+            Err(SessionStoreError::Locked(_))
+        ));
+        assert!(matches!(
+            locked_store.get_or_create_session(&session.session_key, SessionMetadata::default()),
+            Err(SessionStoreError::Locked(_))
+        ));
+    }
+
+    #[test]
     fn test_reject_mode_without_password_keeps_encrypted_sessions_locked_when_hmac_is_configured() {
         let key_material = test_key_material();
         let server_secret = test_key_material();
@@ -3482,6 +3506,42 @@ mod tests {
             .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
         #[cfg(unix)]
         assert_private_mode(&history_path);
+    }
+
+    #[test]
+    fn test_restore_session_waits_for_history_lock() {
+        let (store, _temp_dir) = create_test_store();
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "before-archive"))
+            .unwrap();
+        store.archive_session(&session.id, true).unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let history_lock = FileLock::acquire(&history_path).unwrap();
+
+        let store = std::sync::Arc::new(store);
+        let session_id = session.id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let restore_store = std::sync::Arc::clone(&store);
+
+        let join = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = restore_store.restore_session(&session_id);
+            result_tx.send(result.map(|restored| restored.session_id)).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(result_rx.try_recv().is_err());
+
+        drop(history_lock);
+
+        let restored_session_id = result_rx.recv().unwrap().unwrap();
+        join.join().unwrap();
+        assert_eq!(restored_session_id, session.id);
     }
 
     #[test]
