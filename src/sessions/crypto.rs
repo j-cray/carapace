@@ -399,6 +399,11 @@ impl SessionCryptoContext {
         purpose: &str,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, SessionCryptoError> {
+        if !has_encrypted_payload_prefix(ciphertext) {
+            return Err(SessionCryptoError::BadFormat(
+                "missing cse1: prefix".to_string(),
+            ));
+        }
         let envelope: EncryptedEnvelope = serde_json::from_slice(strip_prefix(ciphertext))?;
         if envelope.format != SESSION_ENCRYPTED_FORMAT_V1 {
             return Err(SessionCryptoError::BadFormat(format!(
@@ -607,6 +612,25 @@ mod tests {
             ctx.decrypt_bytes("session-1", "history", &truncated),
             Err(SessionCryptoError::BadFormat(_))
         ));
+    }
+
+    #[test]
+    fn test_decrypt_bytes_requires_encrypted_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let encrypted = ctx
+            .encrypt_bytes("session-1", "history", br#"{"msg":"hello"}"#)
+            .unwrap();
+        let unprefixed = encrypted[SESSION_ENCRYPTED_PREFIX_V1.len()..].to_vec();
+
+        let err = ctx
+            .decrypt_bytes("session-1", "history", &unprefixed)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SessionCryptoError::BadFormat("missing cse1: prefix".to_string())
+        );
     }
 
     #[test]

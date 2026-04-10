@@ -248,7 +248,11 @@ pub fn prepare_pending_hmac_file_for_appended_bytes(
 pub fn commit_pending_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
     let pending = pending_hmac_path(file_path);
     let sidecar = hmac_path(file_path);
-    fs::rename(pending, sidecar)
+    match fs::rename(&pending, &sidecar) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && sidecar.exists() => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Delete the HMAC sidecar file for the given data file, if it exists.
@@ -452,6 +456,7 @@ fn try_promote_pending_hmac_sidecar(
     };
 
     if !hmacs_match(&stored_hmac, computed) {
+        let _ = fs::remove_file(&pending);
         return Ok(false);
     }
 
@@ -819,6 +824,45 @@ mod tests {
 
         let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_commit_pending_hmac_sidecar_succeeds_if_already_promoted() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("history.jsonl");
+        let data = "line1\n";
+        fs::write(&file_path, data).unwrap();
+
+        let key = derive_hmac_key(b"test-secret");
+        prepare_pending_hmac_file(&key, data.as_bytes(), &file_path).unwrap();
+
+        let pending = pending_hmac_path(&file_path);
+        let sidecar = hmac_path(&file_path);
+        fs::rename(&pending, &sidecar).unwrap();
+
+        let result = commit_pending_hmac_sidecar(&file_path);
+        assert!(result.is_ok());
+        assert!(sidecar.exists());
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn test_try_promote_pending_hmac_sidecar_removes_stale_pending_file() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("history.jsonl");
+        let stale_data = "old\n";
+        let current_data = "new\n";
+        fs::write(&file_path, current_data).unwrap();
+
+        let key = derive_hmac_key(b"test-secret");
+        prepare_pending_hmac_file(&key, stale_data.as_bytes(), &file_path).unwrap();
+        let pending = pending_hmac_path(&file_path);
+        assert!(pending.exists());
+
+        let computed = compute_hmac(&key, current_data.as_bytes());
+        let promoted = try_promote_pending_hmac_sidecar(&computed, &file_path).unwrap();
+        assert!(!promoted);
+        assert!(!pending.exists());
     }
 
     // ==================== Disabled Config ====================
