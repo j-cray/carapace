@@ -967,6 +967,12 @@ impl SessionStore {
         match super::integrity::verify_hmac_path(key, file_path, &integrity_config) {
             Ok(()) => Ok(()),
             Err(super::integrity::IntegrityError::Rejected { .. }) => {
+                let locked_without_crypto =
+                    self.encrypted_artifact_locked_without_crypto_path(file_path)?;
+                if locked_without_crypto {
+                    return Err(Self::session_locked_without_password());
+                }
+
                 let Some(ref legacy_key) = self.legacy_hmac_key else {
                     return Err(SessionStoreError::Io(format!(
                         "session integrity verification failed for {}",
@@ -974,22 +980,27 @@ impl SessionStore {
                     )));
                 };
                 super::integrity::verify_hmac_path(legacy_key, file_path, &integrity_config)
-                    .map_err(|err| match err {
-                        super::integrity::IntegrityError::Rejected { file } => {
-                            SessionStoreError::Io(format!(
-                                "session integrity verification failed for {}",
-                                file
-                            ))
+                    .map_err(|err| {
+                        if locked_without_crypto {
+                            return Self::session_locked_without_password();
                         }
-                        other => {
-                            tracing::warn!(
-                                error_kind = integrity_error_kind(&other),
-                                "session integrity verification issue"
-                            );
-                            SessionStoreError::Io(format!(
-                                "session integrity verification failed for {}",
-                                file_path.display()
-                            ))
+                        match err {
+                            super::integrity::IntegrityError::Rejected { file } => {
+                                SessionStoreError::Io(format!(
+                                    "session integrity verification failed for {}",
+                                    file
+                                ))
+                            }
+                            other => {
+                                tracing::warn!(
+                                    error_kind = integrity_error_kind(&other),
+                                    "session integrity verification issue"
+                                );
+                                SessionStoreError::Io(format!(
+                                    "session integrity verification failed for {}",
+                                    file_path.display()
+                                ))
+                            }
                         }
                     })
             }
@@ -1018,6 +1029,12 @@ impl SessionStore {
         match super::integrity::verify_hmac_file(key, content, file_path, &integrity_config) {
             Ok(()) => Ok(()),
             Err(super::integrity::IntegrityError::Rejected { .. }) => {
+                let locked_without_crypto =
+                    self.encrypted_artifact_locked_without_crypto_bytes(content);
+                if locked_without_crypto {
+                    return Err(Self::session_locked_without_password());
+                }
+
                 let Some(ref legacy_key) = self.legacy_hmac_key else {
                     return Err(SessionStoreError::Io(format!(
                         "session integrity verification failed for {}",
@@ -1030,19 +1047,27 @@ impl SessionStore {
                     file_path,
                     &integrity_config,
                 )
-                .map_err(|err| match err {
-                    super::integrity::IntegrityError::Rejected { file } => SessionStoreError::Io(
-                        format!("session integrity verification failed for {}", file),
-                    ),
-                    other => {
-                        tracing::warn!(
-                            error_kind = integrity_error_kind(&other),
-                            "session integrity verification issue"
-                        );
-                        SessionStoreError::Io(format!(
-                            "session integrity verification failed for {}",
-                            file_path.display()
-                        ))
+                .map_err(|err| {
+                    if locked_without_crypto {
+                        return Self::session_locked_without_password();
+                    }
+                    match err {
+                        super::integrity::IntegrityError::Rejected { file } => {
+                            SessionStoreError::Io(format!(
+                                "session integrity verification failed for {}",
+                                file
+                            ))
+                        }
+                        other => {
+                            tracing::warn!(
+                                error_kind = integrity_error_kind(&other),
+                                "session integrity verification issue"
+                            );
+                            SessionStoreError::Io(format!(
+                                "session integrity verification failed for {}",
+                                file_path.display()
+                            ))
+                        }
                     }
                 })
             }
@@ -1060,6 +1085,23 @@ impl SessionStore {
         self.crypto.is_none()
             && self.encryption_mode.uses_encryption()
             && self.locked_session_count() > 0
+    }
+
+    fn encrypted_artifact_locked_without_crypto_bytes(&self, content: &[u8]) -> bool {
+        self.crypto.is_none()
+            && self.encryption_mode.uses_encryption()
+            && super::crypto::has_encrypted_payload_prefix(content)
+    }
+
+    fn encrypted_artifact_locked_without_crypto_path(
+        &self,
+        file_path: &Path,
+    ) -> Result<bool, SessionStoreError> {
+        if self.crypto.is_some() || !self.encryption_mode.uses_encryption() {
+            return Ok(false);
+        }
+        let content = fs::read(file_path)?;
+        Ok(super::crypto::has_encrypted_payload_prefix(&content))
     }
 
     fn locked_filter_error(&self) -> SessionStoreError {
@@ -3003,6 +3045,44 @@ mod tests {
             .get_session_by_key(&session.session_key)
             .unwrap_err();
         assert!(matches!(err, SessionStoreError::Locked(_)));
+    }
+
+    #[test]
+    fn test_reject_mode_without_password_keeps_encrypted_sessions_locked_when_hmac_is_configured() {
+        let key_material = test_key_material();
+        let server_secret = test_key_material();
+        let (encrypted_store, temp_dir) = create_encrypted_store(&key_material);
+        let session = encrypted_store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        encrypted_store
+            .append_message(ChatMessage::user(&session.id, "hello"))
+            .unwrap();
+
+        let locked_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_encryption_mode(EncryptionMode::IfPassword)
+            .with_hmac_key(Zeroizing::new(integrity::derive_hmac_key(&server_secret)))
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let entries = locked_store
+            .list_session_entries(SessionFilter::default())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id(), session.id);
+        assert_eq!(entries[0].access(), SessionAccessState::Locked);
+
+        assert!(matches!(
+            locked_store.get_session(&session.id),
+            Err(SessionStoreError::Locked(_))
+        ));
+        assert!(matches!(
+            locked_store.get_history(&session.id, None, None),
+            Err(SessionStoreError::Locked(_))
+        ));
+        assert!(matches!(
+            locked_store.get_session_by_key(&session.session_key),
+            Err(SessionStoreError::Locked(_))
+        ));
     }
 
     #[test]
