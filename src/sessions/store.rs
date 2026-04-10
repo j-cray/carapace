@@ -1071,8 +1071,9 @@ impl SessionStore {
                 .map_err(|e| std::io::Error::other(e.to_string()))?
                 .sync_all()?;
         }
+        self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
         fs::rename(&temp_path, history_path)?;
-        self.write_history_hmac(history_path, session_id)?;
+        self.commit_history_hmac(history_path, session_id)?;
         Ok(())
     }
 
@@ -1249,15 +1250,55 @@ impl SessionStore {
         self.verify_integrity_path_with_compat(history_path)
     }
 
-    fn write_history_hmac(
+    fn prepare_history_hmac_for_path(
         &self,
+        source_path: &Path,
         history_path: &Path,
         session_id: &str,
     ) -> Result<(), SessionStoreError> {
         if let Some(ref key) = self.hmac_key {
-            super::integrity::write_hmac_file_for_path(key, history_path).map_err(|e| {
+            super::integrity::prepare_pending_hmac_file_for_path(key, source_path, history_path)
+                .map_err(|e| {
+                    SessionStoreError::Io(format!(
+                        "failed to stage HMAC sidecar for history {}: {}",
+                        session_id, e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn prepare_history_hmac_for_appended_bytes(
+        &self,
+        history_path: &Path,
+        appended: &[u8],
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if let Some(ref key) = self.hmac_key {
+            super::integrity::prepare_pending_hmac_file_for_appended_bytes(
+                key,
+                history_path,
+                appended,
+            )
+            .map_err(|e| {
                 SessionStoreError::Io(format!(
-                    "failed to write HMAC sidecar for history {}: {}",
+                    "failed to stage HMAC sidecar for history {}: {}",
+                    session_id, e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn commit_history_hmac(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if self.hmac_key.is_some() {
+            super::integrity::commit_pending_hmac_sidecar(history_path).map_err(|e| {
+                SessionStoreError::Io(format!(
+                    "failed to commit HMAC sidecar for history {}: {}",
                     session_id, e
                 ))
             })?;
@@ -1697,18 +1738,20 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         self.migrate_history_file_if_needed(&history_path, &session_id)?;
+        let encoded = self.encode_history_message(&message)?;
+        let mut appended = encoded;
+        appended.push(b'\n');
+        self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, &session_id)?;
         let file = Self::open_private_append_file(&history_path)?;
         let mut writer = BufWriter::new(file);
-        let encoded = self.encode_history_message(&message)?;
-        writer.write_all(&encoded)?;
-        writeln!(writer)?;
+        writer.write_all(&appended)?;
         writer.flush()?;
         writer
             .into_inner()
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .sync_all()?;
 
-        self.write_history_hmac(&history_path, &session_id)?;
+        self.commit_history_hmac(&history_path, &session_id)?;
 
         // Update session message count
         self.increment_message_count(&session_id)?;
@@ -1739,21 +1782,24 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         self.migrate_history_file_if_needed(&history_path, session_id)?;
-        let file = Self::open_private_append_file(&history_path)?;
-        let mut writer = BufWriter::new(file);
+        let mut appended = Vec::new();
 
         for msg in messages {
             let encoded = self.encode_history_message(msg)?;
-            writer.write_all(&encoded)?;
-            writeln!(writer)?;
+            appended.extend_from_slice(&encoded);
+            appended.push(b'\n');
         }
+        self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, session_id)?;
+        let file = Self::open_private_append_file(&history_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&appended)?;
         writer.flush()?;
         writer
             .into_inner()
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .sync_all()?;
 
-        self.write_history_hmac(&history_path, session_id)?;
+        self.commit_history_hmac(&history_path, session_id)?;
 
         // Update message count
         for _ in messages {
@@ -1913,34 +1959,10 @@ impl SessionStore {
         // Generate summary
         let summary = summary_fn(&to_compact);
 
-        // Write new history file atomically
-        let temp_path = history_path.with_extension("jsonl.tmp");
-
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-
-            // Write summary as system message
-            let summary_msg = ChatMessage::system(session_id, &summary);
-            let encoded_summary = self.encode_history_message(&summary_msg)?;
-            writer.write_all(&encoded_summary)?;
-            writeln!(writer)?;
-
-            // Write kept messages
-            for msg in &to_keep {
-                let encoded = self.encode_history_message(msg)?;
-                writer.write_all(&encoded)?;
-                writeln!(writer)?;
-            }
-
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-        }
-
-        // Atomic rename
-        fs::rename(&temp_path, &history_path)?;
-
-        self.write_history_hmac(&history_path, session_id)?;
+        let mut rewritten = Vec::with_capacity(to_keep.len() + 1);
+        rewritten.push(ChatMessage::system(session_id, &summary));
+        rewritten.extend(to_keep.iter().cloned());
+        self.rewrite_history_file_from_messages(&history_path, session_id, &rewritten)?;
 
         // Update session metadata
         session.status = SessionStatus::Active;
@@ -2144,24 +2166,8 @@ impl SessionStore {
         let archive_was_plaintext = !super::crypto::has_encrypted_payload_prefix(&archive_content);
         let archived = self.decode_archive(session_id, &archive_content)?;
 
-        // Restore messages to history file
         let history_path = self.session_history_path(session_id)?;
-        {
-            let file = Self::create_private_output_file(&history_path)?;
-            let mut writer = BufWriter::new(file);
-            for msg in &archived.messages {
-                let encoded = self.encode_history_message(msg)?;
-                writer.write_all(&encoded)?;
-                writeln!(writer)?;
-            }
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
-        }
-
-        self.write_history_hmac(&history_path, session_id)?;
+        self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
 
         if self.encryption_active() && archive_was_plaintext {
             let temp_path = archive_path.with_extension("tmp");
@@ -2426,7 +2432,24 @@ impl SessionStore {
                         Err(err @ SessionStoreError::DecryptionFailed(_))
                             if self.crypto.is_some() =>
                         {
-                            return Err(err);
+                            let manifest_locked = self
+                                .crypto
+                                .as_ref()
+                                .is_some_and(|crypto| !crypto.manifest_integrity_valid());
+                            if manifest_locked {
+                                return Err(err);
+                            }
+                            locked_session_entries.insert(
+                                stem.to_string(),
+                                SessionListEntry::locked(
+                                    stem.to_string(),
+                                    Self::file_updated_at(&path),
+                                ),
+                            );
+                            tracing::warn!(
+                                error_kind = session_store_error_kind(&err),
+                                "skipping undecryptable encrypted session metadata during scan"
+                            );
                         }
                         Err(err @ SessionStoreError::Crypto(_)) if self.crypto.is_some() => {
                             locked_session_entries.insert(
@@ -2482,14 +2505,25 @@ impl SessionStore {
                 .sync_all()?;
         }
 
+        if let Some(ref key) = self.hmac_key {
+            super::integrity::prepare_pending_hmac_file(key, &serialized, &meta_path).map_err(
+                |e| {
+                    SessionStoreError::Io(format!(
+                        "failed to stage HMAC sidecar for session {}: {}",
+                        session.id, e
+                    ))
+                },
+            )?;
+        }
+
         // Atomic rename
         fs::rename(&temp_path, &meta_path)?;
 
-        // Write HMAC sidecar if integrity is enabled.
-        if let Some(ref key) = self.hmac_key {
-            super::integrity::write_hmac_file(key, &serialized, &meta_path).map_err(|e| {
+        // Commit HMAC sidecar if integrity is enabled.
+        if self.hmac_key.is_some() {
+            super::integrity::commit_pending_hmac_sidecar(&meta_path).map_err(|e| {
                 SessionStoreError::Io(format!(
-                    "failed to write HMAC sidecar for session {}: {}",
+                    "failed to commit HMAC sidecar for session {}: {}",
                     session.id, e
                 ))
             })?;
@@ -3421,6 +3455,161 @@ mod tests {
             reopened.get_session(&corrupt.id),
             Err(SessionStoreError::Crypto(_))
         ));
+    }
+
+    #[test]
+    fn test_list_sessions_isolates_undecryptable_encrypted_metadata_to_locked_stub() {
+        let key_material = test_key_material();
+        let (store, temp_dir) = create_encrypted_store(&key_material);
+        let healthy = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("channel-a".into()),
+                    chat_id: Some("chat-a".into()),
+                    user_id: Some("user-a".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let corrupt = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("channel-b".into()),
+                    chat_id: Some("chat-b".into()),
+                    user_id: Some("user-b".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&healthy.id, "still-readable"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&corrupt.id, "will-corrupt"))
+            .unwrap();
+
+        let corrupt_meta_path = store.session_meta_path(&corrupt.id).unwrap();
+        let encrypted = fs::read(&corrupt_meta_path).unwrap();
+        assert!(crypto::has_encrypted_payload_prefix(&encrypted));
+
+        let prefix = b"cse1:";
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(encrypted.strip_prefix(prefix).unwrap()).unwrap();
+        let ciphertext = envelope.get("c").and_then(|value| value.as_str()).unwrap();
+        let mut chars: Vec<char> = ciphertext.chars().collect();
+        let flip_idx = chars.iter().position(|ch| *ch != 'A').unwrap_or(0);
+        chars[flip_idx] = if chars[flip_idx] == 'B' { 'C' } else { 'B' };
+        envelope["c"] = serde_json::Value::String(chars.into_iter().collect());
+
+        let mut tampered = prefix.to_vec();
+        tampered.extend(serde_json::to_vec(&envelope).unwrap());
+        fs::write(&corrupt_meta_path, &tampered).unwrap();
+        integrity::write_hmac_file(
+            store.hmac_key.as_ref().unwrap(),
+            &tampered,
+            &corrupt_meta_path,
+        )
+        .unwrap();
+
+        let reopened = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        );
+        let entries = reopened
+            .list_session_entries(SessionFilter::default())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.session_id() == healthy.id)
+                .unwrap()
+                .access(),
+            SessionAccessState::Available
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.session_id() == corrupt.id)
+                .unwrap()
+                .access(),
+            SessionAccessState::Locked
+        );
+
+        let loaded_healthy = reopened.get_session(&healthy.id).unwrap();
+        assert_eq!(loaded_healthy.id, healthy.id);
+        assert!(matches!(
+            reopened.get_session(&corrupt.id),
+            Err(SessionStoreError::DecryptionFailed(_))
+        ));
+        assert!(matches!(
+            reopened.list_session_entries(SessionFilter::new().with_user_id("user-a")),
+            Err(SessionStoreError::Locked(_))
+        ));
+    }
+
+    #[test]
+    fn test_reject_mode_recovers_pending_history_hmac_after_interrupted_rewrite() {
+        let temp_dir = TempDir::new().unwrap();
+        let key_material = test_key_material();
+        let store = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        )
+        .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "before"))
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let temp_path = history_path.with_extension("tmp");
+        {
+            let file = SessionStore::create_private_output_file(&temp_path).unwrap();
+            let mut writer = BufWriter::new(file);
+            for message in [
+                ChatMessage::user(&session.id, "before"),
+                ChatMessage::assistant(&session.id, "after"),
+            ] {
+                let encoded = store.encode_history_message(&message).unwrap();
+                writer.write_all(&encoded).unwrap();
+                writeln!(writer).unwrap();
+            }
+            writer.flush().unwrap();
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        store
+            .prepare_history_hmac_for_path(&temp_path, &history_path, &session.id)
+            .unwrap();
+        fs::rename(&temp_path, &history_path).unwrap();
+
+        let mut pending_sidecar = history_path.as_os_str().to_owned();
+        pending_sidecar.push(".hmac.tmp");
+        let pending_sidecar = PathBuf::from(pending_sidecar);
+        assert!(pending_sidecar.exists());
+
+        let reopened = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        )
+        .with_integrity_action(integrity::IntegrityAction::Reject);
+        let history = reopened.get_history(&session.id, None, None).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "before");
+        assert_eq!(history[1].content, "after");
+        assert!(!pending_sidecar.exists());
     }
 
     #[test]
