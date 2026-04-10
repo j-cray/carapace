@@ -526,7 +526,7 @@ impl SessionCryptoContext {
             } else {
                 tracing::warn!(
                     manifest_path = %manifest_path.display(),
-                    "refusing to backfill missing session crypto manifest integrity tag because the provided password did not decrypt any existing encrypted session artifact"
+                    "refusing to backfill missing session crypto manifest integrity tag because the provided password did not decrypt any existing encrypted session artifact; encrypted session reads and new encrypted writes will remain blocked until the manifest is repaired or removed"
                 );
                 false
             }

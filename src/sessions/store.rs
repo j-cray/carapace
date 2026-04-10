@@ -50,6 +50,8 @@ pub enum SessionStoreError {
     ArchiveNotFound(String),
     #[error("Invalid user ID: {0}")]
     InvalidUserId(String),
+    #[error("Invalid message batch: {0}")]
+    InvalidMessageBatch(String),
     #[error("Session store is locked: {0}")]
     Locked(String),
     #[error("Session decryption failed: {0}")]
@@ -110,6 +112,7 @@ fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
         SessionStoreError::NotArchived(_) => "not_archived",
         SessionStoreError::ArchiveNotFound(_) => "archive_not_found",
         SessionStoreError::InvalidUserId(_) => "invalid_user_id",
+        SessionStoreError::InvalidMessageBatch(_) => "invalid_message_batch",
         SessionStoreError::Locked(_) => "locked",
         SessionStoreError::DecryptionFailed(_) => "decryption_failed",
         SessionStoreError::Crypto(_) => "crypto",
@@ -130,6 +133,9 @@ fn session_store_error_export_warning(err: &SessionStoreError) -> &'static str {
         SessionStoreError::NotArchived(_) => "session data is not archived",
         SessionStoreError::ArchiveNotFound(_) => "session archive was not found on disk",
         SessionStoreError::InvalidUserId(_) => "session data is associated with an invalid user ID",
+        SessionStoreError::InvalidMessageBatch(_) => {
+            "session message batch contains messages for multiple sessions"
+        }
         SessionStoreError::Locked(_) => {
             "encrypted session data is unavailable without the config password"
         }
@@ -1071,7 +1077,7 @@ impl SessionStore {
     }
 
     fn encrypted_artifact_locked_without_crypto_bytes(&self, content: &[u8]) -> bool {
-        self.crypto.is_none() && super::crypto::has_encrypted_payload_prefix(content)
+        self.crypto.is_none() && super::crypto::is_encrypted_payload(content)
     }
 
     fn locked_filter_error(&self) -> SessionStoreError {
@@ -1277,7 +1283,7 @@ impl SessionStore {
             .modified()
             .ok()
             .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|dur| dur.as_millis() as i64);
+            .map(|dur| i64::try_from(dur.as_millis()).unwrap_or(i64::MAX));
         Some((metadata.len(), modified_at_ms))
     }
 
@@ -1950,6 +1956,15 @@ impl SessionStore {
         self.ensure_required_encryption_available()?;
 
         let session_id = &messages[0].session_id;
+        if let Some(message) = messages
+            .iter()
+            .find(|message| message.session_id != *session_id)
+        {
+            return Err(SessionStoreError::InvalidMessageBatch(format!(
+                "cannot append a batch for session {} containing message for session {}",
+                session_id, message.session_id
+            )));
+        }
 
         // Check session status
         if let Ok(session) = self.get_session(session_id) {
@@ -2604,9 +2619,9 @@ impl SessionStore {
                                     Self::file_updated_at(&path),
                                 ),
                             );
-                            tracing::warn!(
+                            tracing::error!(
                                 error_kind = session_store_error_kind(&err),
-                                "skipping undecryptable encrypted session metadata during scan"
+                                "skipping encrypted session metadata that failed authentication during scan"
                             );
                         }
                         Err(err @ SessionStoreError::Crypto(_)) if self.crypto.is_some() => {
@@ -4217,6 +4232,52 @@ mod tests {
         assert_eq!(limited.len(), 2);
         assert_eq!(limited[0].content, "Second");
         assert_eq!(limited[1].content, "Third");
+    }
+
+    #[test]
+    fn test_append_messages_rejects_cross_session_batch() {
+        let (store, _temp) = create_test_store();
+
+        let session_a = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("channel-a".into()),
+                    chat_id: Some("chat-a".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let session_b = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("channel-b".into()),
+                    chat_id: Some("chat-b".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let err = store
+            .append_messages(&[
+                ChatMessage::user(&session_a.id, "first"),
+                ChatMessage::assistant(&session_b.id, "second"),
+            ])
+            .unwrap_err();
+
+        assert!(matches!(err, SessionStoreError::InvalidMessageBatch(_)));
+        assert!(
+            store
+                .get_history(&session_a.id, None, None)
+                .unwrap()
+                .is_empty(),
+            "cross-session batch must not partially write the target history file"
+        );
+        assert!(store
+            .get_history(&session_b.id, None, None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
