@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use wasmtime::{Config, Engine};
 
@@ -49,9 +49,9 @@ where
         Err(engine) => drop(engine),
     }
 
-    engine_cell.get().ok_or_else(|| {
-        "shared engine should be initialized after successful construction".to_string()
-    })
+    Ok(engine_cell
+        .get()
+        .expect("engine must be set after successful OnceLock::set or concurrent set"))
 }
 
 #[derive(Debug)]
@@ -65,7 +65,7 @@ pub(crate) enum EnsureEpochTickerError<E> {
 
 struct EpochTickerState {
     interval: Duration,
-    ticker: Arc<EpochTicker>,
+    ticker: Weak<EpochTicker>,
 }
 
 pub(crate) struct PluginEngine {
@@ -96,13 +96,15 @@ impl PluginEngine {
         let interval = normalize_epoch_ticker_interval(interval);
         let mut ticker = self.epoch_ticker.lock();
         if let Some(existing) = ticker.as_ref() {
-            if existing.interval != interval {
-                return Err(EnsureEpochTickerError::IntervalMismatch {
-                    existing: existing.interval,
-                    requested: interval,
-                });
+            if let Some(ticker) = existing.ticker.upgrade() {
+                if existing.interval != interval {
+                    return Err(EnsureEpochTickerError::IntervalMismatch {
+                        existing: existing.interval,
+                        requested: interval,
+                    });
+                }
+                return Ok(ticker);
             }
-            return Ok(existing.ticker.clone());
         }
 
         let created = Arc::new(
@@ -110,7 +112,7 @@ impl PluginEngine {
         );
         *ticker = Some(EpochTickerState {
             interval,
-            ticker: created.clone(),
+            ticker: Arc::downgrade(&created),
         });
         Ok(created)
     }
@@ -212,6 +214,52 @@ mod tests {
             } if existing == Duration::from_millis(1)
                 && requested == Duration::from_millis(2)
         ));
+    }
+
+    #[test]
+    fn ensure_epoch_ticker_restarts_after_last_runtime_reference_drops() {
+        let plugin_engine = PluginEngine::for_runtime().expect("plugin engine");
+        let starts = AtomicUsize::new(0);
+
+        let first = plugin_engine
+            .ensure_epoch_ticker(Duration::from_millis(1), |_engine, _interval| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                Ok::<EpochTicker, ()>(EpochTicker {
+                    stop: Arc::new(AtomicBool::new(false)),
+                    handle: None,
+                })
+            })
+            .expect("first ticker start should succeed");
+
+        let second = plugin_engine
+            .ensure_epoch_ticker(Duration::from_millis(1), |_engine, _interval| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                Ok::<EpochTicker, ()>(EpochTicker {
+                    stop: Arc::new(AtomicBool::new(false)),
+                    handle: None,
+                })
+            })
+            .expect("concurrent ticker reuse should succeed");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        drop(first);
+        drop(second);
+
+        let third = plugin_engine
+            .ensure_epoch_ticker(Duration::from_millis(2), |_engine, interval| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(interval, Duration::from_millis(2));
+                Ok::<EpochTicker, ()>(EpochTicker {
+                    stop: Arc::new(AtomicBool::new(false)),
+                    handle: None,
+                })
+            })
+            .expect("ticker should restart after all runtime references drop");
+
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        drop(third);
     }
 
     #[test]
