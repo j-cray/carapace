@@ -601,6 +601,16 @@ pub struct HostState<B: CredentialBackend + Send + Sync + 'static> {
     limiter: PluginResourceLimiter,
 }
 
+struct RuntimeInitInputs<B: CredentialBackend + Send + Sync + 'static> {
+    plugin_engine: Arc<super::engine::PluginEngine>,
+    loader: Arc<PluginLoader>,
+    credential_store: Arc<CredentialStore<B>>,
+    rate_limiters: Arc<RateLimiterRegistry>,
+    ssrf_config: SsrfConfig,
+    sandbox_config: super::sandbox::SandboxConfig,
+    permission_config: PermissionConfig,
+}
+
 // Note: Full WASI integration will be added when we upgrade to wasmtime with
 // component model preview2 support fully stable. For now, we implement the
 // minimal host functions needed by plugins directly.
@@ -1072,6 +1082,27 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         }
 
         Self::with_permissions_config_and_epoch_ticker_factory(
+            RuntimeInitInputs {
+                plugin_engine,
+                loader,
+                credential_store,
+                rate_limiters,
+                ssrf_config,
+                sandbox_config,
+                permission_config,
+            },
+            |engine, interval| EpochTicker::start(engine, interval).map_err(RuntimeError::from),
+        )
+    }
+
+    fn with_permissions_config_and_epoch_ticker_factory<F>(
+        inputs: RuntimeInitInputs<B>,
+        epoch_ticker_factory: F,
+    ) -> Result<Self, RuntimeError>
+    where
+        F: FnOnce(Engine, Duration) -> Result<EpochTicker, RuntimeError>,
+    {
+        let RuntimeInitInputs {
             plugin_engine,
             loader,
             credential_store,
@@ -1079,23 +1110,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             ssrf_config,
             sandbox_config,
             permission_config,
-            |engine, interval| EpochTicker::start(engine, interval).map_err(RuntimeError::from),
-        )
-    }
-
-    fn with_permissions_config_and_epoch_ticker_factory<F>(
-        plugin_engine: Arc<super::engine::PluginEngine>,
-        loader: Arc<PluginLoader>,
-        credential_store: Arc<CredentialStore<B>>,
-        rate_limiters: Arc<RateLimiterRegistry>,
-        ssrf_config: SsrfConfig,
-        sandbox_config: super::sandbox::SandboxConfig,
-        permission_config: PermissionConfig,
-        epoch_ticker_factory: F,
-    ) -> Result<Self, RuntimeError>
-    where
-        F: FnOnce(Engine, Duration) -> Result<EpochTicker, RuntimeError>,
-    {
+        } = inputs;
         let epoch_deadline_ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
         plugin_engine
             .ensure_epoch_ticker(DEFAULT_EPOCH_TICK_INTERVAL, epoch_ticker_factory)
@@ -1851,13 +1866,15 @@ mod tests {
         );
 
         let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
-            plugin_engine,
-            loader,
-            credential_store,
-            Arc::new(RateLimiterRegistry::new()),
-            SsrfConfig::default(),
-            crate::plugins::sandbox::SandboxConfig::default(),
-            PermissionConfig::default(),
+            RuntimeInitInputs {
+                plugin_engine,
+                loader,
+                credential_store,
+                rate_limiters: Arc::new(RateLimiterRegistry::new()),
+                ssrf_config: SsrfConfig::default(),
+                sandbox_config: crate::plugins::sandbox::SandboxConfig::default(),
+                permission_config: PermissionConfig::default(),
+            },
             |_engine, _interval| {
                 Err(RuntimeError::ThreadSpawn {
                     source: StartupThreadSpawnError::new(
@@ -1925,13 +1942,15 @@ mod tests {
         );
 
         let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
-            plugin_engine,
-            loader,
-            credential_store,
-            Arc::new(RateLimiterRegistry::new()),
-            SsrfConfig::default(),
-            crate::plugins::sandbox::SandboxConfig::default(),
-            PermissionConfig::default(),
+            RuntimeInitInputs {
+                plugin_engine,
+                loader,
+                credential_store,
+                rate_limiters: Arc::new(RateLimiterRegistry::new()),
+                ssrf_config: SsrfConfig::default(),
+                sandbox_config: crate::plugins::sandbox::SandboxConfig::default(),
+                permission_config: PermissionConfig::default(),
+            },
             |_engine, _interval| {
                 Err(RuntimeError::ThreadSpawn {
                     source: StartupThreadSpawnError::new(
