@@ -1073,6 +1073,13 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         )
     }
 
+    /// Construct a runtime using the exact shared engine already owned by
+    /// `loader`.
+    ///
+    /// Production bootstrap passes `loader.shared_engine().clone()` here. The
+    /// separate `plugin_engine` parameter exists so tests can inject mismatch
+    /// cases deliberately; any non-matching pair is a contract violation and
+    /// returns `RuntimeError::EngineMismatch`.
     pub(crate) fn with_permissions_config_and_engine(
         plugin_engine: Arc<super::engine::PluginEngine>,
         loader: Arc<PluginLoader>,

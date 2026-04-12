@@ -539,4 +539,43 @@ mod tests {
         );
         join.join().expect("join waiter thread");
     }
+
+    #[test]
+    fn ensure_epoch_ticker_clears_starting_slot_after_factory_error() {
+        let plugin_engine = PluginEngine::for_runtime().expect("plugin engine");
+
+        let err = match plugin_engine
+            .ensure_epoch_ticker(Duration::from_millis(1), |_engine, _interval| {
+                Err::<EpochTicker, _>("simulated ticker startup error")
+            }) {
+            Ok(_) => panic!("ticker startup error should be returned"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            EnsureEpochTickerError::Start("simulated ticker startup error")
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let plugin_engine = Arc::clone(&plugin_engine);
+        let join = std::thread::spawn(move || {
+            let result = plugin_engine.ensure_epoch_ticker(
+                Duration::from_millis(1),
+                |_engine, _interval| {
+                    Ok::<EpochTicker, &str>(EpochTicker {
+                        stop: Arc::new(AtomicBool::new(false)),
+                        handle: None,
+                    })
+                },
+            );
+            tx.send(result.is_ok()).expect("send result");
+        });
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(true),
+            "subsequent callers should not block forever after a startup error"
+        );
+        join.join().expect("join waiter thread");
+    }
 }
