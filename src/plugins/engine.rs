@@ -32,10 +32,15 @@ fn build_plugin_engine() -> Result<Engine, String> {
 // fallback engine configured identically to the runtime engine.
 pub(crate) fn shared_component_validation_engine() -> Result<&'static Engine, String> {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
-    get_or_init_shared_engine(&ENGINE, build_plugin_engine)
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+    get_or_init_shared_engine(&ENGINE, &INIT_LOCK, build_plugin_engine)
 }
 
-fn get_or_init_shared_engine<F>(engine_cell: &OnceLock<Engine>, init: F) -> Result<&Engine, String>
+fn get_or_init_shared_engine<'a, F>(
+    engine_cell: &'a OnceLock<Engine>,
+    init_lock: &'a Mutex<()>,
+    init: F,
+) -> Result<&'a Engine, String>
 where
     F: FnOnce() -> Result<Engine, String>,
 {
@@ -44,8 +49,14 @@ where
     }
 
     // `OnceLock::get_or_try_init` would express this more directly, but it is
-    // still unstable in the toolchain used here. We only cache successful
-    // construction so standalone validation retries after transient failures.
+    // still unstable in the toolchain used here. We serialize first-use
+    // initialization so only one expensive `Engine::new` runs at a time, while
+    // still caching only successful construction so transient failures retry.
+    let _init_guard = init_lock.lock();
+    if let Some(engine) = engine_cell.get() {
+        return Ok(engine);
+    }
+
     let engine = init()?;
     match engine_cell.set(engine) {
         Ok(()) => {}
@@ -310,9 +321,10 @@ mod tests {
     #[test]
     fn shared_validation_engine_retries_after_failed_initialization() {
         let engine_cell = OnceLock::new();
+        let init_lock = Mutex::new(());
         let attempts = AtomicUsize::new(0);
 
-        let first_err = match get_or_init_shared_engine(&engine_cell, || {
+        let first_err = match get_or_init_shared_engine(&engine_cell, &init_lock, || {
             attempts.fetch_add(1, Ordering::SeqCst);
             Err("transient init failure".to_string())
         }) {
@@ -324,7 +336,7 @@ mod tests {
         assert!(engine_cell.get().is_none());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
-        let engine = get_or_init_shared_engine(&engine_cell, || {
+        let engine = get_or_init_shared_engine(&engine_cell, &init_lock, || {
             attempts.fetch_add(1, Ordering::SeqCst);
             build_plugin_engine()
         })
@@ -337,5 +349,42 @@ mod tests {
                 .expect("successful init should cache the engine")
         ));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn shared_validation_engine_serializes_concurrent_first_use() {
+        let engine_cell = OnceLock::new();
+        let init_lock = Mutex::new(());
+        let attempts = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for _ in 0..8 {
+                joins.push(scope.spawn(|| {
+                    get_or_init_shared_engine(&engine_cell, &init_lock, || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        build_plugin_engine()
+                    })
+                    .expect("concurrent initialization should succeed")
+                        as *const Engine as usize
+                }));
+            }
+
+            let first = joins
+                .pop()
+                .expect("at least one join handle")
+                .join()
+                .expect("first thread should succeed");
+            for join in joins {
+                let engine = join.join().expect("thread should succeed");
+                assert_eq!(engine, first);
+            }
+        });
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "only one thread should run the expensive engine initializer"
+        );
     }
 }
