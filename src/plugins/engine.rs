@@ -43,6 +43,9 @@ where
         return Ok(engine);
     }
 
+    // `OnceLock::get_or_try_init` would express this more directly, but it is
+    // still unstable in the toolchain used here. We only cache successful
+    // construction so standalone validation retries after transient failures.
     let engine = init()?;
     match engine_cell.set(engine) {
         Ok(()) => {}
@@ -85,6 +88,12 @@ impl PluginEngine {
         &self.engine
     }
 
+    /// Ensure there is a live epoch ticker for this engine.
+    ///
+    /// Interval mismatches are rejected only while a ticker is still live and
+    /// shared by current runtime holders. Once the last `Arc<EpochTicker>` is
+    /// dropped, the next caller starts a fresh ticker and may choose a new
+    /// interval.
     pub(crate) fn ensure_epoch_ticker<F, E>(
         &self,
         interval: Duration,
@@ -184,7 +193,7 @@ mod tests {
     fn ensure_epoch_ticker_rejects_mismatched_interval_requests() {
         let plugin_engine = PluginEngine::for_runtime().expect("plugin engine");
 
-        plugin_engine
+        let first = plugin_engine
             .ensure_epoch_ticker(Duration::ZERO, |_engine, _interval| {
                 Ok::<EpochTicker, ()>(EpochTicker {
                     stop: Arc::new(AtomicBool::new(false)),
@@ -214,10 +223,12 @@ mod tests {
             } if existing == Duration::from_millis(1)
                 && requested == Duration::from_millis(2)
         ));
+
+        drop(first);
     }
 
     #[test]
-    fn ensure_epoch_ticker_restarts_after_last_runtime_reference_drops() {
+    fn ensure_epoch_ticker_allows_interval_change_after_last_runtime_reference_drops() {
         let plugin_engine = PluginEngine::for_runtime().expect("plugin engine");
         let starts = AtomicUsize::new(0);
 

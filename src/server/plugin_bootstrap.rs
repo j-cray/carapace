@@ -186,7 +186,7 @@ fn plugin_runtime_init_error_is_fatal(error: &RuntimeError) -> bool {
     }
 }
 
-fn push_loader_init_failure_entries(
+fn push_plugin_init_failure_entries(
     report: &mut PluginActivationReport,
     managed_entries: &[ManagedPluginConfigEntry],
     reason: &str,
@@ -495,7 +495,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
         Err(error) => {
             let reason = format!("failed to initialize plugin engine: {error}");
             report.errors.push(reason.clone());
-            push_loader_init_failure_entries(&mut report, &managed_entries, &reason);
+            push_plugin_init_failure_entries(&mut report, &managed_entries, &reason);
             return BlockingPluginBootstrapResult {
                 report,
                 plugin_engine: None,
@@ -516,7 +516,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
         Err(error) => {
             let reason = format!("failed to initialize plugin loader: {error}");
             report.errors.push(reason.clone());
-            push_loader_init_failure_entries(&mut report, &managed_entries, &reason);
+            push_plugin_init_failure_entries(&mut report, &managed_entries, &reason);
             return BlockingPluginBootstrapResult {
                 report,
                 plugin_engine: Some(plugin_engine),
