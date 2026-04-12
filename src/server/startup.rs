@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_plugin_runtime_reports_loader_init_failure_per_managed_plugin() {
+    async fn bootstrap_plugin_runtime_reports_engine_init_failure_per_managed_plugin() {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut env = ScopedEnv::new();
         env.set(
@@ -1220,7 +1220,7 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         assert_eq!(
             report.errors[0],
-            "failed to initialize plugin loader: Wasmtime engine error: forced loader init failure"
+            "failed to initialize plugin engine: Wasmtime engine error: forced loader init failure"
         );
         assert_eq!(report.entries.len(), 2);
 
@@ -1234,7 +1234,7 @@ mod tests {
         assert_eq!(
             alpha.reason.as_deref(),
             Some(
-                "failed to initialize plugin loader: Wasmtime engine error: forced loader init failure"
+                "failed to initialize plugin engine: Wasmtime engine error: forced loader init failure"
             )
         );
         assert_eq!(alpha.install_id.as_ref(), Some(&json!("install-alpha")));
