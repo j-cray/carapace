@@ -31,11 +31,27 @@ fn build_plugin_engine() -> Result<Engine, String> {
 // (for example during plugin install/update handling), so it uses a shared
 // fallback engine configured identically to the runtime engine.
 pub(crate) fn shared_component_validation_engine() -> Result<&'static Engine, String> {
-    static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
-    match ENGINE.get_or_init(build_plugin_engine) {
-        Ok(engine) => Ok(engine),
-        Err(message) => Err(message.clone()),
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    get_or_init_shared_engine(&ENGINE, build_plugin_engine)
+}
+
+fn get_or_init_shared_engine<F>(engine_cell: &OnceLock<Engine>, init: F) -> Result<&Engine, String>
+where
+    F: FnOnce() -> Result<Engine, String>,
+{
+    if let Some(engine) = engine_cell.get() {
+        return Ok(engine);
     }
+
+    let engine = init()?;
+    match engine_cell.set(engine) {
+        Ok(()) => {}
+        Err(engine) => drop(engine),
+    }
+
+    engine_cell.get().ok_or_else(|| {
+        "shared engine should be initialized after successful construction".to_string()
+    })
 }
 
 #[derive(Debug)]
@@ -160,6 +176,7 @@ mod tests {
     use crate::plugins::runtime::DEFAULT_EPOCH_TICK_INTERVAL;
     use std::error::Error;
     use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn ensure_epoch_ticker_rejects_mismatched_interval_requests() {
@@ -229,5 +246,37 @@ mod tests {
         assert!(err
             .to_string()
             .contains("simulated epoch ticker thread exhaustion"));
+    }
+
+    #[test]
+    fn shared_validation_engine_retries_after_failed_initialization() {
+        let engine_cell = OnceLock::new();
+        let attempts = AtomicUsize::new(0);
+
+        let first_err = match get_or_init_shared_engine(&engine_cell, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err("transient init failure".to_string())
+        }) {
+            Ok(_) => panic!("first shared engine initialization should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(first_err, "transient init failure");
+        assert!(engine_cell.get().is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let engine = get_or_init_shared_engine(&engine_cell, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            build_plugin_engine()
+        })
+        .expect("second shared engine initialization should retry and succeed");
+
+        assert!(std::ptr::eq(
+            engine,
+            engine_cell
+                .get()
+                .expect("successful init should cache the engine")
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }

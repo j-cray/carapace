@@ -1077,10 +1077,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         sandbox_config: super::sandbox::SandboxConfig,
         permission_config: PermissionConfig,
     ) -> Result<Self, RuntimeError> {
-        if !Arc::ptr_eq(&plugin_engine, loader.shared_engine()) {
-            return Err(RuntimeError::EngineMismatch);
-        }
-
         Self::with_permissions_config_and_epoch_ticker_factory(
             RuntimeInitInputs {
                 plugin_engine,
@@ -1111,6 +1107,10 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             sandbox_config,
             permission_config,
         } = inputs;
+        if !Arc::ptr_eq(&plugin_engine, loader.shared_engine()) {
+            return Err(RuntimeError::EngineMismatch);
+        }
+
         let epoch_deadline_ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
         // PluginEngine retains the ticker Arc internally; the runtime keeps the
         // PluginEngine Arc so the shared ticker stays alive for the runtime lifetime.
@@ -1981,6 +1981,47 @@ mod tests {
 
         assert_eq!(spawn_error.thread_name(), EPOCH_TICKER_THREAD_NAME);
         assert_eq!(io_error.raw_os_error(), Some(11));
+    }
+
+    #[tokio::test]
+    async fn test_runtime_creation_private_factory_rejects_engine_mismatch() {
+        let temp_dir = tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
+        let mismatched_engine = super::super::PluginEngine::for_runtime().unwrap();
+        let backend = MockCredentialBackend::new(true);
+        let credential_store = Arc::new(
+            CredentialStore::new(backend, temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+
+        let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
+            RuntimeInitInputs {
+                plugin_engine: mismatched_engine,
+                loader,
+                credential_store,
+                rate_limiters: Arc::new(RateLimiterRegistry::new()),
+                ssrf_config: SsrfConfig::default(),
+                sandbox_config: crate::plugins::sandbox::SandboxConfig::default(),
+                permission_config: PermissionConfig::default(),
+            },
+            |_engine, _interval| {
+                Err(RuntimeError::ThreadSpawn {
+                    source: StartupThreadSpawnError::new(
+                        EPOCH_TICKER_THREAD_NAME,
+                        io::Error::other("unexpected ticker startup"),
+                    ),
+                })
+            },
+        ) {
+            Ok(_) => panic!("private runtime factory should reject mismatched plugin engines"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, RuntimeError::EngineMismatch));
     }
 
     #[tokio::test]
