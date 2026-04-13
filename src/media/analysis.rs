@@ -568,6 +568,17 @@ impl MediaAnalyzer for GoogleCloudMediaAnalyzer {
             return Err(AnalysisError::EmptyData);
         }
 
+        // The synchronous Google Cloud Speech-to-Text API has a strict 10MB base64 request size limit.
+        // Base64 encoding increases size by ~33%, meaning raw audio must be < 7.5MB.
+        // We reject inputs > 7MB proactively with a clear error.
+        const MAX_SYNC_AUDIO_BYTES: usize = 7 * 1024 * 1024;
+        if audio_data.len() > MAX_SYNC_AUDIO_BYTES {
+            return Err(AnalysisError::ApiRequest(format!(
+                "audio data size ({} bytes) exceeds the Google Cloud synchronous API limit (~7MB). Please use shorter audio files.",
+                audio_data.len()
+            )));
+        }
+
         // Validate that this is an audio MIME type
         if !mime_type.to_lowercase().starts_with("audio/") {
             return Err(AnalysisError::UnsupportedMediaType(format!(
