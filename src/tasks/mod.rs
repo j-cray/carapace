@@ -302,6 +302,33 @@ impl TaskQueue {
         task
     }
 
+    /// Add a new task that starts already claimed in `running` state.
+    ///
+    /// This is for call sites that durably persist work before executing it
+    /// inline, while still relying on queue recovery to resume the work after
+    /// a crash or restart.
+    pub fn enqueue_running_with_policy(&self, payload: Value, policy: TaskPolicy) -> DurableTask {
+        let now = now_ms();
+        let mut task = self.build_task(
+            payload,
+            BuildTaskParams {
+                state: TaskState::Running,
+                next_run_at_ms: None,
+                last_error: None,
+                policy,
+                blocked_reason: None,
+                now,
+            },
+        );
+        task.attempts = 1;
+
+        self.insert_task(&mut task, now);
+        if task.state == TaskState::Failed {
+            task.attempts = 0;
+        }
+        task
+    }
+
     /// Add a new task that starts in `blocked` state.
     pub fn enqueue_blocked_with_policy(
         &self,
@@ -487,6 +514,45 @@ impl TaskQueue {
         }
     }
 
+    /// Async-safe enqueue wrapper for tasks that start already claimed in
+    /// `running` state.
+    pub async fn enqueue_running_async_with_policy(
+        self: &Arc<Self>,
+        payload: Value,
+        policy: TaskPolicy,
+    ) -> DurableTask {
+        let queue = Arc::clone(self);
+        let payload_fallback = payload.clone();
+        let policy_fallback = policy.clone();
+        match tokio::task::spawn_blocking(move || {
+            queue.enqueue_running_with_policy(payload, policy)
+        })
+        .await
+        {
+            Ok(task) => task,
+            Err(err) => {
+                warn!(error = %err, "enqueue worker failed");
+                warn!(
+                    "falling back to a dedicated running-task enqueue thread after enqueue worker failure"
+                );
+                let fallback_task = self.build_failed_enqueue_task(
+                    payload_fallback.clone(),
+                    policy_fallback.clone(),
+                    None,
+                );
+                self.enqueue_via_dedicated_thread(
+                    "task-queue-running-enqueue-fallback",
+                    move |queue_fallback| {
+                        queue_fallback
+                            .enqueue_running_with_policy(payload_fallback, policy_fallback)
+                    },
+                    fallback_task,
+                )
+                .await
+            }
+        }
+    }
+
     /// Async-safe enqueue wrapper that starts the task in `blocked` state.
     pub async fn enqueue_blocked_async_with_policy(
         self: &Arc<Self>,
@@ -592,28 +658,6 @@ impl TaskQueue {
         }
 
         if !claimed.is_empty() {
-            self.flush_to_disk();
-        }
-        claimed
-    }
-
-    /// Claim one specific due task and move it to `running`.
-    pub fn claim_task(&self, id: &str, now: u64) -> Option<DurableTask> {
-        let mut claimed = None;
-        {
-            let mut tasks = self.tasks.write();
-            if let Some(task) = tasks.iter_mut().find(|task| task.id == id) {
-                if is_due(task, now) {
-                    task.state = TaskState::Running;
-                    task.attempts = task.attempts.saturating_add(1);
-                    task.next_run_at_ms = None;
-                    task.updated_at_ms = now;
-                    claimed = Some(task.clone());
-                }
-            }
-        }
-
-        if claimed.is_some() {
             self.flush_to_disk();
         }
         claimed
@@ -1129,16 +1173,16 @@ mod tests {
     }
 
     #[test]
-    fn test_claim_task_marks_specific_due_task_running_and_increments_attempts() {
+    fn test_enqueue_running_with_policy_marks_task_running_and_increments_attempts() {
         let queue = TaskQueue::in_memory();
-        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), Some(1));
+        let task = queue
+            .enqueue_running_with_policy(serde_json::json!({"kind":"demo"}), TaskPolicy::default());
 
-        let claimed = queue
-            .claim_task(&task.id, 10)
-            .expect("specific due task should be claimable");
-        assert_eq!(claimed.id, task.id);
-        assert_eq!(claimed.state, TaskState::Running);
-        assert_eq!(claimed.attempts, 1);
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.attempts, 1);
+        let stored = queue.get(&task.id).expect("task should be persisted");
+        assert_eq!(stored.state, TaskState::Running);
+        assert_eq!(stored.attempts, 1);
     }
 
     #[test]

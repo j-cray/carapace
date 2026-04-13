@@ -561,6 +561,20 @@ impl ActivityService {
             .await
     }
 
+    async fn persist_running_read_receipt_task(
+        &self,
+        channel_id: &str,
+        ctx: ReadReceiptContext,
+    ) -> crate::tasks::DurableTask {
+        self.read_receipt_queue
+            .enqueue_running_async_with_policy(
+                serde_json::to_value(ReadReceiptTaskPayload::new(channel_id, ctx))
+                    .expect("read receipt task payload should serialize"),
+                crate::tasks::TaskPolicy::default(),
+            )
+            .await
+    }
+
     pub async fn enqueue_ready_read_receipt(
         &self,
         channel_id: &str,
@@ -581,19 +595,6 @@ impl ActivityService {
             self.read_receipt_wake.notify_one();
             Some(task.id)
         }
-    }
-
-    async fn claim_ready_read_receipt_task(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<crate::tasks::DurableTask>, String> {
-        tokio::task::spawn_blocking({
-            let queue = self.read_receipt_queue.clone();
-            let task_id = task_id.to_string();
-            move || queue.claim_task(&task_id, crate::time::unix_now_ms_u64())
-        })
-        .await
-        .map_err(|err| format!("read receipt inline-claim worker failed: {err}"))
     }
 
     async fn finalize_read_receipt_task(
@@ -669,22 +670,15 @@ impl ActivityService {
         ctx: ReadReceiptContext,
     ) -> Result<(), String> {
         let task = self
-            .persist_ready_read_receipt_task(channel_id, ctx.clone())
+            .persist_running_read_receipt_task(channel_id, ctx.clone())
             .await;
         if task.state != crate::tasks::TaskState::Failed {
             let task_id = task.id.clone();
-            let Some(claimed_task) = self.claim_ready_read_receipt_task(&task_id).await? else {
-                return Err(format!(
-                    "failed to claim newly persisted read receipt task '{}' for immediate dispatch",
-                    task_id
-                ));
-            };
-            let outcome = execute_read_receipt_task(state, claimed_task).await;
+            let outcome = execute_read_receipt_task(state, task).await;
             self.finalize_read_receipt_task(&task_id, &outcome).await?;
             return match outcome {
-                TaskExecutionOutcome::Done { .. } | TaskExecutionOutcome::RetryWait { .. } => {
-                    Ok(())
-                }
+                TaskExecutionOutcome::Done { .. } => Ok(()),
+                TaskExecutionOutcome::RetryWait { error, .. } => Err(error),
                 TaskExecutionOutcome::Blocked { reason, .. } => Err(reason),
                 TaskExecutionOutcome::Failed { error } => Err(error),
                 TaskExecutionOutcome::Cancelled { reason } => Err(reason.unwrap_or_else(|| {
@@ -3348,6 +3342,36 @@ mod tests {
             .expect("completion task should join cleanly")
             .expect("direct-send fallback should succeed");
         assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_acknowledge_read_receipt_now_returns_err_when_retry_is_scheduled() {
+        let service = Arc::new(ActivityService::new());
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_activity_service(service.clone()),
+        );
+
+        let err = service
+            .acknowledge_read_receipt_now(
+                state.as_ref(),
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("retryable inline dispatch should not report success");
+
+        assert!(
+            err.contains("plugin registry unavailable"),
+            "retryable error should surface the underlying dispatch reason"
+        );
+        let tasks = service.read_receipt_queue().list();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, crate::tasks::TaskState::RetryWait);
     }
 
     #[tokio::test(flavor = "current_thread")]
