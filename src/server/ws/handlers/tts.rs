@@ -271,13 +271,23 @@ async fn google_tts_request(
     format: &str,
     speed: f64,
 ) -> Result<bytes::Bytes, ErrorShape> {
-    // Apply basic mapping for formats. The user's requested format ("mp3", "opus", "aac", "flac") maps to Google's AudioEncoding.
-    // Google supports MP3, OGG_OPUS, MULAW, ALAW, LINEAR16, FLAC
+    // Map requested format to Google Cloud TTS AudioEncoding.
+    // Avoid magic strings by defining constants for supported formats.
+    const ENCODING_MP3: &str = "MP3";
+    const ENCODING_OGG_OPUS: &str = "OGG_OPUS";
+    const ENCODING_FLAC: &str = "FLAC";
+    const ENCODING_LINEAR16: &str = "LINEAR16";
+    const ENCODING_MULAW: &str = "MULAW";
+    const ENCODING_ALAW: &str = "ALAW";
+
     let audio_encoding = match format {
-        "mp3" | "aac" => "MP3",
-        "opus" => "OGG_OPUS",
-        "flac" => "FLAC",
-        _ => "MP3",
+        "opus" | "ogg_opus" => ENCODING_OGG_OPUS,
+        "flac" => ENCODING_FLAC,
+        "wav" | "linear16" | "pcm" => ENCODING_LINEAR16,
+        "mulaw" => ENCODING_MULAW,
+        "alaw" => ENCODING_ALAW,
+        "mp3" | "aac" => ENCODING_MP3,
+        _ => ENCODING_MP3,
     };
 
     // Voice name logic. e.g. en-US-Journey-O determines language code en-US
