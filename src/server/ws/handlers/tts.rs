@@ -261,35 +261,11 @@ async fn openai_tts_request(
     })
 }
 
-/// Resolve GCP ADC token from metadata server
+/// Resolve GCP ADC token from metadata server using the shared utility
 async fn resolve_gcp_adc_token() -> Result<String, ErrorShape> {
-    let client = reqwest::Client::new();
-    let response = client
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
-        .header("Metadata-Flavor", "Google")
-        .send()
+    crate::gcp::resolve_gcp_adc_token()
         .await
-        .map_err(|e| error_shape(ERROR_UNAVAILABLE, &format!("failed to contact GCP metadata server: {}", e), None))?;
-
-    if !response.status().is_success() {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("GCP metadata server returned {}", response.status()),
-            None,
-        ));
-    }
-
-    let json: Value = response.json().await.map_err(|e| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to parse GCP metadata: {}", e),
-            None,
-        )
-    })?;
-    json.get("access_token")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| error_shape(ERROR_UNAVAILABLE, "GCP metadata missing access_token", None))
+        .map_err(|e| error_shape(ERROR_UNAVAILABLE, &e, None))
 }
 
 /// Call the Google Cloud TTS API and return raw audio bytes

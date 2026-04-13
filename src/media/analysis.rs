@@ -530,28 +530,9 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
 
 /// Resolve GCP ADC token from metadata server
 async fn resolve_gcp_adc_token() -> Result<String, AnalysisError> {
-    let client = reqwest::Client::new();
-    let response = client
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
-        .header("Metadata-Flavor", "Google")
-        .send()
+    crate::gcp::resolve_gcp_adc_token()
         .await
-        .map_err(|e| AnalysisError::ApiRequest(format!("failed to contact GCP metadata server: {}", e)))?;
-
-    if !response.status().is_success() {
-        return Err(AnalysisError::ApiRequest(format!(
-            "GCP metadata server returned {}",
-            response.status()
-        )));
-    }
-
-    let json: serde_json::Value = response.json().await.map_err(|e| {
-        AnalysisError::ParseResponse(format!("failed to parse GCP metadata: {}", e))
-    })?;
-    json.get("access_token")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| AnalysisError::ApiRequest("GCP metadata missing access_token".to_string()))
+        .map_err(AnalysisError::ApiRequest)
 }
 
 /// Google Cloud Speech-to-Text analyzer.

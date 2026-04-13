@@ -15,6 +15,7 @@ pub mod devices;
 pub mod discovery;
 pub mod exec;
 pub mod gateway;
+pub mod gcp;
 pub mod hooks;
 pub mod links;
 pub mod logging;
