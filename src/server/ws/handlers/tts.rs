@@ -22,6 +22,9 @@ pub const SYSTEM_VOICES: [&str; 6] = ["samantha", "alex", "victoria", "karen", "
 /// Global TTS state
 static TTS_STATE: LazyLock<RwLock<TtsState>> = LazyLock::new(|| RwLock::new(TtsState::default()));
 
+/// Shared HTTP client for TTS requests
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+
 /// TTS configuration state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsState {
@@ -219,7 +222,6 @@ async fn openai_tts_request(
     format: &str,
     speed: f64,
 ) -> Result<bytes::Bytes, ErrorShape> {
-    let client = reqwest::Client::new();
     let body = json!({
         "model": "tts-1",
         "input": text,
@@ -228,7 +230,7 @@ async fn openai_tts_request(
         "speed": speed.clamp(0.25, 4.0)
     });
 
-    let response = client
+    let response = HTTP_CLIENT
         .post("https://api.openai.com/v1/audio/speech")
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&body)
@@ -276,7 +278,6 @@ async fn google_tts_request(
     format: &str,
     speed: f64,
 ) -> Result<bytes::Bytes, ErrorShape> {
-    let client = reqwest::Client::new();
     // Apply basic mapping for formats. The user's requested format ("mp3", "opus", "aac", "flac") maps to Google's AudioEncoding.
     // Google supports MP3, OGG_OPUS, MULAW, ALAW, LINEAR16, FLAC
     let audio_encoding = match format {
@@ -307,7 +308,7 @@ async fn google_tts_request(
         }
     });
 
-    let response = client
+    let response = HTTP_CLIENT
         .post("https://texttospeech.googleapis.com/v1/text:synthesize")
         .header("Authorization", format!("Bearer {}", token))
         .json(&body)
