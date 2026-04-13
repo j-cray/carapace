@@ -145,7 +145,7 @@ Notes:
 - Control UI also supports Gemini onboarding with either Google sign-in or API key.
 - Gemini onboarding stores the Google OAuth client secret with the auth profile; it is not written into `config.json5`.
 - Gemini Google sign-in requires `CARAPACE_CONFIG_PASSWORD` so the stored auth profile is encrypted at rest.
-- When `google` is set as the active provider in `talk.defaultProvider` or `models.providers.defaultStt`, Carapace can natively perform Text-to-Speech and Speech-to-Text inference by automatically pulling an Application Default Credential (ADC) from the local GCP Metadata Server. This means ZERO configuration is required out of the box so long as the runtime Service Account has `roles/cloudspeech.client` and the TTS/STT APIs are enabled.
+- When `google` is set as the active provider in `talk.defaultProvider` or `models.providers.defaultStt`, Carapace can natively perform Text-to-Speech and Speech-to-Text inference by automatically pulling an Application Default Credential (ADC) from the local GCP Metadata Server. This means ZERO configuration is required out of the box so long as the runtime Service Account has `roles/cloudspeech.client` for Cloud Speech-to-Text and `roles/texttospeech.client` (or equivalent permissions) for Cloud Text-to-Speech, and both the Cloud Speech-to-Text and Cloud Text-to-Speech APIs are enabled.
 
 ```bash
 export AWS_REGION='us-east-1'
