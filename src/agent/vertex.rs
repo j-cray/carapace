@@ -228,6 +228,8 @@ pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
 
     // Convert LlmMessages to Gemini contents format
     let mut contents: Vec<Value> = Vec::new();
+    let mut current_role: Option<&'static str> = None;
+    let mut current_parts: Vec<Value> = Vec::new();
 
     for msg in &request.messages {
         let role = match msg.role {
@@ -279,11 +281,26 @@ pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
         }
 
         if !parts.is_empty() {
-            contents.push(json!({
-                "role": role,
-                "parts": parts,
-            }));
+            if Some(role) == current_role {
+                current_parts.extend(parts);
+            } else {
+                if let Some(r) = current_role {
+                    contents.push(json!({
+                        "role": r,
+                        "parts": std::mem::take(&mut current_parts),
+                    }));
+                }
+                current_role = Some(role);
+                current_parts = parts;
+            }
         }
+    }
+
+    if let Some(r) = current_role {
+        contents.push(json!({
+            "role": r,
+            "parts": current_parts,
+        }));
     }
 
     body["contents"] = json!(contents);
