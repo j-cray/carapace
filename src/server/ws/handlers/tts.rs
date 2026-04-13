@@ -191,9 +191,18 @@ fn resolve_openai_api_key() -> Option<String> {
 ///
 /// Returns the format string to use with the OpenAI API. If `raw` is `None`
 /// the default format `"mp3"` is returned.
-fn validate_audio_format(raw: Option<&str>) -> Result<&'static str, ErrorShape> {
+fn validate_audio_format(
+    raw: Option<&str>,
+    channel: Option<&str>,
+) -> Result<&'static str, ErrorShape> {
     match raw {
-        None => Ok("mp3"),
+        None => {
+            if channel.unwrap_or("").eq_ignore_ascii_case("signal") {
+                Ok("opus")
+            } else {
+                Ok("mp3")
+            }
+        }
         Some(f) => {
             let lower = f.trim();
             OPENAI_AUDIO_FORMATS
@@ -397,7 +406,10 @@ pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, 
     let requested_format = params
         .and_then(|v| v.get("format"))
         .and_then(|v| v.as_str());
-    let audio_format = validate_audio_format(requested_format)?;
+    let channel = params
+        .and_then(|v| v.get("channel"))
+        .and_then(|v| v.as_str());
+    let audio_format = validate_audio_format(requested_format, channel)?;
 
     // Read state in a block so the parking_lot guard (which is !Send) is
     // dropped before any await point.
@@ -846,29 +858,39 @@ mod tests {
 
     #[test]
     fn test_validate_audio_format_default() {
-        let result = validate_audio_format(None).unwrap();
+        let result = validate_audio_format(None, None).unwrap();
+        assert_eq!(result, "mp3");
+    }
+
+    #[test]
+    fn test_validate_audio_format_channel_signal_defaults_to_opus() {
+        let result = validate_audio_format(None, Some("signal")).unwrap();
+        assert_eq!(result, "opus");
+        let result = validate_audio_format(None, Some("SIGNAL")).unwrap();
+        assert_eq!(result, "opus");
+        let result = validate_audio_format(None, Some("discord")).unwrap();
         assert_eq!(result, "mp3");
     }
 
     #[test]
     fn test_validate_audio_format_all_supported() {
         for fmt in &OPENAI_AUDIO_FORMATS {
-            let result = validate_audio_format(Some(fmt)).unwrap();
+            let result = validate_audio_format(Some(fmt), None).unwrap();
             assert_eq!(result, *fmt);
         }
     }
 
     #[test]
     fn test_validate_audio_format_case_insensitive() {
-        assert_eq!(validate_audio_format(Some("MP3")).unwrap(), "mp3");
-        assert_eq!(validate_audio_format(Some("Opus")).unwrap(), "opus");
-        assert_eq!(validate_audio_format(Some("AAC")).unwrap(), "aac");
-        assert_eq!(validate_audio_format(Some("FLAC")).unwrap(), "flac");
+        assert_eq!(validate_audio_format(Some("MP3"), None).unwrap(), "mp3");
+        assert_eq!(validate_audio_format(Some("Opus"), None).unwrap(), "opus");
+        assert_eq!(validate_audio_format(Some("AAC"), None).unwrap(), "aac");
+        assert_eq!(validate_audio_format(Some("FLAC"), None).unwrap(), "flac");
     }
 
     #[test]
     fn test_validate_audio_format_invalid() {
-        let result = validate_audio_format(Some("wav"));
+        let result = validate_audio_format(Some("wav"), None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
