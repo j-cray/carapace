@@ -281,10 +281,12 @@ async fn google_tts_request(
     };
 
     // Voice name logic. e.g. en-US-Journey-O determines language code en-US
-    let language_code = if voice.len() >= 5 && &voice[2..3] == "-" {
-        &voice[0..5]
-    } else {
-        "en-US"
+    let mut voice_parts = voice.split('-');
+    let language_code = match (voice_parts.next(), voice_parts.next()) {
+        (Some(language), Some(region)) if language.len() == 2 && !region.is_empty() => {
+            format!("{}-{}", language, region)
+        }
+        _ => "en-US".to_string(),
     };
 
     let body = json!({
