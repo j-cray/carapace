@@ -564,7 +564,14 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
         let read_receipts_path = format!("{}.readReceipts", path);
         if let Some(read_receipts_obj) = read_receipts.as_object() {
             for key in read_receipts_obj.keys() {
-                if !matches!(key.as_str(), "enabled" | "mode") {
+                if key == "mode" {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!("{}.mode", read_receipts_path),
+                        message: "readReceipts mode is no longer supported; remove this key"
+                            .to_string(),
+                    });
+                } else if key != "enabled" {
                     issues.push(SchemaIssue {
                         severity: Severity::Warning,
                         path: format!("{}.{}", read_receipts_path, key),
@@ -580,31 +587,6 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
                         message: "readReceipts enabled must be a boolean".to_string(),
                     });
                 }
-            }
-
-            if let Some(mode) = read_receipts_obj
-                .get("mode")
-                .and_then(|value| value.as_str())
-            {
-                if mode != "after-response" {
-                    issues.push(SchemaIssue {
-                        severity: Severity::Warning,
-                        path: format!("{}.mode", read_receipts_path),
-                        message: format!(
-                            "readReceipts mode should be \"after-response\", got \"{}\"",
-                            mode
-                        ),
-                    });
-                }
-            } else if let Some(mode) = read_receipts_obj.get("mode") {
-                issues.push(SchemaIssue {
-                    severity: Severity::Warning,
-                    path: format!("{}.mode", read_receipts_path),
-                    message: format!(
-                        "readReceipts mode must be a string, got {}",
-                        json_type_label(mode)
-                    ),
-                });
             }
         } else {
             issues.push(SchemaIssue {
@@ -2903,8 +2885,7 @@ mod tests {
                             "intervalSeconds": 3
                         },
                         "readReceipts": {
-                            "enabled": false,
-                            "mode": "after-response"
+                            "enabled": false
                         }
                     }
                 },
@@ -2915,8 +2896,7 @@ mod tests {
                             "intervalSeconds": 7
                         },
                         "readReceipts": {
-                            "enabled": true,
-                            "mode": "after-response"
+                            "enabled": true
                         }
                     }
                 }

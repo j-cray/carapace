@@ -16,7 +16,7 @@ use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata
 pub struct InboundDispatchOptions {
     pub delivery_recipient_id: Option<String>,
     pub typing_context: Option<TypingContext>,
-    pub read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
+    pub claimed_read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +67,12 @@ pub async fn dispatch_inbound_text_with_options(
         peer_id
     };
 
-    let delivery_recipient_id = options.delivery_recipient_id.or_else(|| chat_id.clone());
+    let InboundDispatchOptions {
+        delivery_recipient_id,
+        typing_context,
+        claimed_read_receipt,
+    } = options;
+    let delivery_recipient_id = delivery_recipient_id.or_else(|| chat_id.clone());
     let metadata = SessionMetadata {
         channel: Some(channel.to_string()),
         user_id: Some(sender_id.to_string()),
@@ -85,7 +90,14 @@ pub async fn dispatch_inbound_text_with_options(
         None,
         metadata,
     )
-    .map_err(|e| format!("failed to get/create session: {}", e))?;
+    .map_err(|e| {
+        if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
+            state
+                .activity_service()
+                .withhold_claimed_read_receipt(claimed_read_receipt);
+        }
+        format!("failed to get/create session: {}", e)
+    })?;
 
     if let Err(e) = crate::sessions::append_message_blocking(
         state.session_store().clone(),
@@ -93,7 +105,26 @@ pub async fn dispatch_inbound_text_with_options(
     )
     .await
     {
+        if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
+            state
+                .activity_service()
+                .withhold_claimed_read_receipt(claimed_read_receipt);
+        }
         return Err(format!("failed to append message: {}", e));
+    }
+
+    if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
+        if let Err(err) = state
+            .activity_service()
+            .complete_claimed_read_receipt(state.as_ref(), claimed_read_receipt)
+            .await
+        {
+            warn!(
+                channel = %claimed_read_receipt.channel_id(),
+                error = %err,
+                "failed to complete explicit read receipt after durable inbound append"
+            );
+        }
     }
 
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -102,7 +133,7 @@ pub async fn dispatch_inbound_text_with_options(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let typing_context = options.typing_context.or_else(|| {
+    let typing_context = typing_context.or_else(|| {
         delivery_recipient_id
             .clone()
             .or_else(|| session.metadata.chat_id.clone())
@@ -117,7 +148,6 @@ pub async fn dispatch_inbound_text_with_options(
         session_key: session.session_key.clone(),
         delivery_recipient_id,
         typing_context,
-        read_receipt: options.read_receipt,
         status: AgentRunStatus::Queued,
         message: text.to_string(),
         response: String::new(),

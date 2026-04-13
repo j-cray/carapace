@@ -9,11 +9,12 @@
 //! - shutdown closes intake first, then drains already-queued work until a
 //!   deadline, joining the real worker threads directly.
 //! - work still queued after the deadline is dropped explicitly with logging.
-//! - receive time claims and delivery-time durable obligations are separate
-//!   typed states owned by `ActivityService`; outbound delivery only ever
-//!   carries a durable read-receipt task.
-//! - read receipts are committed as non-lossy in-process obligations so
-//!   successful delivery never waits on receipt-worker capacity.
+//! - receive-time claims are completed immediately after durable inbound append;
+//!   outbound delivery never carries read-receipt state.
+//! - read receipts are committed as non-lossy in-process obligations so inbound
+//!   append never waits on receipt-worker capacity.
+//! - persisted read-receipt task state is versioned by task kind; legacy queue
+//!   state is rejected at startup instead of being migrated or reinterpreted.
 //! - activity-capable channel implementations must bound their own blocking
 //!   I/O; the dispatcher does not spawn detached per-operation timeout threads.
 //! - config reload only affects future polls/messages because each receive loop
@@ -47,7 +48,7 @@ use crate::plugins::{
 };
 use crate::runtime_bridge::run_sync_blocking_send;
 use crate::server::ws::WsServerState;
-use crate::tasks::{TaskBlockedReason, TaskExecutionOutcome, TaskExecutor, TaskQueue};
+use crate::tasks::{TaskExecutionOutcome, TaskExecutor, TaskQueue};
 use crate::thread_util::{spawn_startup_named_thread_with_spawner, NamedThreadSpawner};
 use crate::StartupThreadSpawnError;
 
@@ -58,22 +59,8 @@ const ACTIVITY_BLOCKING_IO_MAX_SECS: u64 = 5;
 const ACTIVITY_DISPATCH_SHUTDOWN_HEADROOM_MS: u64 = 500;
 const READ_RECEIPT_RETRY_DELAY_MS: u64 = 5_000;
 const READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK: usize = 10_000;
-const READ_RECEIPT_PENDING_REASON: &str = "waiting for successful response delivery";
-pub(crate) const READ_RECEIPT_WITHHELD_RESPONSE_QUEUE_FAILED_REASON: &str =
-    "withholding explicit read receipt because the agent response could not be queued for delivery";
-pub(crate) const READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON: &str =
-    "withholding explicit read receipt because inbound Signal dispatch failed";
-pub(crate) const READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON: &str =
-    "withholding explicit read receipt because the queued response expired before delivery";
-pub(crate) const READ_RECEIPT_WITHHELD_HOOK_CANCELLED_REASON: &str =
-    "withholding explicit read receipt because a hook cancelled the queued response before delivery";
-pub(crate) const READ_RECEIPT_WITHHELD_PLUGIN_MISSING_REASON: &str =
-    "withholding explicit read receipt because no channel plugin was available for delivery";
-pub(crate) const READ_RECEIPT_WITHHELD_DELIVERY_FAILED_REASON: &str =
-    "withholding explicit read receipt because response delivery failed";
-pub(crate) const READ_RECEIPT_WITHHELD_DELIVERY_CALL_FAILED_REASON: &str =
-    "withholding explicit read receipt because the channel delivery call failed";
-const READ_RECEIPT_TASK_KIND: &str = "activityReadReceipt";
+const READ_RECEIPT_TASK_KIND: &str = "activityReadReceiptIngestV2";
+const LEGACY_READ_RECEIPT_TASK_KIND: &str = "activityReadReceipt";
 // This budget must stay at or above the longest built-in activity operation
 // timeout so graceful shutdown drains already-queued work instead of routinely
 // dropping it. Built-in channel activity implementations must keep their own
@@ -199,16 +186,6 @@ pub enum TypingMode {
     Thinking,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReadReceiptMode {
-    // Carapace sends an explicit receipt only after the assistant response has
-    // been delivered successfully. Failed or cancelled runs intentionally
-    // leave the inbound message unread.
-    #[default]
-    AfterResponse,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TypingFeaturePolicy {
@@ -227,20 +204,10 @@ impl Default for TypingFeaturePolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadReceiptFeaturePolicy {
     pub enabled: bool,
-    pub mode: ReadReceiptMode,
-}
-
-impl Default for ReadReceiptFeaturePolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mode: ReadReceiptMode::AfterResponse,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -253,10 +220,9 @@ pub struct ChannelActivityPolicy {
 /// Receive-time explicit read-receipt ownership claim.
 ///
 /// Signal receive decides whether Carapace owns the receipt for this inbound
-/// message. The claim is carried through dispatch/run evaluation and, when the
+/// message. The claim is resolved at inbound append time and, when the
 /// activity service issued it, also reserves bounded receipt ownership
-/// capacity until it is released or promoted into a durable after-response
-/// obligation.
+/// capacity until it is released or completed.
 #[derive(Debug, Clone)]
 pub struct ClaimedReadReceipt {
     channel_id: String,
@@ -348,40 +314,6 @@ impl Drop for ReadReceiptOwnershipReservation {
         for reservation_id in self.reservation_ids.drain(..) {
             reserved_read_receipt_ownership.remove(&reservation_id);
         }
-    }
-}
-
-/// Durable after-response read-receipt obligation attached to queued delivery.
-#[derive(Debug, Clone)]
-pub struct OwnedReadReceipt {
-    channel_id: String,
-    context: ReadReceiptContext,
-    task_id: String,
-}
-
-impl OwnedReadReceipt {
-    pub fn new(
-        channel_id: impl Into<String>,
-        context: ReadReceiptContext,
-        task_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            channel_id: channel_id.into(),
-            context,
-            task_id: task_id.into(),
-        }
-    }
-
-    pub fn channel_id(&self) -> &str {
-        &self.channel_id
-    }
-
-    pub fn context(&self) -> &ReadReceiptContext {
-        &self.context
-    }
-
-    pub fn task_id(&self) -> &str {
-        &self.task_id
     }
 }
 
@@ -483,14 +415,6 @@ impl ActivityService {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_backlog_warning_threshold(backlog_warning_threshold: usize) -> Self {
-        Self::with_limits_for_test(
-            backlog_warning_threshold,
-            READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK,
-        )
-    }
-
-    #[cfg(test)]
     pub(crate) fn with_limits_for_test(
         backlog_warning_threshold: usize,
         read_receipt_ownership_high_watermark: usize,
@@ -516,33 +440,6 @@ impl ActivityService {
 
     pub fn read_receipt_queue(&self) -> &Arc<TaskQueue> {
         &self.read_receipt_queue
-    }
-
-    pub async fn enqueue_after_response_read_receipt(
-        &self,
-        channel_id: &str,
-        ctx: ReadReceiptContext,
-    ) -> Option<String> {
-        let task = self
-            .read_receipt_queue
-            .enqueue_blocked_async_with_policy(
-                serde_json::to_value(ReadReceiptTaskPayload::new(channel_id, ctx))
-                    .expect("read receipt task payload should serialize"),
-                READ_RECEIPT_PENDING_REASON,
-                TaskBlockedReason::ExternalDependency,
-                crate::tasks::TaskPolicy::default(),
-            )
-            .await;
-        if task.state == crate::tasks::TaskState::Failed {
-            tracing::warn!(
-                channel = %channel_id,
-                error = ?task.last_error,
-                "failed to persist after-response read receipt obligation"
-            );
-            None
-        } else {
-            Some(task.id)
-        }
     }
 
     pub fn try_claim_read_receipt(
@@ -611,28 +508,14 @@ impl ActivityService {
         self.release_claimed_read_receipt_reservation(claim)
     }
 
-    pub async fn prepare_after_response_read_receipt(
+    pub async fn complete_claimed_read_receipt(
         &self,
+        state: &WsServerState,
         claim: &ClaimedReadReceipt,
-    ) -> Result<OwnedReadReceipt, String> {
-        let channel_id = claim.channel_id().to_string();
-        let context = claim.context().clone();
-        match self
-            .enqueue_after_response_read_receipt(&channel_id, context.clone())
+    ) -> Result<(), String> {
+        let _ = self.release_claimed_read_receipt_reservation(claim);
+        self.acknowledge_read_receipt_now(state, claim.channel_id(), claim.context().clone())
             .await
-        {
-            Some(task_id) => {
-                let _ = self.release_claimed_read_receipt_reservation(claim);
-                Ok(OwnedReadReceipt::new(channel_id, context, task_id))
-            }
-            None => {
-                let _ = self.release_claimed_read_receipt_reservation(claim);
-                Err(
-                    "failed to durably persist the after-response read receipt obligation before delivery queueing"
-                        .to_string(),
-                )
-            }
-        }
     }
 
     pub async fn enqueue_ready_read_receipt(
@@ -685,115 +568,35 @@ impl ActivityService {
         send_read_receipt_immediately(state, channel_id, ctx).await
     }
 
-    pub async fn activate_read_receipt(&self, task_id: &str) {
-        let task_id = task_id.to_string();
-        let task_id_for_log = task_id.clone();
-        let queue = self.read_receipt_queue.clone();
-        match tokio::task::spawn_blocking(move || {
-            queue.resume_blocked_task(&task_id, 0, "response delivered")
-        })
-        .await
-        {
-            Ok(true) => {
-                self.read_receipt_wake.notify_one();
-            }
-            Ok(false) => tracing::warn!(
-                task_id = %task_id_for_log,
-                "failed to activate read receipt obligation after successful delivery"
-            ),
-            Err(err) => tracing::warn!(
-                task_id = %task_id_for_log,
-                error = %err,
-                "read receipt activation worker failed"
-            ),
-        }
-    }
-
-    pub async fn withhold_read_receipt(&self, task_id: &str, reason: &str) {
-        let task_id = task_id.to_string();
-        let reason = reason.to_string();
-        let task_id_for_log = task_id.clone();
-        let reason_for_log = reason.clone();
-        let queue = self.read_receipt_queue.clone();
-        match tokio::task::spawn_blocking(move || queue.mark_cancelled(&task_id, Some(&reason)))
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                task_id = %task_id_for_log,
-                reason = %reason_for_log,
-                "failed to mark read receipt obligation as withheld"
-            ),
-            Err(err) => tracing::warn!(
-                task_id = %task_id_for_log,
-                error = %err,
-                "read receipt withholding worker failed"
-            ),
-        }
-    }
-
-    pub async fn withhold_owned_read_receipt(&self, receipt: &OwnedReadReceipt, reason: &str) {
-        self.withhold_read_receipt(receipt.task_id(), reason).await;
-    }
-
-    pub async fn complete_owned_read_receipt_after_delivery(&self, receipt: &OwnedReadReceipt) {
-        self.activate_read_receipt(receipt.task_id()).await;
-    }
-
-    pub async fn complete_claimed_read_receipt_without_run(
+    pub fn reject_legacy_persisted_read_receipt_tasks(
         &self,
-        state: &WsServerState,
-        claim: &ClaimedReadReceipt,
-    ) {
-        let _ = self.release_claimed_read_receipt_reservation(claim);
-        if let Err(err) = self
-            .acknowledge_read_receipt_now(state, claim.channel_id(), claim.context().clone())
-            .await
-        {
-            tracing::error!(
-                channel = %claim.channel_id(),
-                error = %err,
-                "failed to complete a claimed read receipt when no run was spawned"
-            );
-        }
-    }
+        state_dir: &std::path::Path,
+    ) -> Result<(), String> {
+        let queue_path = state_dir.join("activity").join("read_receipts.json");
+        for task in self.read_receipt_queue.list() {
+            let payload = ReadReceiptTaskPayload::from_value(task.payload.clone()).map_err(|err| {
+                format!(
+                    "invalid persisted read receipt state in {}: {err}. Delete this file and restart",
+                    queue_path.display()
+                )
+            })?;
 
-    pub async fn cleanup_orphaned_blocked_read_receipts_after_restart(
-        &self,
-    ) -> Result<usize, String> {
-        let queue = self.read_receipt_queue.clone();
-        let cancelled = tokio::task::spawn_blocking(move || {
-            let blocked = queue.list_filtered(Some(crate::tasks::TaskState::Blocked), None).1;
-            let mut cancelled = 0usize;
-            for task in blocked {
-                let is_after_response_pending = task.blocked_reason
-                    == Some(TaskBlockedReason::ExternalDependency)
-                    && ReadReceiptTaskPayload::from_value(task.payload.clone())
-                        .is_ok_and(|payload| payload.kind == READ_RECEIPT_TASK_KIND);
-                if is_after_response_pending
-                    && queue.mark_cancelled(
-                        &task.id,
-                        Some("discarding blocked read receipt orphaned by restart before response delivery"),
-                    )
-                {
-                    cancelled += 1;
-                }
+            if payload.kind == READ_RECEIPT_TASK_KIND {
+                continue;
             }
-            cancelled
-        })
-        .await
-        .map_err(|err| {
-            format!("read receipt orphan cleanup worker failed during startup: {err}")
-        })?;
 
-        if cancelled > 0 {
-            tracing::warn!(
-                cancelled,
-                "cancelled blocked read receipt obligations orphaned by restart before response delivery"
-            );
+            let detail = if payload.kind == LEGACY_READ_RECEIPT_TASK_KIND {
+                "legacy read receipt task state".to_string()
+            } else {
+                format!("unsupported read receipt task kind '{}'", payload.kind)
+            };
+            return Err(format!(
+                "{detail} found in {}. Delete this file and restart",
+                queue_path.display()
+            ));
         }
 
-        Ok(cancelled)
+        Ok(())
     }
 
     pub fn dispatch_stop_typing(
@@ -1551,16 +1354,6 @@ fn apply_channel_activity_overrides(features: Option<&Value>, policy: &mut Chann
         if let Some(enabled) = receipts.get("enabled").and_then(|value| value.as_bool()) {
             policy.read_receipts.enabled = enabled;
         }
-        if let Some(mode) = receipts.get("mode").and_then(|value| value.as_str()) {
-            if mode.eq_ignore_ascii_case("after-response") {
-                policy.read_receipts.mode = ReadReceiptMode::AfterResponse;
-            } else {
-                tracing::warn!(
-                    mode = %mode,
-                    "unknown channels.*.features.readReceipts.mode value; ignoring"
-                );
-            }
-        }
     }
 }
 
@@ -2174,7 +1967,6 @@ mod tests {
             DEFAULT_TYPING_INTERVAL_SECONDS
         );
         assert!(!policy.read_receipts.enabled);
-        assert_eq!(policy.read_receipts.mode, ReadReceiptMode::AfterResponse);
     }
 
     #[test]
@@ -2220,8 +2012,7 @@ mod tests {
                                 "intervalSeconds": 11
                             },
                             "readReceipts": {
-                                "enabled": true,
-                                "mode": "after-response"
+                                "enabled": true
                             }
                         }
                     }
@@ -3258,7 +3049,7 @@ mod tests {
         assert!(service.can_accept_read_receipt_ownership("signal"));
 
         let first = service
-            .enqueue_after_response_read_receipt(
+            .enqueue_ready_read_receipt(
                 "signal",
                 ReadReceiptContext {
                     recipient: "+15551230001".to_string(),
@@ -3268,7 +3059,7 @@ mod tests {
             )
             .await;
         let second = service
-            .enqueue_after_response_read_receipt(
+            .enqueue_ready_read_receipt(
                 "signal",
                 ReadReceiptContext {
                     recipient: "+15551230002".to_string(),
@@ -3346,26 +3137,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_cleanup_orphaned_blocked_read_receipts_after_restart_cancels_pending_tasks() {
+    async fn test_reject_legacy_persisted_read_receipt_tasks_reports_delete_instruction() {
+        let temp = tempfile::tempdir().expect("tempdir");
         let service = ActivityService::new();
-        let orphaned = service
+        service
             .read_receipt_queue()
-            .enqueue_blocked_async_with_policy(
-                serde_json::to_value(ReadReceiptTaskPayload::new(
-                    "signal",
-                    ReadReceiptContext {
-                        recipient: "+15551234567".to_string(),
-                        timestamp: Some(123),
-                        ..Default::default()
-                    },
-                ))
-                .expect("read receipt task payload should serialize"),
-                READ_RECEIPT_PENDING_REASON,
-                TaskBlockedReason::ExternalDependency,
-                crate::tasks::TaskPolicy::default(),
+            .enqueue_async(
+                serde_json::json!({
+                    "kind": LEGACY_READ_RECEIPT_TASK_KIND,
+                    "channelId": "signal",
+                    "context": {
+                        "recipient": "+15551234567",
+                        "timestamp": 123
+                    }
+                }),
+                None,
             )
             .await;
-        let retained = service
+
+        let err = service
+            .reject_legacy_persisted_read_receipt_tasks(temp.path())
+            .expect_err("legacy persisted state should be rejected");
+        assert!(err.contains("legacy read receipt task state"));
+        assert!(err.contains("Delete this file and restart"));
+        assert!(err.contains("read_receipts.json"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_reject_legacy_persisted_read_receipt_tasks_accepts_current_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = ActivityService::new();
+        service
             .read_receipt_queue()
             .enqueue_async(
                 serde_json::to_value(ReadReceiptTaskPayload::new(
@@ -3381,24 +3183,8 @@ mod tests {
             )
             .await;
 
-        let cancelled = service
-            .cleanup_orphaned_blocked_read_receipts_after_restart()
-            .await
-            .expect("startup orphan cleanup should succeed");
-        assert_eq!(cancelled, 1);
-
-        let orphaned_task = service
-            .read_receipt_queue()
-            .get(&orphaned.id)
-            .expect("orphaned task should still be present for audit");
-        assert_eq!(orphaned_task.state, crate::tasks::TaskState::Cancelled);
-
-        let retained_task = service
-            .read_receipt_queue()
-            .get(&retained.id)
-            .expect("queued task should remain present");
-        assert_eq!(retained_task.state, crate::tasks::TaskState::Queued);
-
-        service.shutdown().await;
+        service
+            .reject_legacy_persisted_read_receipt_tasks(temp.path())
+            .expect("current persisted state should remain valid");
     }
 }
