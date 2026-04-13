@@ -659,6 +659,8 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn reset_state() {
+        // Ensure tests don't read the user's actual config to keep test results deterministic.
+        std::env::set_var("CARAPACE_CONFIG_PATH", "nonexistent_config_for_test.json5");
         let mut state = TTS_STATE.write();
         *state = TtsState::default();
     }
