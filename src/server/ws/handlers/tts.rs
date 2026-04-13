@@ -263,13 +263,6 @@ async fn openai_tts_request(
     })
 }
 
-/// Resolve GCP ADC token from metadata server using the shared utility
-async fn resolve_gcp_adc_token() -> Result<String, ErrorShape> {
-    crate::gcp::resolve_gcp_adc_token()
-        .await
-        .map_err(|e| error_shape(ERROR_UNAVAILABLE, &e, None))
-}
-
 /// Call the Google Cloud TTS API and return raw audio bytes
 async fn google_tts_request(
     token: &str,
@@ -436,7 +429,9 @@ pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, 
             "duration": null
         }));
     } else if provider == "google" {
-        let token = resolve_gcp_adc_token().await?;
+        let token = crate::gcp::resolve_gcp_adc_token(&HTTP_CLIENT)
+            .await
+            .map_err(|e| error_shape(ERROR_UNAVAILABLE, &e, None))?;
 
         // Use a default Journey voice for Google if none was set or if defaulting occurred to alloy
         let gcp_voice = if voice == "alloy" {

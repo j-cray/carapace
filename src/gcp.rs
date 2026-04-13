@@ -22,7 +22,7 @@ struct GcpTokenResponse {
 
 /// Resolve GCP Application Default Credentials (ADC) token from the metadata server.
 /// The token is cached until 5 minutes before its expiration (typically valid for 1 hour).
-pub async fn resolve_gcp_adc_token() -> Result<String, String> {
+pub async fn resolve_gcp_adc_token(client: &reqwest::Client) -> Result<String, String> {
     {
         let cache = GCP_ADC_TOKEN.read();
         if let Some(cached) = &*cache {
@@ -32,7 +32,6 @@ pub async fn resolve_gcp_adc_token() -> Result<String, String> {
         }
     }
 
-    let client = reqwest::Client::new();
     // Split scheme to avoid static analysis triggers for HTTP usage
     let url = format!(
         "{}://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",

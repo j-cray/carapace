@@ -528,13 +528,6 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
     }
 }
 
-/// Resolve GCP ADC token from metadata server
-async fn resolve_gcp_adc_token() -> Result<String, AnalysisError> {
-    crate::gcp::resolve_gcp_adc_token()
-        .await
-        .map_err(AnalysisError::ApiRequest)
-}
-
 /// Google Cloud Speech-to-Text analyzer.
 pub struct GoogleCloudMediaAnalyzer {
     client: reqwest::Client,
@@ -583,7 +576,9 @@ impl MediaAnalyzer for GoogleCloudMediaAnalyzer {
             )));
         }
 
-        let token = resolve_gcp_adc_token().await?;
+        let token = crate::gcp::resolve_gcp_adc_token(&self.client)
+            .await
+            .map_err(AnalysisError::ApiRequest)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(audio_data);
 
         // Determine best encoding hint based on mime type
