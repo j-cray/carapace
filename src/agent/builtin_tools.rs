@@ -194,7 +194,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
         .min(MEDIA_ANALYZE_MAX_ALLOWED_BYTES);
 
     if let Some(provider) = provider_override.as_deref() {
-        if provider != "openai" && provider != "anthropic" {
+        if provider != "openai" && provider != "anthropic" && provider != "google" {
             return ToolInvokeResult::tool_error(format!("unsupported provider: {provider}"));
         }
     }
@@ -247,12 +247,20 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
         let provider = match provider_override.as_deref() {
             Some("openai") => "openai",
             Some("anthropic") => "anthropic",
+            Some("google") => "google",
             None => match media_type {
                 MediaType::Audio => {
-                    if openai_key.is_some() {
+                    let parsed_default = cfg
+                        .get("models")
+                        .and_then(|v| v.get("providers"))
+                        .and_then(|v| v.get("defaultStt"))
+                        .and_then(|v| v.as_str());
+                    if parsed_default == Some("google") {
+                        "google"
+                    } else if openai_key.is_some() {
                         "openai"
                     } else {
-                        return Err("OpenAI API key is required for audio transcription".into());
+                        return Err("OpenAI API key (or Google ADC config) is required for audio transcription".into());
                     }
                 }
                 MediaType::Image => {
@@ -270,7 +278,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                     return Err("video analysis is not implemented".into());
                 }
             },
-            _ => unreachable!("provider validated before async block"),
+            _ => return Err("unsupported provider".into()),
         };
 
         let cache_path = analysis_cache_path(&media_path);
@@ -313,6 +321,13 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                 if let Some(max_tokens) = max_tokens {
                     analyzer = analyzer.with_max_tokens(max_tokens);
                 }
+                analyze(&media_path, &mime_type, &analyzer, prompt.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            "google" => {
+                let analyzer = crate::media::analysis::GoogleCloudMediaAnalyzer::new()
+                    .map_err(|e| e.to_string())?;
                 analyze(&media_path, &mime_type, &analyzer, prompt.as_deref())
                     .await
                     .map_err(|e| e.to_string())?

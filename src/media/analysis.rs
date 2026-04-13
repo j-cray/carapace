@@ -528,6 +528,171 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
     }
 }
 
+/// Resolve GCP ADC token from metadata server
+async fn resolve_gcp_adc_token() -> Result<String, AnalysisError> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await
+        .map_err(|e| AnalysisError::ApiRequest(format!("failed to contact GCP metadata server: {}", e)))?;
+
+    if !response.status().is_success() {
+        return Err(AnalysisError::ApiRequest(format!(
+            "GCP metadata server returned {}",
+            response.status()
+        )));
+    }
+
+    let json: serde_json::Value = response.json().await.map_err(|e| {
+        AnalysisError::ParseResponse(format!("failed to parse GCP metadata: {}", e))
+    })?;
+    json.get("access_token")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| AnalysisError::ApiRequest("GCP metadata missing access_token".to_string()))
+}
+
+/// Google Cloud Speech-to-Text analyzer.
+pub struct GoogleCloudMediaAnalyzer {
+    client: reqwest::Client,
+}
+
+impl GoogleCloudMediaAnalyzer {
+    /// Create a new Google Cloud media analyzer.
+    pub fn new() -> Result<Self, AnalysisError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| AnalysisError::ApiRequest(format!("failed to build HTTP client: {e}")))?;
+
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl MediaAnalyzer for GoogleCloudMediaAnalyzer {
+    async fn analyze_image(
+        &self,
+        _image_data: &[u8],
+        _mime_type: &str,
+        _prompt: Option<&str>,
+    ) -> Result<MediaAnalysis, AnalysisError> {
+        Err(AnalysisError::UnsupportedMediaType(
+            "Google Cloud analyzer implemented here only supports audio STT".to_string(),
+        ))
+    }
+
+    async fn transcribe_audio(
+        &self,
+        audio_data: &[u8],
+        mime_type: &str,
+    ) -> Result<MediaAnalysis, AnalysisError> {
+        if audio_data.is_empty() {
+            return Err(AnalysisError::EmptyData);
+        }
+
+        // Validate that this is an audio MIME type
+        if !mime_type.to_lowercase().starts_with("audio/") {
+            return Err(AnalysisError::UnsupportedMediaType(format!(
+                "expected audio/* MIME type, got: {}",
+                mime_type
+            )));
+        }
+
+        let token = resolve_gcp_adc_token().await?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(audio_data);
+
+        // Determine best encoding hint based on mime type
+        let encoding_hint = match mime_type.to_lowercase().as_str() {
+            "audio/mp3" | "audio/mpeg" => "MP3",
+            "audio/webm" => "WEBM_OPUS",
+            "audio/ogg" | "audio/ogg; codecs=opus" => "OGG_OPUS",
+            "audio/flac" => "FLAC",
+            "audio/wav" | "audio/x-wav" | "audio/wave" => "LINEAR16",
+            _ => "ENCODING_UNSPECIFIED",
+        };
+
+        let mut config = serde_json::json!({
+            "languageCode": "en-US",
+        });
+
+        if encoding_hint != "ENCODING_UNSPECIFIED" {
+            config["encoding"] = serde_json::json!(encoding_hint);
+        }
+
+        let body = serde_json::json!({
+            "config": config,
+            "audio": {
+                "content": b64
+            }
+        });
+
+        let response = self
+            .client
+            .post("https://speech.googleapis.com/v1/speech:recognize")
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AnalysisError::ApiRequest(format!("HTTP request failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            return Err(AnalysisError::ApiResponse {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+
+        let resp_body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+
+        let mut combined_transcript = String::new();
+        if let Some(results) = resp_body.get("results").and_then(|r| r.as_array()) {
+            for result in results {
+                if let Some(alts) = result.get("alternatives").and_then(|a| a.as_array()) {
+                    if let Some(first_alt) = alts.first() {
+                        if let Some(transcript) =
+                            first_alt.get("transcript").and_then(|t| t.as_str())
+                        {
+                            if !combined_transcript.is_empty() {
+                                combined_transcript.push(' ');
+                            }
+                            combined_transcript.push_str(transcript.trim());
+                        }
+                    }
+                }
+            }
+        }
+
+        if combined_transcript.is_empty() {
+            return Err(AnalysisError::ParseResponse(
+                "Google Cloud STT returned empty transcription".to_string(),
+            ));
+        }
+
+        Ok(MediaAnalysis {
+            description: combined_transcript,
+            media_type: MediaType::Audio,
+            provider: "google".to_string(),
+            tokens_used: None,
+        })
+    }
+
+    fn supported_types(&self) -> Vec<MediaType> {
+        vec![MediaType::Audio]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Integration: analyze stored media files with caching
 // ---------------------------------------------------------------------------

@@ -128,9 +128,21 @@ pub(super) fn handle_tts_enable() -> Result<Value, ErrorShape> {
     let mut state = TTS_STATE.write();
     state.enabled = true;
 
-    // Default to system provider if none set
+    // Default to configured provider or system if none set
     if state.provider.is_none() {
-        state.provider = Some("system".to_string());
+        let mut default_provider = "system".to_string();
+        if let Ok(cfg) = config::load_config() {
+            if let Some(dp) = cfg
+                .get("talk")
+                .and_then(|v| v.get("defaultProvider"))
+                .and_then(|v| v.as_str())
+            {
+                if TTS_PROVIDERS.contains(&dp) {
+                    default_provider = dp.to_string();
+                }
+            }
+        }
+        state.provider = Some(default_provider);
     }
 
     Ok(json!({
@@ -249,6 +261,132 @@ async fn openai_tts_request(
     })
 }
 
+/// Resolve GCP ADC token from metadata server
+async fn resolve_gcp_adc_token() -> Result<String, ErrorShape> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await
+        .map_err(|e| error_shape(ERROR_UNAVAILABLE, &format!("failed to contact GCP metadata server: {}", e), None))?;
+
+    if !response.status().is_success() {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("GCP metadata server returned {}", response.status()),
+            None,
+        ));
+    }
+
+    let json: Value = response.json().await.map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to parse GCP metadata: {}", e),
+            None,
+        )
+    })?;
+    json.get("access_token")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| error_shape(ERROR_UNAVAILABLE, "GCP metadata missing access_token", None))
+}
+
+/// Call the Google Cloud TTS API and return raw audio bytes
+async fn google_tts_request(
+    token: &str,
+    text: &str,
+    voice: &str,
+    format: &str,
+    speed: f64,
+) -> Result<bytes::Bytes, ErrorShape> {
+    let client = reqwest::Client::new();
+    // Apply basic mapping for formats. The user's requested format ("mp3", "opus", "aac", "flac") maps to Google's AudioEncoding.
+    // Google supports MP3, OGG_OPUS, MULAW, ALAW, LINEAR16, FLAC
+    let audio_encoding = match format {
+        "mp3" | "aac" => "MP3",
+        "opus" => "OGG_OPUS",
+        "flac" => "FLAC",
+        _ => "MP3",
+    };
+
+    // Voice name logic. e.g. en-US-Journey-O determines language code en-US
+    let language_code = if voice.len() >= 5 && &voice[2..3] == "-" {
+        &voice[0..5]
+    } else {
+        "en-US"
+    };
+
+    let body = json!({
+        "input": {
+            "text": text
+        },
+        "voice": {
+            "languageCode": language_code,
+            "name": voice
+        },
+        "audioConfig": {
+            "audioEncoding": audio_encoding,
+            "speakingRate": speed.clamp(0.25, 4.0)
+        }
+    });
+
+    let response = client
+        .post("https://texttospeech.googleapis.com/v1/text:synthesize")
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("Google TTS request failed: {}", e),
+                None,
+            )
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let err_body = response.text().await.unwrap_or_default();
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("Google TTS API error ({}): {}", status, err_body),
+            None,
+        ));
+    }
+
+    let json: Value = response.json().await.map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to parse Google TTS response: {}", e),
+            None,
+        )
+    })?;
+
+    let base64_audio = json
+        .get("audioContent")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                "Google TTS response missing audioContent",
+                None,
+            )
+        })?;
+
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(base64_audio)
+        .map(bytes::Bytes::from)
+        .map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to decode Google TTS audioContent: {}", e),
+                None,
+            )
+        })
+}
+
 /// Convert text to speech.
 ///
 /// Params:
@@ -320,9 +458,41 @@ pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, 
             "audioSize": audio_bytes.len(),
             "duration": null
         }));
+    } else if provider == "google" {
+        let token = resolve_gcp_adc_token().await?;
+
+        // Use a default Journey voice for Google if none was set or if defaulting occurred to alloy
+        let gcp_voice = if voice == "alloy" {
+            "en-US-Journey-O".to_string()
+        } else {
+            voice.clone()
+        };
+
+        // Ensure format mapping is clear; if AAC or something is requested, google_tts_request defaults it to MP3.
+        let actual_format = if audio_format == "aac" {
+            "mp3"
+        } else {
+            audio_format
+        };
+        let audio_bytes = google_tts_request(&token, text, &gcp_voice, actual_format, rate).await?;
+
+        let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
+
+        return Ok(json!({
+            "ok": true,
+            "text": text,
+            "provider": provider,
+            "voice": gcp_voice,
+            "rate": rate,
+            "pitch": pitch,
+            "audio": audio_b64,
+            "audioFormat": actual_format,
+            "audioSize": audio_bytes.len(),
+            "duration": null
+        }));
     }
 
-    // Non-OpenAI provider: no server-side synthesis available.
+    // Non-OpenAI and Non-Google provider: no server-side synthesis available.
     Ok(json!({
         "ok": true,
         "text": text,
@@ -407,6 +577,19 @@ pub(super) fn handle_tts_voices() -> Result<Value, ErrorShape> {
                 json!({
                     "id": v,
                     "name": v.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default() + &v[1..]
+                })
+            })
+            .collect(),
+        "google" => vec![
+            "en-US-Journey-D", "en-US-Journey-F", "en-US-Journey-O",
+            "en-US-Neural2-A", "en-US-Neural2-C", "en-US-Neural2-D",
+            "en-US-Neural2-E", "en-US-Neural2-F", "en-US-Neural2-G"
+        ]
+            .into_iter()
+            .map(|v| {
+                json!({
+                    "id": v,
+                    "name": v
                 })
             })
             .collect(),
