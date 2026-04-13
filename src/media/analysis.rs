@@ -1473,6 +1473,59 @@ mod tests {
         ));
     }
 
+    // ==================== Google Cloud Analyzer tests ====================
+
+    #[test]
+    fn test_google_supported_types() {
+        let analyzer = GoogleCloudMediaAnalyzer::new().unwrap();
+        let types = analyzer.supported_types();
+        assert_eq!(types, vec![MediaType::Audio]);
+    }
+
+    #[tokio::test]
+    async fn test_google_analyze_image_unsupported() {
+        let analyzer = GoogleCloudMediaAnalyzer::new().unwrap();
+        let result = analyzer
+            .analyze_image(b"fake data", "image/png", None)
+            .await;
+        assert!(matches!(
+            result,
+            Err(AnalysisError::UnsupportedMediaType(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_google_transcribe_empty_audio() {
+        let analyzer = GoogleCloudMediaAnalyzer::new().unwrap();
+        let result = analyzer.transcribe_audio(&[], "audio/mpeg").await;
+        assert!(matches!(result, Err(AnalysisError::EmptyData)));
+    }
+
+    #[tokio::test]
+    async fn test_google_transcribe_wrong_mime() {
+        let analyzer = GoogleCloudMediaAnalyzer::new().unwrap();
+        let result = analyzer.transcribe_audio(b"data", "image/png").await;
+        assert!(matches!(
+            result,
+            Err(AnalysisError::UnsupportedMediaType(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_google_transcribe_audio_too_large() {
+        let analyzer = GoogleCloudMediaAnalyzer::new().unwrap();
+        const OVER_LIMIT: usize = 7 * 1024 * 1024 + 1;
+        let large_data = vec![0u8; OVER_LIMIT];
+        let result = analyzer.transcribe_audio(&large_data, "audio/mpeg").await;
+
+        match result {
+            Err(AnalysisError::ApiRequest(msg)) => {
+                assert!(msg.contains("exceeds the Google Cloud synchronous API limit"));
+            }
+            other => panic!("expected ApiRequest error, got: {:?}", other),
+        }
+    }
+
     // ==================== MediaType serde tests ====================
 
     #[test]
