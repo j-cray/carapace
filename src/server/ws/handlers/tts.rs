@@ -445,9 +445,22 @@ pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, 
             .await
             .map_err(|e| error_shape(ERROR_UNAVAILABLE, &e, None))?;
 
-        // Use a default Journey voice for Google if none was set or if defaulting occurred to alloy
+        // Use a default voice for Google if none was set or if defaulting occurred to alloy
         let gcp_voice = if voice == "alloy" {
-            "en-US-Journey-O".to_string()
+            let mut default_voice = "en-US-Journey-O".to_string();
+            if let Ok(cfg) = config::load_config() {
+                if let Some(v) = cfg
+                    .get("google")
+                    .and_then(|val| val.get("tts"))
+                    .and_then(|val| val.get("voice"))
+                    .and_then(|val| val.as_str())
+                {
+                    if !v.trim().is_empty() {
+                        default_voice = v.trim().to_string();
+                    }
+                }
+            }
+            default_voice
         } else {
             voice.clone()
         };

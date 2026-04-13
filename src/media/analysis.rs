@@ -602,8 +602,22 @@ impl MediaAnalyzer for GoogleCloudMediaAnalyzer {
             _ => "ENCODING_UNSPECIFIED",
         };
 
+        let mut lang_code = "en-US".to_string();
+        if let Ok(cfg) = crate::config::load_config() {
+            if let Some(l) = cfg
+                .get("google")
+                .and_then(|v| v.get("stt"))
+                .and_then(|v| v.get("languageCode"))
+                .and_then(|v| v.as_str())
+            {
+                if !l.trim().is_empty() {
+                    lang_code = l.trim().to_string();
+                }
+            }
+        }
+
         let mut config = serde_json::json!({
-            "languageCode": "en-US",
+            "languageCode": lang_code,
         });
 
         if encoding_hint != "ENCODING_UNSPECIFIED" {

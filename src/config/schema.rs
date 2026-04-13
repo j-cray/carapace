@@ -904,6 +904,30 @@ fn validate_google(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             });
         }
     }
+
+    if let Some(tts) = google.get("tts").and_then(|v| v.as_object()) {
+        if let Some(voice) = tts.get("voice") {
+            if !voice.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".google.tts.voice".to_string(),
+                    message: "voice must be a string".to_string(),
+                });
+            }
+        }
+    }
+
+    if let Some(stt) = google.get("stt").and_then(|v| v.as_object()) {
+        if let Some(lang) = stt.get("languageCode") {
+            if !lang.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".google.stt.languageCode".to_string(),
+                    message: "languageCode must be a string".to_string(),
+                });
+            }
+        }
+    }
 }
 
 fn validate_codex(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
