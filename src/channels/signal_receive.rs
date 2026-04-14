@@ -29,6 +29,10 @@ pub struct SignalEnvelope {
     #[serde(default, rename = "sourceNumber")]
     pub source_number: Option<String>,
 
+    /// Source UUID (used when phone number privacy is enabled).
+    #[serde(default, rename = "sourceUuid")]
+    pub source_uuid: Option<String>,
+
     /// Legacy source field.
     #[serde(default)]
     pub source: Option<String>,
@@ -59,11 +63,12 @@ pub struct SignalDataMessage {
 }
 
 impl SignalEnvelope {
-    /// Returns the effective source number, preferring `sourceNumber` over `source`.
+    /// Returns the effective source number, preferring `sourceNumber` over `sourceUuid` and `source`.
     pub fn effective_source_number(&self) -> Option<&str> {
         self.source_number
             .as_deref()
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.source_uuid.as_deref().filter(|s| !s.trim().is_empty()))
             .or_else(|| self.source.as_deref().filter(|s| !s.trim().is_empty()))
     }
 }
