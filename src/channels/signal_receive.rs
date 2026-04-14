@@ -947,6 +947,45 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_source_number_uuid_fallback() {
+        let envelope = SignalEnvelope {
+            source_uuid: Some("bc10cb01-949e-4c75-8eb6-04dbdbda16e0".to_string()),
+            source_number: None,
+            source: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: None,
+        };
+        assert_eq!(
+            envelope.effective_source_number(),
+            Some("bc10cb01-949e-4c75-8eb6-04dbdbda16e0")
+        );
+    }
+
+    #[test]
+    fn test_effective_source_number_both_absent_fallback() {
+        let envelope = SignalEnvelope {
+            source_uuid: None,
+            source_number: None,
+            source: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: None,
+        };
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
+    fn test_effective_source_number_both_empty_fallback() {
+        let envelope = SignalEnvelope {
+            source_uuid: Some("   ".to_string()),
+            source_number: Some("   ".to_string()),
+            source: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: None,
+        };
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
     fn test_parse_envelope_with_duplicate_source_fields() {
         let json = r#"[
             {
