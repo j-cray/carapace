@@ -2049,7 +2049,7 @@ pub fn resolve_matrix_configs(cfg: &Value) -> Result<Vec<MatrixConfig>, MatrixEr
             let config = resolve_matrix_config_single(account_obj, name.clone())?;
             configs.push(config);
         }
-    } else if matrix.get("homeserverUrl").is_some() {
+    } else {
         let config = resolve_matrix_config_single(matrix, "default".to_string())?;
         configs.push(config);
     }
@@ -7493,6 +7493,33 @@ mod tests {
         assert!(!resolved.encrypted());
         assert!(resolved.auto_join.allows_user("@alice:example.com"));
         assert!(resolved.auto_join.allows_user("@bob:chat.example.org"));
+    }
+
+    #[test]
+    fn test_resolve_matrix_configs_env_var_only() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.set("MATRIX_HOMESERVER_URL", "https://matrix.env.example.com")
+            .set("MATRIX_USER_ID", "@envcara:example.com")
+            .set("MATRIX_ACCESS_TOKEN", "envtoken")
+            .set("MATRIX_DEVICE_ID", "ENVDEVICE");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true
+            }
+        });
+
+        let resolved = resolve_matrix_configs(&cfg).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].account_name, "default");
+        assert_eq!(resolved[0].homeserver_url, "https://matrix.env.example.com");
+        assert_eq!(resolved[0].user_id, "@envcara:example.com");
+        assert_eq!(
+            resolved[0].access_token.as_deref().map(|s| s.as_str()),
+            Some("envtoken")
+        );
+        assert_eq!(resolved[0].device_id.as_deref(), Some("ENVDEVICE"));
     }
 
     #[test]
