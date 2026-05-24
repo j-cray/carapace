@@ -1231,6 +1231,59 @@ fn validate_matrix(
         None => return,
     };
 
+    if let Some(accounts_value) = matrix.get("accounts") {
+        let accounts = match accounts_value.as_object() {
+            Some(o) => o,
+            None => {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: ".matrix.accounts".to_string(),
+                    message: format!(
+                        "accounts must be an object, got {}",
+                        json_type_label(accounts_value)
+                    ),
+                });
+                return;
+            }
+        };
+        for (name, val) in accounts {
+            let account_obj = match val.as_object() {
+                Some(o) => o,
+                None => {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".matrix.accounts.{}", name),
+                        message: format!(
+                            "account '{}' must be an object, got {}",
+                            name,
+                            json_type_label(val)
+                        ),
+                    });
+                    continue;
+                }
+            };
+            validate_matrix_single(
+                obj,
+                context,
+                account_obj,
+                &format!(".matrix.accounts.{}", name),
+                issues,
+            );
+        }
+    } else {
+        validate_matrix_single(obj, context, matrix, ".matrix", issues);
+    }
+}
+
+fn validate_matrix_single(
+    obj: &serde_json::Map<String, Value>,
+    context: &SchemaValidationContext,
+    matrix: &serde_json::Map<String, Value>,
+    path: &str,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    let is_default = path == ".matrix";
+
     for field in [
         "homeserverUrl",
         "userId",
@@ -1243,30 +1296,14 @@ fn validate_matrix(
             if !value.is_string() && !value.is_null() {
                 issues.push(SchemaIssue {
                     severity: Severity::Error,
-                    path: format!(".matrix.{field}"),
+                    path: format!("{path}.{field}"),
                     message: format!("{field} must be a string"),
                 });
             }
         }
     }
 
-    // userId must be a Matrix MXID: `@localpart:server-name`. The
-    // resolver later catches malformed values via `OwnedUserId::parse`
-    // (surfaces as `MatrixError::InvalidUserId` after the runtime
-    // starts), but a startup-time schema check tells the operator the
-    // typo before they wait through env-load + matrix-sdk client
-    // construction. Empty-string is caught here; other shape errors
-    // (missing `@`, missing `:`, whitespace) are ALL emitted with the
-    // same canonical-form hint so an operator pasting `"cara@example.com"`
-    // (email-style) gets a pointer to the right form.
     if let Some(Value::String(user_id)) = matrix.get("userId") {
-        // The previous regex had three bypass cases: `@:example.com`
-        // (empty localpart), `@cara:` (empty server), and any
-        // leading/trailing whitespace (the whitespace check ran on
-        // the already-trimmed string). Validate against the user-
-        // supplied value (NOT the trimmed one) for whitespace, and
-        // require both localpart and server to be non-empty after
-        // splitting on the first `:`.
         let canonical = || {
             "userId must be a Matrix user ID in canonical form \
              `@localpart:server-name` (e.g. `@cara:example.com`)"
@@ -1274,29 +1311,22 @@ fn validate_matrix(
         if user_id.trim().is_empty() {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.userId".to_string(),
+                path: format!("{path}.userId"),
                 message: "userId cannot be empty when matrix is enabled".to_string(),
             });
         } else if user_id.contains(char::is_whitespace) {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.userId".to_string(),
+                path: format!("{path}.userId"),
                 message: format!("{}; got {user_id:?}", canonical()),
             });
         } else if let Some(rest) = user_id.strip_prefix('@') {
-            // Split into (localpart, server) at first `:`. Require
-            // both halves non-empty; SDK accepts ports in the server
-            // part (e.g. `@u:s:8448`), so we do NOT reject extra `:`.
             match rest.split_once(':') {
-                Some((localpart, server)) if !localpart.is_empty() && !server.is_empty() => {
-                    // Valid shape. Deeper grammar (allowed
-                    // localpart chars per Matrix spec) is left to
-                    // the SDK's `OwnedUserId::parse` at runtime.
-                }
+                Some((localpart, server)) if !localpart.is_empty() && !server.is_empty() => {}
                 _ => {
                     issues.push(SchemaIssue {
                         severity: Severity::Error,
-                        path: ".matrix.userId".to_string(),
+                        path: format!("{path}.userId"),
                         message: format!("{}; got {user_id:?}", canonical()),
                     });
                 }
@@ -1304,7 +1334,7 @@ fn validate_matrix(
         } else {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.userId".to_string(),
+                path: format!("{path}.userId"),
                 message: format!("{}; got {user_id:?}", canonical()),
             });
         }
@@ -1313,16 +1343,9 @@ fn validate_matrix(
     for field in ["enabled", "encrypted"] {
         if let Some(value) = matrix.get(field) {
             if !value.is_boolean() {
-                // Severity::Error rather than Warning: both fields gate
-                // security-relevant behaviour and silently default to
-                // `true` if non-boolean. An operator typing
-                // `"enabled": "false"` to disable Matrix would parse as
-                // `unwrap_or(true)` → enabled-anyway, and the same for
-                // `"encrypted": "false"` → silent-plaintext. Refuse the
-                // config at startup so the operator notices the typo.
                 issues.push(SchemaIssue {
                     severity: Severity::Error,
-                    path: format!(".matrix.{field}"),
+                    path: format!("{path}.{field}"),
                     message: format!("{field} must be a boolean"),
                 });
             }
@@ -1337,50 +1360,52 @@ fn validate_matrix(
         return;
     }
 
-    let homeserver_for_validation = matrix_nonempty_string(matrix, "homeserverUrl")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_HOMESERVER_URL"));
+    let homeserver_for_validation = matrix_nonempty_string(matrix, "homeserverUrl").or_else(|| {
+        if is_default {
+            config_env_value_for_validation(obj, context, "MATRIX_HOMESERVER_URL")
+        } else {
+            None
+        }
+    });
     if homeserver_for_validation.is_none() {
         issues.push(SchemaIssue {
             severity: Severity::Error,
-            path: ".matrix.homeserverUrl".to_string(),
+            path: format!("{path}.homeserverUrl"),
             message: "homeserverUrl is required when matrix is enabled".to_string(),
         });
     }
     if matrix_nonempty_string(matrix, "userId")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_USER_ID"))
+        .or_else(|| {
+            if is_default {
+                config_env_value_for_validation(obj, context, "MATRIX_USER_ID")
+            } else {
+                None
+            }
+        })
         .is_none()
     {
         issues.push(SchemaIssue {
             severity: Severity::Error,
-            path: ".matrix.userId".to_string(),
+            path: format!("{path}.userId"),
             message: "userId is required when matrix is enabled".to_string(),
         });
     }
 
-    // Error when homeserverUrl uses plaintext `http://` against a
-    // non-loopback host. matrix-sdk faithfully connects over plaintext
-    // if asked, putting the SDK store passphrase, access token, and
-    // recovery-key flow on the wire in clear.
     if let Some(homeserver) = homeserver_for_validation {
         if homeserver_is_plaintext_non_loopback(&homeserver) {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.homeserverUrl".to_string(),
+                path: format!("{path}.homeserverUrl"),
                 message: "homeserverUrl uses plaintext http:// against a non-loopback host; \
                           Matrix passphrases, access tokens, and recovery-key material would \
                           traverse the network in clear. Use https:// for any non-loopback homeserver."
                     .to_string(),
             });
         }
-        // Promote resolver-fatal shapes to schema-level Errors so
-        // `validate_config` and `register_matrix_channel_if_configured`
-        // agree: length cap, scheme/credentials validation. Otherwise
-        // operators see schema "OK with warnings" but daemon refuses
-        // to start with `MatrixError::InvalidLength` / `InvalidUrl`.
         if homeserver.len() > crate::channels::matrix::MATRIX_HOMESERVER_URL_MAX_BYTES_PUB {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.homeserverUrl".to_string(),
+                path: format!("{path}.homeserverUrl"),
                 message: format!(
                     "homeserverUrl exceeds {} bytes (got {})",
                     crate::channels::matrix::MATRIX_HOMESERVER_URL_MAX_BYTES_PUB,
@@ -1391,20 +1416,30 @@ fn validate_matrix(
         if let Err(err) = crate::channels::matrix::validate_homeserver_url(&homeserver) {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.homeserverUrl".to_string(),
+                path: format!("{path}.homeserverUrl"),
                 message: format!("homeserverUrl is not a valid URL: {err}"),
             });
         }
     }
 
-    let access_token = matrix_nonempty_string(matrix, "accessToken")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_ACCESS_TOKEN"));
-    let password = matrix_nonempty_string(matrix, "password")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_PASSWORD"));
+    let access_token = matrix_nonempty_string(matrix, "accessToken").or_else(|| {
+        if is_default {
+            config_env_value_for_validation(obj, context, "MATRIX_ACCESS_TOKEN")
+        } else {
+            None
+        }
+    });
+    let password = matrix_nonempty_string(matrix, "password").or_else(|| {
+        if is_default {
+            config_env_value_for_validation(obj, context, "MATRIX_PASSWORD")
+        } else {
+            None
+        }
+    });
     if access_token.is_none() && password.is_none() {
         issues.push(SchemaIssue {
             severity: Severity::Error,
-            path: ".matrix.accessToken".to_string(),
+            path: format!("{path}.accessToken"),
             message: "matrix.accessToken or matrix.password is required when matrix is enabled"
                 .to_string(),
         });
@@ -1412,35 +1447,35 @@ fn validate_matrix(
     if access_token.is_some() && password.is_some() {
         issues.push(SchemaIssue {
             severity: Severity::Error,
-            path: ".matrix.accessToken".to_string(),
+            path: format!("{path}.accessToken"),
             message: "matrix.accessToken and matrix.password must not both be set; choose token restore or password login explicitly".to_string(),
         });
     }
-    for (field, env_key) in [
-        ("homeserverUrl", "MATRIX_HOMESERVER_URL"),
-        ("userId", "MATRIX_USER_ID"),
-        ("accessToken", "MATRIX_ACCESS_TOKEN"),
-        ("password", "MATRIX_PASSWORD"),
-        ("deviceId", "MATRIX_DEVICE_ID"),
-        ("storePassphrase", "MATRIX_STORE_PASSPHRASE"),
-    ] {
-        warn_matrix_config_env_shadow(obj, context, matrix, issues, field, env_key);
+
+    if is_default {
+        for (field, env_key) in [
+            ("homeserverUrl", "MATRIX_HOMESERVER_URL"),
+            ("userId", "MATRIX_USER_ID"),
+            ("accessToken", "MATRIX_ACCESS_TOKEN"),
+            ("password", "MATRIX_PASSWORD"),
+            ("deviceId", "MATRIX_DEVICE_ID"),
+            ("storePassphrase", "MATRIX_STORE_PASSPHRASE"),
+        ] {
+            warn_matrix_config_env_shadow(obj, context, matrix, issues, field, env_key);
+        }
     }
-    // Resolve userId and deviceId via the same env-aware chain as
-    // `resolve_matrix_config` (channels/matrix.rs:1909-1934). Pre-fix
-    // these length caps were applied to in-config fields ONLY, so an
-    // operator providing oversized MATRIX_USER_ID / MATRIX_DEVICE_ID
-    // via env saw "schema OK" then the daemon refused to start with
-    // MatrixError::InvalidLength. Same schema/runtime contract
-    // mismatch the access-token-without-deviceId check fixes 80 lines
-    // below.
-    if let Some(uid) = matrix_nonempty_string(matrix, "userId")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_USER_ID"))
-    {
+
+    if let Some(uid) = matrix_nonempty_string(matrix, "userId").or_else(|| {
+        if is_default {
+            config_env_value_for_validation(obj, context, "MATRIX_USER_ID")
+        } else {
+            None
+        }
+    }) {
         if uid.len() > crate::channels::matrix::MATRIX_USER_ID_MAX_BYTES_PUB {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.userId".to_string(),
+                path: format!("{path}.userId"),
                 message: format!(
                     "userId exceeds {} bytes (got {})",
                     crate::channels::matrix::MATRIX_USER_ID_MAX_BYTES_PUB,
@@ -1449,13 +1484,17 @@ fn validate_matrix(
             });
         }
     }
-    if let Some(did) = matrix_nonempty_string(matrix, "deviceId")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_DEVICE_ID"))
-    {
+    if let Some(did) = matrix_nonempty_string(matrix, "deviceId").or_else(|| {
+        if is_default {
+            config_env_value_for_validation(obj, context, "MATRIX_DEVICE_ID")
+        } else {
+            None
+        }
+    }) {
         if did.len() > crate::channels::matrix::MATRIX_DEVICE_ID_MAX_BYTES_PUB {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.deviceId".to_string(),
+                path: format!("{path}.deviceId"),
                 message: format!(
                     "deviceId exceeds {} bytes (got {})",
                     crate::channels::matrix::MATRIX_DEVICE_ID_MAX_BYTES_PUB,
@@ -1465,43 +1504,37 @@ fn validate_matrix(
         }
     }
 
-    // Mirror resolve_matrix_config (src/channels/matrix.rs): both
-    // accessToken and deviceId can come from EITHER the in-config
-    // matrix.* fields OR the env/env.vars fallback. Reading only the
-    // in-config field here let an operator pass `MATRIX_ACCESS_TOKEN`
-    // via env without `matrix.deviceId`, see "schema OK", then watch
-    // the daemon refuse to start with MissingDeviceIdForTokenRestore.
-    // Use the same env-aware resolution path as the credentials-pair
-    // check above so schema validation matches runtime behavior.
-    let access_token = matrix_nonempty_string(matrix, "accessToken")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_ACCESS_TOKEN"));
-    let device_id = matrix_nonempty_string(matrix, "deviceId")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_DEVICE_ID"));
+    let access_token = matrix_nonempty_string(matrix, "accessToken").or_else(|| {
+        if is_default {
+            config_env_value_for_validation(obj, context, "MATRIX_ACCESS_TOKEN")
+        } else {
+            None
+        }
+    });
+    let device_id = matrix_nonempty_string(matrix, "deviceId").or_else(|| {
+        if is_default {
+            config_env_value_for_validation(obj, context, "MATRIX_DEVICE_ID")
+        } else {
+            None
+        }
+    });
     if access_token.is_some() && device_id.is_none() {
-        // The runtime resolver rejects accessToken-without-deviceId
-        // unconditionally (silent fall-through to password login would
-        // churn the bot's device identity on every restart). Schema
-        // must match the resolver — previously this was a warning that
-        // also required password to be absent, which let setup produce
-        // a config the daemon refused to load.
         issues.push(SchemaIssue {
             severity: Severity::Error,
-            path: ".matrix.deviceId".to_string(),
+            path: format!("{path}.deviceId"),
             message: "deviceId is required whenever accessToken is configured \
                       (token restore needs the SDK-issued device ID)"
                 .to_string(),
         });
     }
-    // Resolve store_passphrase env-aware (same pattern as accessToken/
-    // deviceId above and as `resolve_matrix_store_passphrase` in
-    // channels/matrix.rs). Pre-fix, the encrypted=false warning only
-    // fired when storePassphrase was set IN-CONFIG, missing the case
-    // where the operator supplied MATRIX_STORE_PASSPHRASE via env or
-    // env.vars while matrix.encrypted=false. The resolver-side warning
-    // still fires at startup so it's not silent overall, but the
-    // schema/wizard-side surface should agree with the resolver.
-    let store_passphrase = matrix_nonempty_string(matrix, "storePassphrase")
-        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_STORE_PASSPHRASE"));
+
+    let store_passphrase = matrix_nonempty_string(matrix, "storePassphrase").or_else(|| {
+        if is_default {
+            config_env_value_for_validation(obj, context, "MATRIX_STORE_PASSPHRASE")
+        } else {
+            None
+        }
+    });
     let encrypted = matrix
         .get("encrypted")
         .and_then(|v| v.as_bool())
@@ -1509,7 +1542,7 @@ fn validate_matrix(
     if !encrypted && store_passphrase.is_some() {
         issues.push(SchemaIssue {
             severity: Severity::Warning,
-            path: ".matrix.storePassphrase".to_string(),
+            path: format!("{path}.storePassphrase"),
             message: "storePassphrase is set (via config or env) but matrix.encrypted=false; \
                       the value will be ignored — flip encrypted=true to use it"
                 .to_string(),
@@ -1517,13 +1550,14 @@ fn validate_matrix(
     }
     if encrypted
         && store_passphrase.is_none()
-        && config_env_value_for_validation(obj, context, "MATRIX_STORE_PASSPHRASE").is_none()
+        && (!is_default
+            || config_env_value_for_validation(obj, context, "MATRIX_STORE_PASSPHRASE").is_none())
         && !context.config_password_available
         && !matrix_store_passphrase_file_available_for_validation(context, issues)
     {
         issues.push(SchemaIssue {
             severity: Severity::Error,
-            path: ".matrix.encrypted".to_string(),
+            path: format!("{path}.encrypted"),
             message: "matrix.encrypted=true requires matrix.storePassphrase, MATRIX_STORE_PASSPHRASE, CARAPACE_CONFIG_PASSWORD, or a non-empty <state_dir>/matrix/store_passphrase file".to_string(),
         });
     }
@@ -1534,30 +1568,21 @@ fn validate_matrix(
                     Some("accept" | "refuse") => {}
                     Some(_) => issues.push(SchemaIssue {
                         severity: Severity::Error,
-                        path: ".matrix.inboundDlq.legacyEnvelopePolicy".to_string(),
+                        path: format!("{path}.inboundDlq.legacyEnvelopePolicy"),
                         message: "legacyEnvelopePolicy must be `accept` or `refuse`".to_string(),
                     }),
                     None => issues.push(SchemaIssue {
                         severity: Severity::Error,
-                        path: ".matrix.inboundDlq.legacyEnvelopePolicy".to_string(),
+                        path: format!("{path}.inboundDlq.legacyEnvelopePolicy"),
                         message: "legacyEnvelopePolicy must be a string".to_string(),
                     }),
                 }
             }
-            // Align with the forward-compat posture of the runtime
-            // (`resolve_matrix_legacy_envelope_policy` in matrix.rs
-            // intentionally warns-and-ignores unknown sibling keys so
-            // an operator downgrading after a newer daemon added a
-            // sibling option can still start). Demoting unknown keys
-            // from `Error` to `Warning` keeps the diagnostic visible
-            // to operators while preserving the schema/runtime
-            // contract: anything the runtime accepts MUST pass schema
-            // validation, even if with warnings.
             for key in inbound_dlq.keys() {
                 if key != "legacyEnvelopePolicy" {
                     issues.push(SchemaIssue {
                         severity: Severity::Warning,
-                        path: format!(".matrix.inboundDlq.{key}"),
+                        path: format!("{path}.inboundDlq.{key}"),
                         message: "unknown inboundDlq key (forward-compat: ignored at runtime)"
                             .to_string(),
                     });
@@ -1566,27 +1591,19 @@ fn validate_matrix(
         } else {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".matrix.inboundDlq".to_string(),
+                path: format!("{path}.inboundDlq"),
                 message: "inboundDlq must be an object".to_string(),
             });
         }
     }
 
-    // Severity::Error rather than Warning: `resolve_matrix_config`
-    // (`src/channels/matrix.rs::resolve_matrix_config`) rejects the
-    // same shape with `MatrixError::InvalidStringArray` and
-    // `register_matrix_channel_if_configured` propagates it as a
-    // startup error. A schema/runtime contract mismatch — config
-    // validation passing with warnings while daemon startup fails
-    // hard — is exactly the operator-confusion case round 16
-    // promoted `enabled`/`encrypted` for. Same logic applies here.
     let Some(auto_join) = matrix.get("autoJoin") else {
         return;
     };
     let Some(auto_join) = auto_join.as_object() else {
         issues.push(SchemaIssue {
             severity: Severity::Error,
-            path: ".matrix.autoJoin".to_string(),
+            path: format!("{path}.autoJoin"),
             message: "autoJoin must be an object".to_string(),
         });
         return;
@@ -1598,17 +1615,15 @@ fn validate_matrix(
         let Some(values) = value.as_array() else {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: format!(".matrix.autoJoin.{field}"),
+                path: format!("{path}.autoJoin.{field}"),
                 message: format!("{field} must be an array of strings"),
             });
             continue;
         };
-        // Resolver enforces these limits via `MatrixError::AllowlistTooLarge`
-        // and per-entry `InvalidLength`; align schema severity.
         if values.len() > crate::channels::matrix::MATRIX_ALLOWLIST_MAX_ENTRIES_PUB {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: format!(".matrix.autoJoin.{field}"),
+                path: format!("{path}.autoJoin.{field}"),
                 message: format!(
                     "{field} exceeds {} entries (got {})",
                     crate::channels::matrix::MATRIX_ALLOWLIST_MAX_ENTRIES_PUB,
@@ -1624,7 +1639,7 @@ fn validate_matrix(
                 {
                     issues.push(SchemaIssue {
                         severity: Severity::Error,
-                        path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                        path: format!("{path}.autoJoin.{field}[{idx}]"),
                         message: format!(
                             "{field} entry exceeds {} bytes (got {})",
                             crate::channels::matrix::MATRIX_ALLOWLIST_ENTRY_MAX_BYTES_PUB,
@@ -1640,7 +1655,7 @@ fn validate_matrix(
                     if !seen.insert(trimmed.to_string()) {
                         issues.push(SchemaIssue {
                             severity: Severity::Warning,
-                            path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                            path: format!("{path}.autoJoin.{field}[{idx}]"),
                             message: format!("{field} contains duplicate entry {trimmed:?}"),
                         });
                     }
@@ -1650,21 +1665,9 @@ fn validate_matrix(
                         _ => true,
                     };
                     if !valid_shape {
-                        // Runtime `read_string_set` in
-                        // `channels/matrix.rs` does NOT enforce
-                        // mxid/server-name shape — it accepts any
-                        // non-empty trimmed string up to
-                        // `MATRIX_ALLOWLIST_ENTRY_MAX_BYTES`. A
-                        // shape-mismatched entry is dead config
-                        // (never matches a real MXID at gate
-                        // evaluation) — not a security risk, just an
-                        // operator typo. Demoting to Warning keeps
-                        // the schema/runtime contract: anything the
-                        // runtime accepts must validate, even if
-                        // with warnings.
                         issues.push(SchemaIssue {
                             severity: Severity::Warning,
-                            path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                            path: format!("{path}.autoJoin.{field}[{idx}]"),
                             message: match field {
                                 "allowUsers" => {
                                     "allowUsers entries should be Matrix user IDs like `@localpart:server-name`; runtime accepts the value but it will never match a real MXID".to_string()
@@ -1680,7 +1683,7 @@ fn validate_matrix(
                 None => {
                     issues.push(SchemaIssue {
                         severity: Severity::Error,
-                        path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                        path: format!("{path}.autoJoin.{field}[{idx}]"),
                         message: format!("{field} entries must be strings"),
                     });
                 }
@@ -1984,6 +1987,15 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
                         &format!(".agents.list[{i}].sandbox"),
                         issues,
                     );
+                }
+                if let Some(matrix_account) = entry.get("matrixAccount") {
+                    if !matrix_account.is_string() {
+                        issues.push(SchemaIssue {
+                            severity: Severity::Error,
+                            path: format!(".agents.list[{i}].matrixAccount"),
+                            message: "matrixAccount must be a string".to_string(),
+                        });
+                    }
                 }
             }
             if let Some(model) = entry.get("model") {

@@ -253,6 +253,7 @@ static LAST_VALID_WALL_CLOCK_MILLIS: AtomicI64 = AtomicI64::new(LAST_VALID_WALL_
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct MatrixConfig {
+    pub account_name: String,
     pub homeserver_url: String,
     pub user_id: String,
     /// Long-lived Matrix access token. Wrapped in `Zeroizing` so any
@@ -284,6 +285,7 @@ impl fmt::Debug for MatrixConfig {
     /// also redacts via `PassphraseSource`'s own Debug impl.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MatrixConfig")
+            .field("account_name", &self.account_name)
             .field("homeserver_url", &self.homeserver_url)
             .field("user_id", &self.user_id)
             .field(
@@ -437,6 +439,7 @@ impl MatrixAutoJoinConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum MatrixConfigResolve {
     Disabled,
     Missing,
@@ -1023,6 +1026,7 @@ pub struct MatrixDeviceInfo {
 
 #[derive(Debug)]
 pub struct MatrixRuntimeState {
+    pub channel_id: String,
     status: MatrixStatusMetadata,
     devices: Vec<MatrixDeviceInfo>,
     verifications: Vec<MatrixVerificationInfo>,
@@ -1101,9 +1105,10 @@ pub struct MatrixRuntimeState {
     inbound_dlq_at_cap_since_ms: Option<i64>,
 }
 
-impl Default for MatrixRuntimeState {
-    fn default() -> Self {
+impl MatrixRuntimeState {
+    pub fn with_channel_id(channel_id: String) -> Self {
         Self {
+            channel_id,
             status: MatrixStatusMetadata::default(),
             devices: Vec::new(),
             verifications: Vec::new(),
@@ -1117,6 +1122,12 @@ impl Default for MatrixRuntimeState {
             terminal_runtime_stamped: false,
             inbound_dlq_at_cap_since_ms: None,
         }
+    }
+}
+
+impl Default for MatrixRuntimeState {
+    fn default() -> Self {
+        Self::with_channel_id("matrix".to_string())
     }
 }
 
@@ -1535,6 +1546,7 @@ impl MatrixRuntimeState {
 }
 
 pub struct MatrixRuntimeHandle {
+    pub config: MatrixConfig,
     tx: mpsc::Sender<MatrixCommand>,
     state: Arc<RwLock<MatrixRuntimeState>>,
     completed: Arc<AtomicBool>,
@@ -1561,6 +1573,17 @@ impl MatrixRuntimeHandle {
     pub(crate) fn for_test() -> Arc<Self> {
         let (tx, _rx) = mpsc::channel(MATRIX_OUTBOUND_QUEUE_CAPACITY);
         Arc::new(Self {
+            config: MatrixConfig {
+                account_name: "default".to_string(),
+                homeserver_url: "https://matrix.example.com".to_string(),
+                user_id: "@cara:example.com".to_string(),
+                access_token: None,
+                password: None,
+                device_id: None,
+                security: MatrixSecurity::Unencrypted,
+                auto_join: MatrixAutoJoinConfig::default(),
+                legacy_dlq_envelope_policy: MatrixLegacyDlqEnvelopePolicy::Accept,
+            },
             tx,
             state: Arc::new(RwLock::new(MatrixRuntimeState::default())),
             completed: Arc::new(AtomicBool::new(true)),
@@ -1575,7 +1598,19 @@ impl MatrixRuntimeHandle {
     }
 
     pub fn channel(&self) -> MatrixChannel {
+        let channel_id = if self.config.account_name == "default" {
+            "matrix".to_string()
+        } else {
+            format!("matrix:{}", self.config.account_name)
+        };
+        let label = if self.config.account_name == "default" {
+            "Matrix".to_string()
+        } else {
+            format!("Matrix ({})", self.config.account_name)
+        };
         MatrixChannel {
+            channel_id,
+            label,
             tx: self.tx.clone(),
         }
     }
@@ -1763,15 +1798,17 @@ async fn await_matrix_command_reply(
 
 #[derive(Debug, Clone)]
 pub struct MatrixChannel {
+    pub channel_id: String,
+    pub label: String,
     tx: mpsc::Sender<MatrixCommand>,
 }
 
 impl ChannelPluginInstance for MatrixChannel {
     fn get_info(&self) -> Result<PluginChannelInfo, BindingError> {
         Ok(PluginChannelInfo {
-            id: MATRIX_CHANNEL_ID.to_string(),
-            label: MATRIX_CHANNEL_NAME.to_string(),
-            selection_label: MATRIX_CHANNEL_NAME.to_string(),
+            id: self.channel_id.clone(),
+            label: self.label.clone(),
+            selection_label: self.label.clone(),
             docs_path: "docs/channels.md#matrix".to_string(),
             blurb: "Send and receive Matrix / Element room messages.".to_string(),
             order: 45,
@@ -1979,11 +2016,59 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
         return Ok(MatrixConfigResolve::Disabled);
     }
 
-    // Matrix homeserver URL is operator-controlled protected configuration.
-    // We do not DNS-resolve and block private ranges here because self-hosted
-    // Matrix deployments commonly live on private or loopback addresses.
+    let configs = resolve_matrix_configs(cfg)?;
+    if let Some(first) = configs.into_iter().next() {
+        Ok(MatrixConfigResolve::Configured(first))
+    } else {
+        Ok(MatrixConfigResolve::Missing)
+    }
+}
+
+pub fn resolve_matrix_configs(cfg: &Value) -> Result<Vec<MatrixConfig>, MatrixError> {
+    let Some(matrix_value) = cfg.get("matrix") else {
+        return Ok(vec![]);
+    };
+    let matrix = matrix_value
+        .as_object()
+        .ok_or(MatrixError::InvalidConfigRoot)?;
+
+    if read_bool(matrix, "enabled")? == Some(false) {
+        return Ok(vec![]);
+    }
+
+    let mut configs = Vec::new();
+    if let Some(accounts_value) = matrix.get("accounts") {
+        let accounts = accounts_value
+            .as_object()
+            .ok_or(MatrixError::InvalidConfigRoot)?;
+        for (name, val) in accounts {
+            let account_obj = val.as_object().ok_or(MatrixError::InvalidConfigRoot)?;
+            if read_bool(account_obj, "enabled")? == Some(false) {
+                continue;
+            }
+            let config = resolve_matrix_config_single(account_obj, name.clone())?;
+            configs.push(config);
+        }
+    } else if matrix.get("homeserverUrl").is_some() {
+        let config = resolve_matrix_config_single(matrix, "default".to_string())?;
+        configs.push(config);
+    }
+    Ok(configs)
+}
+
+fn resolve_matrix_config_single(
+    matrix: &serde_json::Map<String, Value>,
+    account_name: String,
+) -> Result<MatrixConfig, MatrixError> {
+    let is_default = account_name == "default";
     let homeserver_url = read_string(matrix, "homeserverUrl")?
-        .or_else(|| crate::config::read_config_env("MATRIX_HOMESERVER_URL"))
+        .or_else(|| {
+            if is_default {
+                crate::config::read_config_env("MATRIX_HOMESERVER_URL")
+            } else {
+                None
+            }
+        })
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or(MatrixError::MissingHomeserverUrl)?;
@@ -1995,7 +2080,13 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
     validate_homeserver_url(&homeserver_url)?;
 
     let user_id = read_string(matrix, "userId")?
-        .or_else(|| crate::config::read_config_env("MATRIX_USER_ID"))
+        .or_else(|| {
+            if is_default {
+                crate::config::read_config_env("MATRIX_USER_ID")
+            } else {
+                None
+            }
+        })
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or(MatrixError::MissingUserId)?;
@@ -2004,15 +2095,15 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
     // Wrap the raw read in Zeroizing FIRST so the un-trimmed source
     // String is wiped on drop. The trim-via-to_string chain otherwise
     // allocates a fresh String for the trimmed bytes and drops the
-    // un-trimmed source UN-zeroized (the token bytes remain in the
-    // allocator's freelist until reuse, observable via coredump or
-    // post-free heap inspection). When the trim is a no-op (no
-    // leading/trailing whitespace, the common case), reuse the
-    // original Zeroizing allocation rather than allocating a fresh
-    // one. The fresh trimmed allocation IS also Zeroized — both
-    // allocations are wrapped before any drop.
+    // un-trimmed source UN-zeroized.
     let access_token = read_string(matrix, "accessToken")?
-        .or_else(|| crate::config::read_config_env("MATRIX_ACCESS_TOKEN"))
+        .or_else(|| {
+            if is_default {
+                crate::config::read_config_env("MATRIX_ACCESS_TOKEN")
+            } else {
+                None
+            }
+        })
         .map(zeroize::Zeroizing::new)
         .and_then(|raw| {
             let trimmed = raw.trim();
@@ -2024,13 +2115,15 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
                 Some(zeroize::Zeroizing::new(trimmed.to_string()))
             }
         });
-    // Same zeroize-source-then-trim discipline as access_token above.
-    // The pre-fix shape didn't trim the value passed downstream at
-    // all — only the empty-check trimmed — so a config or env value
-    // with trailing whitespace was sent to the homeserver verbatim
-    // and "rejected as wrong password" with no operator diagnostic.
+
     let password = read_string(matrix, "password")?
-        .or_else(|| crate::config::read_config_env("MATRIX_PASSWORD"))
+        .or_else(|| {
+            if is_default {
+                crate::config::read_config_env("MATRIX_PASSWORD")
+            } else {
+                None
+            }
+        })
         .map(zeroize::Zeroizing::new)
         .and_then(|raw| {
             let trimmed = raw.trim();
@@ -2042,35 +2135,39 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
                 Some(zeroize::Zeroizing::new(trimmed.to_string()))
             }
         });
+
     if access_token.is_none() && password.is_none() {
         return Err(MatrixError::MissingCredentials);
     }
     let device_id = read_string(matrix, "deviceId")?
-        .or_else(|| crate::config::read_config_env("MATRIX_DEVICE_ID"))
+        .or_else(|| {
+            if is_default {
+                crate::config::read_config_env("MATRIX_DEVICE_ID")
+            } else {
+                None
+            }
+        })
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     if let Some(ref id) = device_id {
         validate_field_length(id, "deviceId", MATRIX_DEVICE_ID_MAX_BYTES)?;
     }
-    // Token-restore path requires both accessToken and deviceId. Allowing
-    // accessToken without deviceId would silently fall through to the
-    // password-login branch (when password is also configured), creating
-    // a fresh device on every restart and churning the bot's
-    // cross-signing identity. Reject the ambiguous combo at config-resolve
-    // time so operators are explicit: either supply both for token
-    // restore, or remove accessToken to opt into password login.
+
     if access_token.is_some() && device_id.is_none() {
         return Err(MatrixError::MissingDeviceIdForTokenRestore);
     }
 
     let encrypted = read_bool(matrix, "encrypted")?.unwrap_or(true);
     let explicit_passphrase = read_string(matrix, "storePassphrase")?
-        .or_else(|| crate::config::read_config_env("MATRIX_STORE_PASSPHRASE"))
+        .or_else(|| {
+            if is_default {
+                crate::config::read_config_env("MATRIX_STORE_PASSPHRASE")
+            } else {
+                None
+            }
+        })
         .filter(|value| !value.trim().is_empty());
     if !encrypted && explicit_passphrase.is_some() {
-        // The schema validator already issues a Severity::Warning for
-        // this combination; emit a startup warn so operators tailing
-        // logs notice the value will be silently ignored.
         warn!(
             "matrix.storePassphrase is set but matrix.encrypted=false; \
              the passphrase will be ignored. Set matrix.encrypted=true to use it."
@@ -2088,7 +2185,8 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
         MatrixSecurity::Unencrypted
     };
 
-    Ok(MatrixConfigResolve::Configured(MatrixConfig {
+    Ok(MatrixConfig {
+        account_name,
         homeserver_url,
         user_id,
         access_token,
@@ -2097,7 +2195,7 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
         security,
         auto_join: read_auto_join(matrix)?,
         legacy_dlq_envelope_policy: read_legacy_dlq_envelope_policy(matrix)?,
-    }))
+    })
 }
 
 fn read_legacy_dlq_envelope_policy(
@@ -2768,13 +2866,19 @@ pub fn spawn_matrix_runtime(
     shutdown_rx: watch::Receiver<bool>,
 ) -> Arc<MatrixRuntimeHandle> {
     let (tx, rx) = mpsc::channel(MATRIX_OUTBOUND_QUEUE_CAPACITY);
-    let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+    let channel_id = if config.account_name == "default" {
+        "matrix".to_string()
+    } else {
+        format!("matrix:{}", config.account_name)
+    };
+    let state = Arc::new(RwLock::new(MatrixRuntimeState::with_channel_id(channel_id)));
     let completed = Arc::new(AtomicBool::new(false));
     let shutdown_complete = Arc::new(Notify::new());
     let state_for_handle = state.clone();
     let completed_for_handle = completed.clone();
     let shutdown_complete_for_handle = shutdown_complete.clone();
     let runtime_user_id = matrix_observability_id(&config.user_id);
+    let config_clone = config.clone();
     let actor_handle = tokio::spawn(async move {
         let runtime_span = tracing::info_span!(
             target: MATRIX_TRACING_TARGET,
@@ -2783,7 +2887,7 @@ pub fn spawn_matrix_runtime(
         );
         async move {
             run_matrix_runtime(
-                config,
+                config_clone,
                 state_dir,
                 ws_state,
                 channel_registry,
@@ -2799,6 +2903,7 @@ pub fn spawn_matrix_runtime(
         shutdown_complete.notify_waiters();
     });
     Arc::new(MatrixRuntimeHandle {
+        config,
         tx: tx.clone(),
         state: state_for_handle,
         completed: completed_for_handle,
@@ -2816,8 +2921,19 @@ async fn run_matrix_runtime(
     mut rx: mpsc::Receiver<MatrixCommand>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let channel_id = if config.account_name == "default" {
+        MATRIX_CHANNEL_ID.to_string()
+    } else {
+        format!("matrix:{}", config.account_name)
+    };
+    let channel_name = if config.account_name == "default" {
+        MATRIX_CHANNEL_NAME.to_string()
+    } else {
+        format!("Matrix ({})", config.account_name)
+    };
+
     channel_registry.register(
-        crate::channels::ChannelInfo::new(MATRIX_CHANNEL_ID, MATRIX_CHANNEL_NAME)
+        crate::channels::ChannelInfo::new(channel_id, channel_name)
             .with_status(ChannelStatus::Connecting)
             .with_metadata(ChannelMetadata {
                 description: Some("Matrix / Element native channel runtime".to_string()),
@@ -4126,7 +4242,8 @@ async fn shutdown_matrix_runtime_actor(
     // a subsequent re-registration in the same daemon process.
     state.write().status.last_error_kind = None;
     update_channel_registry_metadata(channel_registry, state);
-    channel_registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Disconnected);
+    let channel_id = state.read().channel_id.clone();
+    channel_registry.update_status(&channel_id, ChannelStatus::Disconnected);
     // No typed cause for clean shutdown; in-flight tasks resolve as
     // `NotConnected`, matching queued-command drain semantics.
     send_cancel.cancel();
@@ -5979,7 +6096,8 @@ fn update_channel_registry_metadata(
     state: &Arc<RwLock<MatrixRuntimeState>>,
 ) {
     let status = state.read().status();
-    registry.update_metadata_extra(MATRIX_CHANNEL_ID, json!(status));
+    let channel_id = state.read().channel_id.clone();
+    registry.update_metadata_extra(&channel_id, json!(status));
 }
 
 /// Stamp a typed `MatrixError` to the channel registry's
@@ -6000,7 +6118,8 @@ fn stamp_matrix_runtime_error(
     err: &MatrixError,
 ) {
     state.write().status.last_error_kind = Some(err.kind().to_string());
-    registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(err));
+    let channel_id = state.read().channel_id.clone();
+    registry.set_error(&channel_id, matrix_error_for_status(err));
     update_channel_registry_metadata(registry, state);
 }
 
@@ -6013,7 +6132,8 @@ fn stamp_matrix_runtime_error_message(
     message: impl Into<String>,
 ) {
     state.write().status.last_error_kind = None;
-    registry.set_error(MATRIX_CHANNEL_ID, message);
+    let channel_id = state.read().channel_id.clone();
+    registry.set_error(&channel_id, message);
     update_channel_registry_metadata(registry, state);
 }
 
@@ -6024,7 +6144,8 @@ fn stamp_matrix_runtime_error_message_with_kind(
     error_kind: impl Into<String>,
 ) {
     state.write().status.last_error_kind = Some(error_kind.into());
-    registry.set_error(MATRIX_CHANNEL_ID, message);
+    let channel_id = state.read().channel_id.clone();
+    registry.set_error(&channel_id, message);
     update_channel_registry_metadata(registry, state);
 }
 
@@ -6039,7 +6160,8 @@ fn mark_matrix_channel_connected(
     state: &Arc<RwLock<MatrixRuntimeState>>,
 ) {
     state.write().status.last_error_kind = None;
-    registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
+    let channel_id = state.read().channel_id.clone();
+    registry.update_status(&channel_id, ChannelStatus::Connected);
     update_channel_registry_metadata(registry, state);
 }
 
@@ -7044,6 +7166,7 @@ fn matrix_test_config(encrypted: bool) -> MatrixConfig {
         .allow_users
         .insert("@alice:example.com".to_string());
     MatrixConfig {
+        account_name: "default".to_string(),
         homeserver_url: "https://matrix.example.com".to_string(),
         user_id: "@cara:example.com".to_string(),
         access_token: Some(zeroize::Zeroizing::new("token".to_string())),
@@ -7070,6 +7193,7 @@ fn matrix_test_config_with_passphrase(passphrase: &str) -> MatrixConfig {
         .allow_users
         .insert("@alice:example.com".to_string());
     MatrixConfig {
+        account_name: "default".to_string(),
         homeserver_url: "https://matrix.example.com".to_string(),
         user_id: "@cara:example.com".to_string(),
         access_token: Some(zeroize::Zeroizing::new("token".to_string())),
@@ -7372,6 +7496,54 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_matrix_configs_multiple_accounts() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "accounts": {
+                    "primary": {
+                        "homeserverUrl": "https://matrix1.example.com",
+                        "userId": "@cara1:example.com",
+                        "password": "secretpassword",
+                        "encrypted": false
+                    },
+                    "secondary": {
+                        "homeserverUrl": "https://matrix2.example.com",
+                        "userId": "@cara2:example.com",
+                        "password": "anothersecret",
+                        "encrypted": false
+                    }
+                }
+            }
+        });
+
+        let resolved = resolve_matrix_configs(&cfg).unwrap();
+        assert_eq!(resolved.len(), 2);
+
+        let primary = resolved
+            .iter()
+            .find(|c| c.account_name == "primary")
+            .unwrap();
+        assert_eq!(primary.homeserver_url, "https://matrix1.example.com");
+        assert_eq!(primary.user_id, "@cara1:example.com");
+
+        let secondary = resolved
+            .iter()
+            .find(|c| c.account_name == "secondary")
+            .unwrap();
+        assert_eq!(secondary.homeserver_url, "https://matrix2.example.com");
+        assert_eq!(secondary.user_id, "@cara2:example.com");
+
+        // Single fallback resolve resolves to the first account (primary or secondary depending on iteration)
+        let single_resolve = resolve_matrix_config(&cfg).unwrap();
+        if let MatrixConfigResolve::Configured(cfg) = single_resolve {
+            assert!(cfg.account_name == "primary" || cfg.account_name == "secondary");
+        } else {
+            panic!("should resolve to Configured");
+        }
+    }
+
+    #[test]
     fn test_resolve_matrix_config_defaults_legacy_dlq_policy_accept() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env = ScopedEnv::new();
@@ -7474,6 +7646,7 @@ mod tests {
     #[test]
     fn test_explicit_matrix_store_passphrase_is_used_directly() {
         let config = MatrixConfig {
+            account_name: "default".to_string(),
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
             access_token: Some(zeroize::Zeroizing::new("token".to_string())),
@@ -7503,6 +7676,7 @@ mod tests {
         env.unset("MATRIX_STORE_PASSPHRASE");
         let temp = tempfile::tempdir().expect("tempdir");
         let config = MatrixConfig {
+            account_name: "default".to_string(),
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
             access_token: Some(zeroize::Zeroizing::new("token".to_string())),
@@ -7908,6 +8082,7 @@ mod tests {
             .allow_users
             .insert("@alice:example.com".to_string());
         MatrixConfig {
+            account_name: "default".to_string(),
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
             access_token: Some(zeroize::Zeroizing::new("token".to_string())),
@@ -10223,7 +10398,11 @@ mod tests {
         })
         .expect("seed full outbound queue");
 
-        let channel = MatrixChannel { tx };
+        let channel = MatrixChannel {
+            channel_id: "matrix".to_string(),
+            label: "Matrix".to_string(),
+            tx,
+        };
         let delivery = channel
             .send_text(OutboundContext {
                 to: "!room:example.com".to_string(),

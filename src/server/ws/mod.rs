@@ -857,8 +857,10 @@ pub struct WsServerState {
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
     /// Runtime-owned service for channel activity side effects and warnings.
     activity_service: Arc<channels::activity::ActivityService>,
-    /// Runtime-owned Matrix channel state and command actor.
-    matrix_runtime: parking_lot::RwLock<Option<Arc<channels::matrix::MatrixRuntimeHandle>>>,
+    /// Runtime-owned Matrix channel state and command actor handles.
+    matrix_runtimes: parking_lot::RwLock<
+        std::collections::HashMap<String, Arc<channels::matrix::MatrixRuntimeHandle>>,
+    >,
     /// Retained plugin runtime for instantiated plugin lifetimes and epoch ticker.
     plugin_runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     /// Startup-time plugin activation report
@@ -889,10 +891,7 @@ impl std::fmt::Debug for WsServerState {
                 &self.plugin_registry.as_ref().map(|_| ".."),
             )
             .field("activity_service", &"..")
-            .field(
-                "matrix_runtime",
-                &self.matrix_runtime.read().as_ref().map(|_| ".."),
-            )
+            .field("matrix_runtimes", &"..")
             .field(
                 "plugin_runtime",
                 &self.plugin_runtime.as_ref().map(|_| ".."),
@@ -976,7 +975,7 @@ impl WsServerState {
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service_factory()?),
-            matrix_runtime: parking_lot::RwLock::new(None),
+            matrix_runtimes: parking_lot::RwLock::new(std::collections::HashMap::new()),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -1070,7 +1069,7 @@ impl WsServerState {
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service),
-            matrix_runtime: parking_lot::RwLock::new(None),
+            matrix_runtimes: parking_lot::RwLock::new(std::collections::HashMap::new()),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -1212,21 +1211,31 @@ impl WsServerState {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_matrix_runtime(
         &self,
         runtime: Option<Arc<channels::matrix::MatrixRuntimeHandle>>,
     ) -> Result<(), Arc<channels::matrix::MatrixRuntimeHandle>> {
-        let mut slot = self.matrix_runtime.write();
+        self.set_matrix_runtime_for_account("default", runtime)
+    }
+
+    pub(crate) fn set_matrix_runtime_for_account(
+        &self,
+        account_name: &str,
+        runtime: Option<Arc<channels::matrix::MatrixRuntimeHandle>>,
+    ) -> Result<(), Arc<channels::matrix::MatrixRuntimeHandle>> {
+        let mut slot = self.matrix_runtimes.write();
         if let Some(runtime) = runtime {
-            if slot.is_some() {
+            if slot.contains_key(account_name) {
                 warn!(
-                    "Matrix runtime registration refused because an existing runtime handle is still installed"
+                    account = account_name,
+                    "Matrix runtime registration refused because an existing runtime handle is still installed for this account"
                 );
                 return Err(runtime);
             }
-            *slot = Some(runtime);
+            slot.insert(account_name.to_string(), runtime);
         } else {
-            *slot = None;
+            slot.remove(account_name);
         }
         Ok(())
     }
@@ -1320,7 +1329,18 @@ impl WsServerState {
     }
 
     pub fn matrix_runtime(&self) -> Option<Arc<channels::matrix::MatrixRuntimeHandle>> {
-        self.matrix_runtime.read().clone()
+        self.matrix_runtimes.read().get("default").cloned()
+    }
+
+    pub fn matrix_runtime_for_account(
+        &self,
+        account_name: &str,
+    ) -> Option<Arc<channels::matrix::MatrixRuntimeHandle>> {
+        self.matrix_runtimes.read().get(account_name).cloned()
+    }
+
+    pub fn all_matrix_runtimes(&self) -> Vec<Arc<channels::matrix::MatrixRuntimeHandle>> {
+        self.matrix_runtimes.read().values().cloned().collect()
     }
 
     /// Runtime-owned shutdown entrypoint for Matrix background work.
@@ -1330,13 +1350,16 @@ impl WsServerState {
     /// shared shutdown watch. Dropping only the handle would leave a best-effort
     /// fire-and-forget task with user-visible side effects still in flight.
     pub async fn shutdown_matrix_runtime(&self) {
-        let Some(runtime) = self.matrix_runtime() else {
-            return;
-        };
-        if !runtime.wait_for_shutdown(Duration::from_secs(10)).await {
-            warn!("Matrix runtime did not finish within 10s shutdown timeout");
+        let runtimes = self.all_matrix_runtimes();
+        for runtime in runtimes {
+            if !runtime.wait_for_shutdown(Duration::from_secs(10)).await {
+                warn!(
+                    account = runtime.config.account_name,
+                    "Matrix runtime did not finish within 10s shutdown timeout"
+                );
+            }
+            let _ = self.set_matrix_runtime_for_account(&runtime.config.account_name, None);
         }
-        let _ = self.set_matrix_runtime(None);
     }
 
     /// Runtime-owned shutdown entrypoint for channel activity side effects.

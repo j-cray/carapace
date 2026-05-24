@@ -611,65 +611,67 @@ pub async fn register_matrix_channel_if_configured(
     state_dir: &Path,
     shutdown_rx: &watch::Receiver<bool>,
 ) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
-    if let Some(registry) = ws_state.plugin_registry() {
-        if registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID) {
-            return Err(format!(
-                "duplicate channel plugin id '{}'",
-                crate::channels::matrix::MATRIX_CHANNEL_ID
-            )
-            .into());
-        }
-    }
-
-    let matrix_config = match crate::channels::matrix::resolve_matrix_config(cfg) {
-        Ok(crate::channels::matrix::MatrixConfigResolve::Configured(config)) => config,
-        Ok(
-            crate::channels::matrix::MatrixConfigResolve::Disabled
-            | crate::channels::matrix::MatrixConfigResolve::Missing,
-        ) => {
-            return Ok(ws_state);
-        }
+    let matrix_configs = match crate::channels::matrix::resolve_matrix_configs(cfg) {
+        Ok(configs) => configs,
         Err(err) => return Err(Box::new(err)),
     };
 
-    let existing_matrix_channel = ws_state
-        .channel_registry()
-        .get(crate::channels::matrix::MATRIX_CHANNEL_ID);
+    if matrix_configs.is_empty() {
+        return Ok(ws_state);
+    }
 
-    let runtime = crate::channels::matrix::spawn_matrix_runtime(
-        matrix_config,
-        state_dir.to_path_buf(),
-        ws_state.clone(),
-        ws_state.channel_registry().clone(),
-        shutdown_rx.clone(),
-    );
+    for matrix_config in matrix_configs {
+        let account_name = matrix_config.account_name.clone();
+        let channel_id = if account_name == "default" {
+            "matrix".to_string()
+        } else {
+            format!("matrix:{}", account_name)
+        };
 
-    if let Some(registry) = ws_state.plugin_registry() {
-        if let Err(err) = registry.try_register_channel(
-            crate::channels::matrix::MATRIX_CHANNEL_ID.to_string(),
-            Arc::new(runtime.channel()),
-        ) {
+        if let Some(registry) = ws_state.plugin_registry() {
+            if registry.has_channel(&channel_id) {
+                return Err(format!("duplicate channel plugin id '{channel_id}'").into());
+            }
+        }
+
+        let existing_matrix_channel = ws_state.channel_registry().get(&channel_id);
+
+        let runtime = crate::channels::matrix::spawn_matrix_runtime(
+            matrix_config,
+            state_dir.to_path_buf(),
+            ws_state.clone(),
+            ws_state.channel_registry().clone(),
+            shutdown_rx.clone(),
+        );
+
+        if let Some(registry) = ws_state.plugin_registry() {
+            if let Err(err) =
+                registry.try_register_channel(channel_id.clone(), Arc::new(runtime.channel()))
+            {
+                runtime.abort_startup_registration_failure().await;
+                restore_matrix_channel_registry_entry(
+                    ws_state.channel_registry().as_ref(),
+                    existing_matrix_channel.clone(),
+                );
+                return Err(Box::new(err));
+            }
+        }
+
+        if let Err(runtime) = ws_state.set_matrix_runtime_for_account(&account_name, Some(runtime))
+        {
             runtime.abort_startup_registration_failure().await;
+            if let Some(registry) = ws_state.plugin_registry() {
+                registry.unregister(&channel_id);
+            }
             restore_matrix_channel_registry_entry(
                 ws_state.channel_registry().as_ref(),
-                existing_matrix_channel.clone(),
+                existing_matrix_channel,
             );
-            return Err(Box::new(err));
+            return Err(format!("Matrix runtime handle for account '{account_name}' already registered; refusing to overwrite").into());
         }
+        info!(account = %account_name, "Matrix channel registered");
     }
 
-    if let Err(runtime) = ws_state.set_matrix_runtime(Some(runtime)) {
-        runtime.abort_startup_registration_failure().await;
-        if let Some(registry) = ws_state.plugin_registry() {
-            registry.unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
-        }
-        restore_matrix_channel_registry_entry(
-            ws_state.channel_registry().as_ref(),
-            existing_matrix_channel,
-        );
-        return Err("Matrix runtime handle already registered; refusing to overwrite".into());
-    }
-    info!("Matrix channel registered");
     Ok(ws_state)
 }
 

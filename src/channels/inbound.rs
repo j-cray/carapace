@@ -443,11 +443,37 @@ pub async fn dispatch_inbound_text_with_options(
         }
     }
 
+    let mut target_agent_id: Option<String> = None;
+    if channel == "matrix" || channel.starts_with("matrix:") {
+        let account_name = if channel == "matrix" {
+            "default"
+        } else {
+            channel.strip_prefix("matrix:").unwrap_or("")
+        };
+
+        if let Some(agents) = cfg.get("agents").and_then(|v| v.as_object()) {
+            if let Some(list) = agents.get("list").and_then(|v| v.as_array()) {
+                for agent_val in list {
+                    if let Some(agent_obj) = agent_val.as_object() {
+                        if let Some(acc) = agent_obj.get("matrixAccount").and_then(|v| v.as_str()) {
+                            if acc == account_name {
+                                if let Some(id) = agent_obj.get("id").and_then(|v| v.as_str()) {
+                                    target_agent_id = Some(id.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut config = crate::agent::AgentConfig::default();
     if let Err(e) = crate::agent::resolve_agent_model(
         &mut config,
         cfg.as_ref(),
-        None,
+        target_agent_id.as_deref(),
         &crate::agent::ModelResolutionOverrides {
             session_route: session.metadata.route.as_deref(),
             session_model: session.metadata.model.as_deref(),
@@ -462,7 +488,11 @@ pub async fn dispatch_inbound_text_with_options(
             corrupt_dedupe_index_lines,
         });
     }
-    crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
+    crate::agent::apply_agent_config_from_settings(
+        &mut config,
+        cfg.as_ref(),
+        target_agent_id.as_deref(),
+    );
     config.deliver = true;
     crate::agent::spawn_run(
         run_id.clone(),

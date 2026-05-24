@@ -173,6 +173,29 @@ impl ChannelSessionConfig {
             return Self::from_value_with_default(channel_session, default_scope);
         }
 
+        // Try matrix-specific account config
+        if channel_name == "matrix" || channel_name.starts_with("matrix:") {
+            let account_name = if channel_name == "matrix" {
+                "default"
+            } else {
+                channel_name.strip_prefix("matrix:").unwrap_or("")
+            };
+            if let Some(matrix_obj) = config.get("matrix").and_then(|v| v.as_object()) {
+                let channel_session = if account_name == "default" {
+                    matrix_obj.get("session")
+                } else {
+                    matrix_obj
+                        .get("accounts")
+                        .and_then(|v| v.as_object())
+                        .and_then(|accs| accs.get(account_name))
+                        .and_then(|acc| acc.get("session"))
+                };
+                if let Some(session_val) = channel_session {
+                    return Self::from_value_with_default(session_val, default_scope);
+                }
+            }
+        }
+
         // Fall back to global session.scope (no reset at global level)
         let scope = config
             .get("session")
@@ -189,7 +212,7 @@ impl ChannelSessionConfig {
 }
 
 fn default_scope_for_channel(channel_name: &str) -> SessionScope {
-    if channel_name == "matrix" {
+    if channel_name == "matrix" || channel_name.starts_with("matrix:") {
         SessionScope::PerChannelPeer
     } else {
         SessionScope::default()
@@ -693,6 +716,32 @@ mod tests {
         let result = ChannelSessionConfig::from_config(&config, "matrix");
         assert_eq!(result.scope, SessionScope::PerChannelPeer);
         assert_eq!(result.reset, SessionResetPolicy::Manual);
+
+        let result_primary = ChannelSessionConfig::from_config(&config, "matrix:primary");
+        assert_eq!(result_primary.scope, SessionScope::PerChannelPeer);
+    }
+
+    #[test]
+    fn test_from_config_multi_account_matrix_specific() {
+        let config = json!({
+            "matrix": {
+                "accounts": {
+                    "primary": {
+                        "session": {
+                            "scope": "global",
+                            "reset": { "mode": "daily" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let result = ChannelSessionConfig::from_config(&config, "matrix:primary");
+        assert_eq!(result.scope, SessionScope::Global);
+        assert_eq!(result.reset, SessionResetPolicy::Daily);
+
+        let result_other = ChannelSessionConfig::from_config(&config, "matrix:secondary");
+        assert_eq!(result_other.scope, SessionScope::PerChannelPeer);
     }
 
     #[test]

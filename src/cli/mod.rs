@@ -18297,6 +18297,7 @@ mod tests {
         // Build a minimal MatrixConfig — recovery doesn't actually use
         // it post-fix, but the signature still requires one.
         let config = crate::channels::matrix::MatrixConfig {
+            account_name: "default".to_string(),
             homeserver_url: "https://example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
             access_token: None,
