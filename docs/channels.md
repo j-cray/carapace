@@ -230,6 +230,8 @@ graph. `openssl-probe` is explicitly allowed because it does not link
 OpenSSL itself — it is a small no-OpenSSL utility used by rustls for
 locating system CA certificate paths at runtime.
 
+### Single Account Configuration
+
 ```json5
 {
   "matrix": {
@@ -244,6 +246,83 @@ locating system CA certificate paths at runtime.
     "autoJoin": {
       "allowUsers": ["@alice:example.com"],
       "allowServerNames": ["example.org"]
+    }
+  }
+}
+```
+
+### Multi-Account Configuration
+
+Carapace supports configuring multiple distinct Matrix accounts at the same time. Each account runs as its own concurrent Matrix runtime/actor task and is uniquely assigned to a specific agent.
+
+To configure multiple Matrix accounts, define them under the `matrix.accounts` map:
+
+```json5
+{
+  "matrix": {
+    "enabled": true,
+    "accounts": {
+      "primary": {
+        "homeserverUrl": "https://matrix1.example.com",
+        "userId": "@cara1:example.com",
+        "password": "${MATRIX_PASSWORD_1}",
+        "encrypted": true,
+        "autoJoin": {
+          "allowUsers": ["@alice:example.com"]
+        }
+      },
+      "secondary": {
+        "homeserverUrl": "https://matrix2.example.com",
+        "userId": "@cara2:example.com",
+        "password": "${MATRIX_PASSWORD_2}",
+        "encrypted": true
+      }
+    }
+  }
+}
+```
+
+### Agent Mapping for Multi-Account Matrix
+
+To assign an agent to a specific Matrix account, set the `matrixAccount` field in the agent's definition inside your `agents.list` configuration. Incoming events on that specific Matrix account will dynamically target and trigger model runs for the designated agent:
+
+```json5
+{
+  "agents": {
+    "list": [
+      {
+        "id": "my_primary_agent",
+        "matrixAccount": "primary", // Maps this agent to the "primary" Matrix account config
+        "model": "google:gemini-2.5-pro",
+        "prompt": "You are the primary assistant."
+      },
+      {
+        "id": "my_secondary_agent",
+        "matrixAccount": "secondary", // Maps this agent to the "secondary" Matrix account config
+        "model": "google:gemini-2.5-flash",
+        "prompt": "You are the secondary assistant."
+      }
+    ]
+  }
+}
+```
+
+### Multi-Account Scoping & Session Resolution
+
+Dynamic matrix accounts formulate channel IDs starting with `matrix:` followed by their account name (e.g. `matrix:primary` or `matrix:secondary`). You can customize the session scope and reset policy specifically for each account inside their configuration (under `matrix.accounts.{name}.session`):
+
+```json5
+{
+  "matrix": {
+    "accounts": {
+      "primary": {
+        "homeserverUrl": "https://matrix1.example.com",
+        "userId": "@cara1:example.com",
+        "session": {
+          "scope": "global",
+          "reset": { "mode": "daily" }
+        }
+      }
     }
   }
 }
