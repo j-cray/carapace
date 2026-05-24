@@ -486,6 +486,8 @@ impl std::fmt::Display for DlqCryptoFailure {
 
 #[derive(Debug, Clone, Error)]
 pub enum MatrixError {
+    #[error("multiple Matrix accounts configured; CLI operations are ambiguous without a 'default' account")]
+    AmbiguousAccountSelection,
     #[error("matrix config must be an object")]
     InvalidConfigRoot,
     #[error("matrix.{field} must be a string")]
@@ -795,6 +797,7 @@ impl MatrixError {
     /// returned token is a breaking change.
     pub fn kind(&self) -> &'static str {
         match self {
+            MatrixError::AmbiguousAccountSelection => "ambiguous-account-selection",
             MatrixError::InvalidConfigRoot => "invalid-config-root",
             MatrixError::InvalidString { .. } => "invalid-string",
             MatrixError::InvalidBool { .. } => "invalid-bool",
@@ -1921,7 +1924,8 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         // non-retryable CallError so the dispatch pipeline records
         // the failure once and stops.
         MatrixError::SendTerminal(_) => Err(BindingError::CallError(redacted)),
-        MatrixError::InvalidConfigRoot
+        MatrixError::AmbiguousAccountSelection
+        | MatrixError::InvalidConfigRoot
         | MatrixError::InvalidString { .. }
         | MatrixError::InvalidBool { .. }
         | MatrixError::InvalidStringArray { .. }
@@ -2017,10 +2021,16 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
     }
 
     let configs = resolve_matrix_configs(cfg)?;
-    if let Some(first) = configs.into_iter().next() {
-        Ok(MatrixConfigResolve::Configured(first))
+    if configs.is_empty() {
+        return Ok(MatrixConfigResolve::Missing);
+    }
+
+    if let Some(default_cfg) = configs.iter().find(|c| c.account_name == "default") {
+        Ok(MatrixConfigResolve::Configured(default_cfg.clone()))
+    } else if configs.len() == 1 {
+        Ok(MatrixConfigResolve::Configured(configs[0].clone()))
     } else {
-        Ok(MatrixConfigResolve::Missing)
+        Err(MatrixError::AmbiguousAccountSelection)
     }
 }
 
@@ -7561,12 +7571,57 @@ mod tests {
         assert_eq!(secondary.homeserver_url, "https://matrix2.example.com");
         assert_eq!(secondary.user_id, "@cara2:example.com");
 
-        // Single fallback resolve resolves to the first account (primary or secondary depending on iteration)
-        let single_resolve = resolve_matrix_config(&cfg).unwrap();
-        if let MatrixConfigResolve::Configured(cfg) = single_resolve {
-            assert!(cfg.account_name == "primary" || cfg.account_name == "secondary");
+        // Single fallback resolve returns AmbiguousAccountSelection when multiple exist with no "default"
+        let err = resolve_matrix_config(&cfg).expect_err("should return AmbiguousAccountSelection");
+        assert!(matches!(err, MatrixError::AmbiguousAccountSelection));
+
+        // If one of the accounts is named "default", it resolves to default
+        let cfg_with_default = json!({
+            "matrix": {
+                "enabled": true,
+                "accounts": {
+                    "default": {
+                        "homeserverUrl": "https://matrix1.example.com",
+                        "userId": "@cara1:example.com",
+                        "password": "secretpassword",
+                        "encrypted": false
+                    },
+                    "secondary": {
+                        "homeserverUrl": "https://matrix2.example.com",
+                        "userId": "@cara2:example.com",
+                        "password": "anothersecret",
+                        "encrypted": false
+                    }
+                }
+            }
+        });
+        let single_resolve = resolve_matrix_config(&cfg_with_default).unwrap();
+        if let MatrixConfigResolve::Configured(c) = single_resolve {
+            assert_eq!(c.account_name, "default");
+            assert_eq!(c.homeserver_url, "https://matrix1.example.com");
         } else {
-            panic!("should resolve to Configured");
+            panic!("should resolve to Configured default");
+        }
+
+        // If only a single account is configured, it resolves to it
+        let cfg_single = json!({
+            "matrix": {
+                "enabled": true,
+                "accounts": {
+                    "primary": {
+                        "homeserverUrl": "https://matrix1.example.com",
+                        "userId": "@cara1:example.com",
+                        "password": "secretpassword",
+                        "encrypted": false
+                    }
+                }
+            }
+        });
+        let single_resolve_only = resolve_matrix_config(&cfg_single).unwrap();
+        if let MatrixConfigResolve::Configured(c) = single_resolve_only {
+            assert_eq!(c.account_name, "primary");
+        } else {
+            panic!("should resolve to Configured primary");
         }
     }
 

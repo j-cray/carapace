@@ -3146,7 +3146,8 @@ fn matrix_runtime_error_detail_reason(err: &MatrixError) -> Option<&'static str>
     // the public HTTP contract is kind-only for that variant.
     match err {
         MatrixError::RecoveryKeyRestoreFailed { reason, .. } => Some(reason.as_str()),
-        MatrixError::InvalidConfigRoot
+        MatrixError::AmbiguousAccountSelection
+        | MatrixError::InvalidConfigRoot
         | MatrixError::InvalidString { .. }
         | MatrixError::InvalidBool { .. }
         | MatrixError::InvalidStringArray { .. }
@@ -3285,7 +3286,8 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         MatrixError::VerificationTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
         // Request-shape errors — the operator (or schema validator)
         // sent us a config we can't interpret.
-        MatrixError::InvalidConfigRoot
+        MatrixError::AmbiguousAccountSelection
+        | MatrixError::InvalidConfigRoot
         | MatrixError::InvalidString { .. }
         | MatrixError::InvalidBool { .. }
         | MatrixError::InvalidStringArray { .. }

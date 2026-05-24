@@ -913,7 +913,8 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         // these arms exhaustive prevents a future MatrixError variant from
         // compiling without a deliberate DLQ aggregate classification; the
         // debug assertion catches any caller that bypasses the dispatch wrapper.
-        MatrixError::InvalidConfigRoot
+        MatrixError::AmbiguousAccountSelection
+        | MatrixError::InvalidConfigRoot
         | MatrixError::InvalidString { .. }
         | MatrixError::InvalidBool { .. }
         | MatrixError::InvalidStringArray { .. }
