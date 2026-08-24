@@ -1,13 +1,15 @@
 //! Signal inbound receive loop.
 //!
-//! Polls the signal-cli-rest-api `GET /v1/receive/{number}` endpoint every
-//! 2 seconds and routes inbound messages into the chat pipeline.
+//! Connects to the signal-cli-rest-api WebSocket stream at `ws://{base_url}/v1/receive/{number}`
+//! (or `wss://...`) and routes inbound messages in real time into the chat pipeline.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::signal::validate_signal_url;
@@ -15,11 +17,10 @@ use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::plugins::{ChannelPluginInstance, ReadReceiptContext, TypingContext};
 use crate::server::ws::WsServerState;
 
-/// Interval between receive polls.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Timeout for each receive HTTP request.
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Initial reconnect backoff delay.
+const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+/// Maximum reconnect backoff delay.
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const SIGNAL_RECEIPT_CAPABILITY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// An envelope returned by `GET /v1/receive/{number}`.
@@ -146,25 +147,26 @@ fn read_receipt_context_for_signal_run(
     build_signal_read_receipt_context(envelope, data_message, sender)
 }
 
-fn sanitize_signal_receive_transport_error(error: reqwest::Error) -> String {
-    error.without_url().to_string()
-}
-
-fn build_signal_receive_http_client(
-    builder: reqwest::ClientBuilder,
-) -> Result<reqwest::Client, String> {
-    builder
-        .timeout(RECEIVE_TIMEOUT)
-        .build()
-        .map_err(|err| format!("failed to build Signal receive HTTP client: {err}"))
+fn sanitize_signal_receive_transport_error(error: &dyn std::fmt::Display) -> String {
+    let raw = error.to_string();
+    static SENSITIVE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(%2B|\+)\d{5,}").expect("valid sensitive phone regex")
+    });
+    SENSITIVE_RE.replace_all(&raw, "[redacted]").to_string()
 }
 
 fn build_receive_url(
     base_url: &url::Url,
     phone_number: &str,
-    managed_read_receipt_capacity: usize,
+    carapace_manages_read_receipts: bool,
 ) -> url::Url {
     let mut url = base_url.clone();
+    let ws_scheme = match url.scheme() {
+        "http" | "ws" => "ws",
+        "https" | "wss" => "wss",
+        _ => "ws",
+    };
+    let _ = url.set_scheme(ws_scheme);
     let encoded_phone_number = urlencoding::encode(phone_number);
     let path_prefix = url.path().trim_end_matches('/');
     let receive_path = if path_prefix.is_empty() {
@@ -179,13 +181,12 @@ fn build_receive_url(
         .filter(|(key, _)| key != "send_read_receipts" && key != "max_messages")
         .collect::<Vec<_>>();
     url.set_query(None);
-    if !filtered_query_pairs.is_empty() || managed_read_receipt_capacity > 0 {
+    if !filtered_query_pairs.is_empty() || carapace_manages_read_receipts {
         let mut query_pairs = url.query_pairs_mut();
         for (key, value) in filtered_query_pairs {
             query_pairs.append_pair(&key, &value);
         }
-        if managed_read_receipt_capacity > 0 {
-            query_pairs.append_pair("max_messages", &managed_read_receipt_capacity.to_string());
+        if carapace_manages_read_receipts {
             query_pairs.append_pair("send_read_receipts", "false");
         }
     }
@@ -306,11 +307,8 @@ async fn snapshot_signal_receive_poll(
     let read_receipt_reservation =
         can_manage_signal_read_receipts(activity_policy, activity_service, state, capability_cache)
             .await;
-    let managed_read_receipt_capacity = read_receipt_reservation
-        .as_ref()
-        .map_or(0, |reservation| reservation.reserved_capacity());
     SignalReceivePollSnapshot {
-        receive_url: build_receive_url(base_url, phone_number, managed_read_receipt_capacity),
+        receive_url: build_receive_url(base_url, phone_number, read_receipt_reservation.is_some()),
         suppressed_upstream_auto_receipts: read_receipt_reservation.is_some(),
         read_receipt_reservation,
     }
@@ -331,9 +329,10 @@ fn record_signal_parse_failure<E: std::fmt::Display>(
 
 /// Run the Signal receive loop.
 ///
-/// Polls `GET {base_url}/v1/receive/{number}` every 2 seconds, parses inbound
-/// messages, and routes them into the chat pipeline. Updates channel registry
-/// status on success/failure. Exits when the shutdown signal fires.
+/// Connects to the signal-cli-rest-api WebSocket stream at `ws://{base_url}/v1/receive/{number}`
+/// (or `wss://...`), receives pushed inbound message envelopes in real time, and routes
+/// them into the chat pipeline. Updates channel registry status on success/failure and
+/// reconnects with exponential backoff on disconnect. Exits when the shutdown signal fires.
 pub async fn signal_receive_loop(
     base_url: String,
     phone_number: String,
@@ -351,19 +350,6 @@ pub async fn signal_receive_loop(
         }
     };
 
-    let client = match build_signal_receive_http_client(reqwest::Client::builder()) {
-        Ok(client) => client,
-        Err(err) => {
-            error!(
-                phone_number = %phone_number,
-                error = %err,
-                "Signal receive loop HTTP client initialization failed"
-            );
-            channel_registry.set_error("signal", err);
-            channel_registry.update_status("signal", ChannelStatus::Error);
-            return;
-        }
-    };
     info!(phone_number = %phone_number, "Signal receive loop started");
     let mut config_rx = crate::config::subscribe_config_changes();
     config_rx.borrow_and_update();
@@ -371,12 +357,11 @@ pub async fn signal_receive_loop(
         crate::channels::activity::load_channel_activity_policy_async("signal").await;
     let mut capability_cache = SignalReadReceiptCapabilityCache::default();
 
-    // Track consecutive transport and parse errors to avoid spamming logs.
+    let mut backoff = INITIAL_RECONNECT_BACKOFF;
     let mut consecutive_errors: u32 = 0;
     let mut consecutive_parse_errors: u32 = 0;
 
     loop {
-        // Check shutdown before polling
         if *shutdown.borrow() {
             info!("Signal receive loop shutting down");
             break;
@@ -392,8 +377,11 @@ pub async fn signal_receive_loop(
         )
         .await;
 
-        match client.get(poll_snapshot.receive_url.clone()).send().await {
-            Ok(resp) if resp.status().is_success() => {
+        let ws_url_str = poll_snapshot.receive_url.as_str();
+        channel_registry.update_status("signal", ChannelStatus::Connecting);
+
+        match tokio_tungstenite::connect_async(ws_url_str).await {
+            Ok((ws_stream, _)) => {
                 if consecutive_errors > 0 {
                     info!(
                         "Signal receive loop recovered after {} errors",
@@ -401,109 +389,193 @@ pub async fn signal_receive_loop(
                     );
                     consecutive_errors = 0;
                 }
+                backoff = INITIAL_RECONNECT_BACKOFF;
+                channel_registry.update_status("signal", ChannelStatus::Connected);
 
-                // Cap the inbound response body at 16 MiB — a Signal
-                // /v1/receive batch is JSON containing up to ~100
-                // envelopes with text/media metadata; 16 MiB bounds a
-                // hostile / MITM-attacked Signal-CLI from streaming
-                // unbounded bytes into RAM via `response.json()`.
-                let body_text =
-                    crate::net_util::read_response_body_text_capped(resp, 16 * 1024 * 1024).await;
-                match body_text
-                    .map_err(|e| format!("failed to read Signal receive response body: {e}"))
-                    .and_then(|text| {
-                        serde_json::from_str::<Vec<Value>>(&text)
-                            .map_err(|e| format!("invalid Signal receive response body: {e}"))
-                    }) {
-                    Ok(items) => {
-                        channel_registry.update_status("signal", ChannelStatus::Connected);
-                        let mut had_parse_error = false;
-                        for item in items {
-                            match deserialize_signal_envelope_item(item) {
-                                Ok(envelope) => {
-                                    let carapace_manages_read_receipts =
-                                        poll_snapshot.carapace_manages_read_receipts();
-                                    process_envelope(
-                                        &envelope,
-                                        &state,
-                                        carapace_manages_read_receipts,
-                                        &mut poll_snapshot.read_receipt_reservation,
-                                    )
-                                    .await;
+                let (mut ws_writer, mut ws_reader) = ws_stream.split();
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                info!("Signal receive loop shutting down");
+                                let _ = ws_writer.send(Message::Close(None)).await;
+                                channel_registry.update_status("signal", ChannelStatus::Disconnected);
+                                return;
+                            }
+                        }
+                        changed = config_rx.changed() => {
+                            if changed.is_err() {
+                                warn!("Signal receive loop config subscription closed unexpectedly");
+                                continue;
+                            }
+                            activity_policy =
+                                crate::channels::activity::load_channel_activity_policy_async("signal").await;
+                            capability_cache.clear();
+                            let new_snapshot = snapshot_signal_receive_poll(
+                                &base_url,
+                                &phone_number,
+                                &activity_policy,
+                                state.as_ref(),
+                                state.activity_service(),
+                                &mut capability_cache,
+                            )
+                            .await;
+                            if new_snapshot.suppressed_upstream_auto_receipts != poll_snapshot.suppressed_upstream_auto_receipts {
+                                info!("Signal read receipt suppression policy changed; reconnecting WebSocket stream");
+                                let _ = ws_writer.send(Message::Close(None)).await;
+                                break;
+                            } else {
+                                poll_snapshot = new_snapshot;
+                            }
+                        }
+                        msg = ws_reader.next() => {
+                            match msg {
+                                Some(Ok(Message::Text(text))) => {
+                                    match serde_json::from_str::<Value>(&text) {
+                                        Ok(Value::Array(items)) => {
+                                            let mut had_parse_error = false;
+                                            for item in items {
+                                                match deserialize_signal_envelope_item(item) {
+                                                    Ok(envelope) => {
+                                                        let carapace_manages_read_receipts =
+                                                            poll_snapshot.carapace_manages_read_receipts();
+                                                        process_envelope(
+                                                            &envelope,
+                                                            &state,
+                                                            carapace_manages_read_receipts,
+                                                            &mut poll_snapshot.read_receipt_reservation,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(e) => {
+                                                        had_parse_error = true;
+                                                        record_signal_parse_failure(
+                                                            "envelope item",
+                                                            &e,
+                                                            &mut consecutive_parse_errors,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if !had_parse_error && consecutive_parse_errors > 0 {
+                                                info!(
+                                                    "Signal receive parse handling recovered after {} errors",
+                                                    consecutive_parse_errors
+                                                );
+                                                consecutive_parse_errors = 0;
+                                            }
+                                        }
+                                        Ok(item @ Value::Object(_)) => {
+                                            match deserialize_signal_envelope_item(item) {
+                                                Ok(envelope) => {
+                                                    if consecutive_parse_errors > 0 {
+                                                        info!(
+                                                            "Signal receive parse handling recovered after {} errors",
+                                                            consecutive_parse_errors
+                                                        );
+                                                        consecutive_parse_errors = 0;
+                                                    }
+                                                    let carapace_manages_read_receipts =
+                                                        poll_snapshot.carapace_manages_read_receipts();
+                                                    process_envelope(
+                                                        &envelope,
+                                                        &state,
+                                                        carapace_manages_read_receipts,
+                                                        &mut poll_snapshot.read_receipt_reservation,
+                                                    )
+                                                    .await;
+                                                }
+                                                Err(e) => {
+                                                    record_signal_parse_failure(
+                                                        "envelope item",
+                                                        &e,
+                                                        &mut consecutive_parse_errors,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Ok(_) => {
+                                            debug!("Ignoring non-object non-array Signal WebSocket payload");
+                                        }
+                                        Err(e) => {
+                                            record_signal_parse_failure(
+                                                "receive payload JSON",
+                                                &e,
+                                                &mut consecutive_parse_errors,
+                                            );
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    had_parse_error = true;
-                                    record_signal_parse_failure(
-                                        "envelope item",
-                                        &e,
-                                        &mut consecutive_parse_errors,
-                                    );
+                                Some(Ok(Message::Ping(payload))) => {
+                                    if let Err(e) = ws_writer.send(Message::Pong(payload)).await {
+                                        warn!(error = %e, "Failed to respond to Signal WebSocket ping with pong");
+                                    }
+                                }
+                                Some(Ok(Message::Pong(_))) => {}
+                                Some(Ok(Message::Close(frame))) => {
+                                    info!(frame = ?frame, "Signal WebSocket stream closed by remote");
+                                    break;
+                                }
+                                Some(Ok(Message::Binary(_))) => {
+                                    debug!("Ignoring binary Signal WebSocket message");
+                                }
+                                Some(Ok(Message::Frame(_))) => {}
+                                Some(Err(err)) => {
+                                    let sanitized = sanitize_signal_receive_transport_error(&err);
+                                    warn!(error = %sanitized, "Signal WebSocket stream error");
+                                    channel_registry.set_error("signal", sanitized);
+                                    break;
+                                }
+                                None => {
+                                    info!("Signal WebSocket stream ended");
+                                    break;
                                 }
                             }
                         }
-                        if !had_parse_error && consecutive_parse_errors > 0 {
-                            info!(
-                                "Signal receive parse handling recovered after {} errors",
-                                consecutive_parse_errors
-                            );
-                            consecutive_parse_errors = 0;
-                        }
-                    }
-                    Err(error_message) => {
-                        record_signal_parse_failure(
-                            "receive response",
-                            &error_message,
-                            &mut consecutive_parse_errors,
-                        );
-                        channel_registry.set_error(
-                            "signal",
-                            format!("receive parse failed: {}", error_message),
-                        );
                     }
                 }
             }
-            Ok(resp) => {
+            Err(err) => {
                 consecutive_errors += 1;
-                let status = resp.status();
+                let sanitized = sanitize_signal_receive_transport_error(&err);
                 if consecutive_errors <= 3 {
-                    warn!("Signal receive HTTP {}", status);
-                }
-                channel_registry.set_error("signal", format!("HTTP {}", status));
-            }
-            Err(e) => {
-                consecutive_errors += 1;
-                let sanitized_error = sanitize_signal_receive_transport_error(e);
-                if consecutive_errors <= 3 {
-                    warn!("Signal receive error: {}", sanitized_error);
+                    warn!(error = %sanitized, "Signal WebSocket connect failed");
                 } else if consecutive_errors == 4 {
                     warn!(
-                        "Signal receive errors continuing (suppressing further logs until recovery)"
+                        "Signal WebSocket connect errors continuing (suppressing further logs until recovery)"
                     );
                 }
-                channel_registry.set_error("signal", sanitized_error);
+                channel_registry.set_error("signal", sanitized);
             }
         }
 
-        // Wait for poll interval or shutdown
+        if *shutdown.borrow() {
+            break;
+        }
+
         tokio::select! {
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            _ = tokio::time::sleep(backoff) => {
+                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+            }
             changed = config_rx.changed() => {
-                if changed.is_err() {
-                    warn!("Signal receive loop config subscription closed unexpectedly");
-                    continue;
+                if changed.is_ok() {
+                    activity_policy =
+                        crate::channels::activity::load_channel_activity_policy_async("signal").await;
+                    capability_cache.clear();
                 }
-                activity_policy =
-                    crate::channels::activity::load_channel_activity_policy_async("signal").await;
-                capability_cache.clear();
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    info!("Signal receive loop shutting down");
                     break;
                 }
             }
         }
     }
+
+    channel_registry.update_status("signal", ChannelStatus::Disconnected);
+    info!("Signal receive loop shutting down");
 }
 
 /// Process a single inbound Signal envelope by routing it into the chat pipeline.
@@ -620,7 +692,7 @@ mod tests {
 
     use axum::extract::{OriginalUri, Path, State};
     use axum::routing::get;
-    use axum::{Json, Router};
+    use axum::Router;
     use parking_lot::Mutex;
     use tokio::sync::Notify;
 
@@ -796,23 +868,31 @@ mod tests {
         responses: Arc<Mutex<VecDeque<Value>>>,
     }
 
-    async fn signal_receive_test_handler(
+    async fn signal_receive_test_ws_handler(
+        ws: axum::extract::ws::WebSocketUpgrade,
         State(state): State<SignalReceiveTestServerState>,
         OriginalUri(uri): OriginalUri,
         Path(_number): Path<String>,
-    ) -> Json<Value> {
-        state.requests.lock().push(
-            uri.path_and_query()
-                .map(|value| value.as_str().to_string())
-                .unwrap_or_else(|| uri.path().to_string()),
-        );
-        Json(
-            state
-                .responses
-                .lock()
-                .pop_front()
-                .unwrap_or_else(|| serde_json::json!([])),
-        )
+    ) -> axum::response::Response {
+        let uri_str = uri
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| uri.path().to_string());
+        state.requests.lock().push(uri_str);
+        let next_msg = state.responses.lock().pop_front();
+        ws.on_upgrade(move |mut socket| async move {
+            if let Some(payload) = next_msg {
+                let text = serde_json::to_string(&payload).unwrap();
+                let _ = socket
+                    .send(axum::extract::ws::Message::Text(text.into()))
+                    .await;
+            }
+            while let Some(Ok(msg)) = socket.recv().await {
+                if let axum::extract::ws::Message::Close(_) = msg {
+                    break;
+                }
+            }
+        })
     }
 
     async fn wait_for_condition<F>(timeout: Duration, mut condition: F)
@@ -1052,10 +1132,10 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080").unwrap(),
                 "+15551234567",
-                0
+                false
             )
             .as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567"
+            "ws://localhost:8080/v1/receive/%2B15551234567"
         );
     }
 
@@ -1065,10 +1145,10 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080").unwrap(),
                 "+15551234567",
-                7
+                true
             )
             .as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567?max_messages=7&send_read_receipts=false"
+            "ws://localhost:8080/v1/receive/%2B15551234567?send_read_receipts=false"
         );
     }
 
@@ -1078,10 +1158,10 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080?debug=1").unwrap(),
                 "+15551234567",
-                7
+                true
             )
             .as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567?debug=1&max_messages=7&send_read_receipts=false"
+            "ws://localhost:8080/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
         );
     }
 
@@ -1094,10 +1174,10 @@ mod tests {
                 )
                 .unwrap(),
                 "+15551234567",
-                7
+                true
             )
             .as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567?debug=1&max_messages=7&send_read_receipts=false"
+            "ws://localhost:8080/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
         );
     }
 
@@ -1111,10 +1191,10 @@ mod tests {
                 )
                 .unwrap(),
                 "+15551234567",
-                0,
+                false
             )
             .as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567?debug=1"
+            "ws://localhost:8080/v1/receive/%2B15551234567?debug=1"
         );
     }
 
@@ -1124,10 +1204,10 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080/api").unwrap(),
                 "+15551234567",
-                0
+                false
             )
             .as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567"
+            "ws://localhost:8080/api/v1/receive/%2B15551234567"
         );
     }
 
@@ -1137,10 +1217,23 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
                 "+15551234567",
-                7
+                true
             )
             .as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&max_messages=7&send_read_receipts=false"
+            "ws://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+        );
+    }
+
+    #[test]
+    fn test_build_receive_url_converts_https_to_wss() {
+        assert_eq!(
+            build_receive_url(
+                &url::Url::parse("https://signal.example.com/api").unwrap(),
+                "+15551234567",
+                true
+            )
+            .as_str(),
+            "wss://signal.example.com/api/v1/receive/%2B15551234567?send_read_receipts=false"
         );
     }
 
@@ -1168,7 +1261,7 @@ mod tests {
         assert!(!snapshot.carapace_manages_read_receipts());
         assert_eq!(
             snapshot.receive_url.as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567"
+            "ws://localhost:8080/v1/receive/%2B15551234567"
         );
         drop(snapshot);
         state.shutdown_activity_service().await;
@@ -1184,17 +1277,9 @@ mod tests {
             .send()
             .await
             .expect_err("transport request should fail against unreachable port");
-        let sanitized = sanitize_signal_receive_transport_error(err);
+        let sanitized = sanitize_signal_receive_transport_error(&err);
         assert!(!sanitized.contains("%2B15551234567"));
         assert!(!sanitized.contains("+15551234567"));
-        assert!(!sanitized.contains("send_read_receipts=false"));
-    }
-
-    #[test]
-    fn test_build_signal_receive_http_client_reports_builder_errors() {
-        let err = build_signal_receive_http_client(reqwest::Client::builder().user_agent("\n"))
-            .expect_err("invalid user agent should fail client construction");
-        assert!(err.contains("failed to build Signal receive HTTP client"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1221,7 +1306,7 @@ mod tests {
         assert!(snapshot.carapace_manages_read_receipts());
         assert_eq!(
             snapshot.receive_url.as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&max_messages=3&send_read_receipts=false"
+            "ws://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
         );
         drop(snapshot);
         state.shutdown_activity_service().await;
@@ -1263,7 +1348,7 @@ mod tests {
         assert!(!snapshot.carapace_manages_read_receipts());
         assert_eq!(
             snapshot.receive_url.as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1"
+            "ws://localhost:8080/api/v1/receive/%2B15551234567?debug=1"
         );
         drop(snapshot);
         state.shutdown_activity_service().await;
@@ -1300,7 +1385,7 @@ mod tests {
         assert!(snapshot.carapace_manages_read_receipts());
         assert_eq!(
             snapshot.receive_url.as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&max_messages=10000&send_read_receipts=false"
+            "ws://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
         );
         drop(snapshot);
         state.shutdown_activity_service().await;
@@ -1331,7 +1416,7 @@ mod tests {
         assert!(!snapshot.carapace_manages_read_receipts());
         assert_eq!(
             snapshot.receive_url.as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1"
+            "ws://localhost:8080/api/v1/receive/%2B15551234567?debug=1"
         );
         drop(snapshot);
         state.shutdown_activity_service().await;
@@ -1582,7 +1667,10 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
         let app = Router::new()
-            .route("/api/v1/receive/{number}", get(signal_receive_test_handler))
+            .route(
+                "/api/v1/receive/{number}",
+                get(signal_receive_test_ws_handler),
+            )
             .with_state(SignalReceiveTestServerState {
                 requests: requests.clone(),
                 responses: responses.clone(),
@@ -1677,6 +1765,89 @@ mod tests {
             receipt_tasks[0].payload["context"]["timestamp"].as_u64(),
             Some(1706745601000_u64)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_signal_receive_loop_handles_ping_pong_and_clean_close() {
+        let (ping_received_tx, ping_received_rx) = tokio::sync::watch::channel(false);
+        let ping_received_tx = Arc::new(ping_received_tx);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test Signal receive server");
+        let addr = listener.local_addr().expect("local addr");
+        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let tx_for_ws = ping_received_tx.clone();
+        let app = Router::new().route(
+            "/v1/receive/{number}",
+            get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+                let tx = tx_for_ws.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Ping(vec![1, 2, 3, 4].into()))
+                            .await;
+                        while let Some(Ok(msg)) = socket.recv().await {
+                            match msg {
+                                axum::extract::ws::Message::Pong(payload) => {
+                                    if payload.as_ref() == [1, 2, 3, 4] {
+                                        let _ = tx.send(true);
+                                    }
+                                }
+                                axum::extract::ws::Message::Close(_) => {
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    })
+                }
+            }),
+        );
+
+        let server_task = tokio::spawn(async move {
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let mut shutdown = server_shutdown_rx;
+                let _ = shutdown.changed().await;
+            });
+            server.await.expect("serve test Signal receive server");
+        });
+
+        let state = test_state_with_provider_and_signal_plugin();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let receive_task = tokio::spawn(signal_receive_loop(
+            format!("http://127.0.0.1:{}", addr.port()),
+            "+15551234567".to_string(),
+            state.clone(),
+            state.channel_registry().clone(),
+            shutdown_rx,
+        ));
+
+        let mut ping_rx = ping_received_rx;
+        let pong_received = tokio::time::timeout(Duration::from_secs(2), async {
+            while !*ping_rx.borrow() {
+                if ping_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            pong_received.is_ok(),
+            "receive loop should answer ping with pong"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), receive_task)
+            .await
+            .expect("receive loop should exit")
+            .expect("receive loop task should succeed");
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server should exit")
+            .expect("server task should succeed");
     }
 
     #[tokio::test(flavor = "current_thread")]

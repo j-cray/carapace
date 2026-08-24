@@ -210,7 +210,10 @@
   //   // enabled: false,                            // explicit kill switch
   // },
 
-  // --- Signal channel (via signal-cli REST API) ------------------------------
+  // --- Signal channel (via signal-cli REST API / WebSocket) ------------------
+  // Note: For optimal performance and zero database lock contention, run
+  // signal-cli-rest-api with MODE=json-rpc or MODE=json-rpc-native. Carapace
+  // connects to the /v1/receive WebSocket stream for real-time push reception.
   // signal: {
   //   baseUrl: "http://localhost:8080",           // signal-cli-rest-api address
   //   phoneNumber: "+15551234567",                // registered Signal number
