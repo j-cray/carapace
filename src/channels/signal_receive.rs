@@ -166,7 +166,7 @@ fn build_receive_url(
         "https" | "wss" => "wss",
         _ => "ws",
     };
-    let _ = url.set_scheme(ws_scheme);
+    url.set_scheme(ws_scheme).expect("valid WebSocket scheme");
     let encoded_phone_number = urlencoding::encode(phone_number);
     let path_prefix = url.path().trim_end_matches('/');
     let receive_path = if path_prefix.is_empty() {
