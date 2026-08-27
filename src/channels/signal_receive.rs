@@ -540,6 +540,7 @@ pub async fn signal_receive_loop(
                         }
                     }
                 }
+                channel_registry.update_status("signal", ChannelStatus::Disconnected);
             }
             Err(err) => {
                 consecutive_errors += 1;
