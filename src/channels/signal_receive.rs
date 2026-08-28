@@ -547,7 +547,9 @@ pub async fn signal_receive_loop(
                         }
                     }
                 }
-                channel_registry.update_status("signal", ChannelStatus::Disconnected);
+                if channel_registry.get_status("signal") != Some(ChannelStatus::Error) {
+                    channel_registry.update_status("signal", ChannelStatus::Disconnected);
+                }
             }
             Err(err) => {
                 consecutive_errors += 1;
@@ -1886,6 +1888,149 @@ mod tests {
             pong_received.is_ok(),
             "receive loop should answer ping with pong"
         );
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), receive_task)
+            .await
+            .expect("receive loop should exit")
+            .expect("receive loop task should succeed");
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server should exit")
+            .expect("server task should succeed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_signal_receive_loop_preserves_error_status_on_stream_error() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test Signal receive server");
+        let addr = listener.local_addr().expect("local addr");
+        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let server_task = tokio::spawn(async move {
+            let mut shutdown = server_shutdown_rx;
+            tokio::select! {
+                _ = shutdown.changed() => {}
+                res = listener.accept() => {
+                    if let Ok((stream, _)) = res {
+                        if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
+                            let mut raw_stream = ws_stream.into_inner();
+                            let _ = raw_stream.flush().await;
+                            // Send partial frame header declaring 1024 bytes payload, then drop stream
+                            // to force an unexpected EOF stream read error on the client.
+                            let _ = raw_stream.write_all(&[0x81, 0x7E, 0x04, 0x00]).await;
+                            let _ = raw_stream.flush().await;
+                            drop(raw_stream);
+                        }
+                    }
+                }
+            }
+        });
+
+        let state = test_state_with_provider_and_signal_plugin();
+        let channel_registry = state.channel_registry().clone();
+        channel_registry.register(crate::channels::ChannelInfo::new("signal", "Signal"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let receive_task = tokio::spawn(signal_receive_loop(
+            format!("http://127.0.0.1:{}", addr.port()),
+            "+15551234567".to_string(),
+            state.clone(),
+            channel_registry.clone(),
+            shutdown_rx,
+        ));
+
+        wait_for_condition(Duration::from_secs(2), || {
+            channel_registry.get_status("signal") == Some(ChannelStatus::Error)
+        })
+        .await;
+
+        let channel_info = channel_registry.get("signal").expect("channel info");
+        assert_eq!(channel_info.status, ChannelStatus::Error);
+        assert!(
+            channel_info.metadata.last_error.is_some(),
+            "last_error must be preserved on stream read error"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), receive_task)
+            .await
+            .expect("receive loop should exit")
+            .expect("receive loop task should succeed");
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server should exit")
+            .expect("server task should succeed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_signal_receive_loop_sets_disconnected_on_clean_remote_close() {
+        let (close_sent_tx, close_sent_rx) = tokio::sync::watch::channel(false);
+        let close_sent_tx = Arc::new(close_sent_tx);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test Signal receive server");
+        let addr = listener.local_addr().expect("local addr");
+        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let tx = close_sent_tx.clone();
+        let app = Router::new().route(
+            "/v1/receive/{number}",
+            get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+                let tx = tx.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        let _ = socket.send(axum::extract::ws::Message::Close(None)).await;
+                        let _ = tx.send(true);
+                    })
+                }
+            }),
+        );
+
+        let server_task = tokio::spawn(async move {
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let mut shutdown = server_shutdown_rx;
+                let _ = shutdown.changed().await;
+            });
+            server.await.expect("serve test Signal receive server");
+        });
+
+        let state = test_state_with_provider_and_signal_plugin();
+        let channel_registry = state.channel_registry().clone();
+        channel_registry.register(crate::channels::ChannelInfo::new("signal", "Signal"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let receive_task = tokio::spawn(signal_receive_loop(
+            format!("http://127.0.0.1:{}", addr.port()),
+            "+15551234567".to_string(),
+            state.clone(),
+            channel_registry.clone(),
+            shutdown_rx,
+        ));
+
+        let mut rx = close_sent_rx;
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            while !*rx.borrow() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(sent.is_ok(), "server should send clean close frame");
+
+        wait_for_condition(Duration::from_secs(2), || {
+            channel_registry.get_status("signal") == Some(ChannelStatus::Disconnected)
+        })
+        .await;
+
+        let channel_info = channel_registry.get("signal").expect("channel info");
+        assert_eq!(channel_info.status, ChannelStatus::Disconnected);
+        assert!(channel_info.metadata.last_error.is_none());
 
         let _ = shutdown_tx.send(true);
         let _ = server_shutdown_tx.send(true);
