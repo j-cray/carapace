@@ -149,10 +149,17 @@ fn read_receipt_context_for_signal_run(
 
 fn sanitize_signal_receive_transport_error(error: &dyn std::fmt::Display) -> String {
     let raw = error.to_string();
+    static URL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\b(?:https?|wss?)://[^\s<>()"']*[^\s<>()"':,.;]"#)
+            .expect("valid URL regex")
+    });
     static SENSITIVE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(%2B|\+)\d{5,}").expect("valid sensitive phone regex")
     });
-    SENSITIVE_RE.replace_all(&raw, "[redacted]").to_string()
+    let without_url = URL_RE.replace_all(&raw, "[redacted]");
+    SENSITIVE_RE
+        .replace_all(&without_url, "[redacted]")
+        .to_string()
 }
 
 fn build_receive_url(
@@ -1285,6 +1292,43 @@ mod tests {
         let sanitized = sanitize_signal_receive_transport_error(&err);
         assert!(!sanitized.contains("%2B15551234567"));
         assert!(!sanitized.contains("+15551234567"));
+        assert!(!sanitized.contains("127.0.0.1:1"));
+        assert!(!sanitized.contains("send_read_receipts=false"));
+        assert!(!sanitized.contains("max_messages=7"));
+        assert!(!sanitized.contains("/v1/receive"));
+    }
+
+    #[test]
+    fn test_sanitize_signal_receive_transport_error_scrubs_ws_urls_and_credentials() {
+        struct MockError(&'static str);
+        impl std::fmt::Display for MockError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        let err = MockError(
+            "WebSocket connect error for ws://user:secretpass@127.0.0.1:8080/v1/receive/%2B15551234567?token=xyz123: Connection refused",
+        );
+        let sanitized = sanitize_signal_receive_transport_error(&err);
+        assert!(!sanitized.contains("user:secretpass"));
+        assert!(!sanitized.contains("127.0.0.1:8080"));
+        assert!(!sanitized.contains("%2B15551234567"));
+        assert!(!sanitized.contains("+15551234567"));
+        assert!(!sanitized.contains("token=xyz123"));
+        assert_eq!(
+            sanitized,
+            "WebSocket connect error for [redacted]: Connection refused"
+        );
+
+        let err2 = MockError(
+            "Connection to wss://example.com/v1/receive/+15559876543 closed unexpectedly (status: +15559876543 error)",
+        );
+        let sanitized2 = sanitize_signal_receive_transport_error(&err2);
+        assert_eq!(
+            sanitized2,
+            "Connection to [redacted] closed unexpectedly (status: [redacted] error)"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
