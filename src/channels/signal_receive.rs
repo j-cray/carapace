@@ -2,6 +2,7 @@
 //!
 //! Connects to the signal-cli-rest-api WebSocket stream at `{base_url}/v1/receive/{number}`
 //! (rewriting `http`→`ws` and `https`→`wss`) and routes inbound messages in real time into the chat pipeline.
+//! Requires `signal-cli-rest-api` running in JSON-RPC mode (`MODE=json-rpc-native` or `MODE=json-rpc`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -340,6 +341,8 @@ fn record_signal_parse_failure<E: std::fmt::Display>(
 /// (or `wss://...`), receives pushed inbound message envelopes in real time, and routes
 /// them into the chat pipeline. Updates channel registry status on success/failure and
 /// reconnects with exponential backoff on disconnect. Exits when the shutdown signal fires.
+///
+/// Requires `signal-cli-rest-api` running in JSON-RPC mode (`MODE=json-rpc-native` or `MODE=json-rpc`).
 pub async fn signal_receive_loop(
     base_url: String,
     phone_number: String,
