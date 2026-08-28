@@ -204,7 +204,6 @@ fn build_receive_url(
 struct SignalReceivePollSnapshot {
     receive_url: url::Url,
     suppressed_upstream_auto_receipts: bool,
-    read_receipt_reservation: Option<crate::channels::activity::ReadReceiptOwnershipReservation>,
 }
 
 impl SignalReceivePollSnapshot {
@@ -243,65 +242,62 @@ async fn can_manage_signal_read_receipts(
     activity_service: &crate::channels::activity::ActivityService,
     state: &WsServerState,
     capability_cache: &mut SignalReadReceiptCapabilityCache,
-) -> Option<crate::channels::activity::ReadReceiptOwnershipReservation> {
+) -> bool {
     if !activity_policy.read_receipts.enabled {
-        return None;
+        return false;
     }
 
     let Some(plugin_registry) = state.plugin_registry() else {
         capability_cache.clear();
-        return None;
+        return false;
     };
     let Some(plugin) = plugin_registry.get_channel("signal") else {
         capability_cache.clear();
-        return None;
+        return false;
     };
     capability_cache.update_plugin(signal_plugin_cache_key(&plugin));
 
-    if let Some(supported) = capability_cache.read_receipts_supported {
-        return if supported {
-            activity_service.reserve_available_read_receipt_ownership("signal")
-        } else {
-            None
-        };
-    }
-    if capability_cache
-        .retry_after
-        .is_some_and(|retry_after| Instant::now() < retry_after)
-    {
-        return None;
-    }
+    let supported = if let Some(supported) = capability_cache.read_receipts_supported {
+        supported
+    } else {
+        if capability_cache
+            .retry_after
+            .is_some_and(|retry_after| Instant::now() < retry_after)
+        {
+            return false;
+        }
 
-    match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
-        Ok(Ok(capabilities)) => {
-            capability_cache.read_receipts_supported = Some(capabilities.read_receipts);
-            capability_cache.retry_after = None;
-            if capabilities.read_receipts {
-                activity_service.reserve_available_read_receipt_ownership("signal")
-            } else {
-                activity_service.warn_unsupported_feature("signal", "read_receipts");
-                None
+        match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
+            Ok(Ok(capabilities)) => {
+                capability_cache.read_receipts_supported = Some(capabilities.read_receipts);
+                capability_cache.retry_after = None;
+                if !capabilities.read_receipts {
+                    activity_service.warn_unsupported_feature("signal", "read_receipts");
+                }
+                capabilities.read_receipts
+            }
+            Ok(Err(err)) => {
+                capability_cache.retry_after =
+                    Some(Instant::now() + SIGNAL_RECEIPT_CAPABILITY_RETRY_BACKOFF);
+                warn!(
+                    error = %err,
+                    "failed to load Signal capabilities while deciding whether to suppress upstream auto-read-receipts"
+                );
+                false
+            }
+            Err(err) => {
+                capability_cache.retry_after =
+                    Some(Instant::now() + SIGNAL_RECEIPT_CAPABILITY_RETRY_BACKOFF);
+                warn!(
+                    error = %err,
+                    "Signal capability worker failed while deciding whether to suppress upstream auto-read-receipts"
+                );
+                false
             }
         }
-        Ok(Err(err)) => {
-            capability_cache.retry_after =
-                Some(Instant::now() + SIGNAL_RECEIPT_CAPABILITY_RETRY_BACKOFF);
-            warn!(
-                error = %err,
-                "failed to load Signal capabilities while deciding whether to suppress upstream auto-read-receipts"
-            );
-            None
-        }
-        Err(err) => {
-            capability_cache.retry_after =
-                Some(Instant::now() + SIGNAL_RECEIPT_CAPABILITY_RETRY_BACKOFF);
-            warn!(
-                error = %err,
-                "Signal capability worker failed while deciding whether to suppress upstream auto-read-receipts"
-            );
-            None
-        }
-    }
+    };
+
+    supported && activity_service.can_accept_read_receipt_ownership("signal")
 }
 
 async fn snapshot_signal_receive_poll(
@@ -312,13 +308,12 @@ async fn snapshot_signal_receive_poll(
     activity_service: &crate::channels::activity::ActivityService,
     capability_cache: &mut SignalReadReceiptCapabilityCache,
 ) -> SignalReceivePollSnapshot {
-    let read_receipt_reservation =
+    let carapace_manages_read_receipts =
         can_manage_signal_read_receipts(activity_policy, activity_service, state, capability_cache)
             .await;
     SignalReceivePollSnapshot {
-        receive_url: build_receive_url(base_url, phone_number, read_receipt_reservation.is_some()),
-        suppressed_upstream_auto_receipts: read_receipt_reservation.is_some(),
-        read_receipt_reservation,
+        receive_url: build_receive_url(base_url, phone_number, carapace_manages_read_receipts),
+        suppressed_upstream_auto_receipts: carapace_manages_read_receipts,
     }
 }
 
@@ -459,7 +454,6 @@ pub async fn signal_receive_loop(
                                                             &envelope,
                                                             &state,
                                                             carapace_manages_read_receipts,
-                                                            &mut poll_snapshot.read_receipt_reservation,
                                                         )
                                                         .await;
                                                     }
@@ -497,7 +491,6 @@ pub async fn signal_receive_loop(
                                                         &envelope,
                                                         &state,
                                                         carapace_manages_read_receipts,
-                                                        &mut poll_snapshot.read_receipt_reservation,
                                                     )
                                                     .await;
                                                 }
@@ -600,9 +593,6 @@ async fn process_envelope(
     envelope: &SignalEnvelope,
     state: &Arc<WsServerState>,
     carapace_manages_read_receipts: bool,
-    read_receipt_reservation: &mut Option<
-        crate::channels::activity::ReadReceiptOwnershipReservation,
-    >,
 ) {
     let data_message = match &envelope.data_message {
         Some(dm) => dm,
@@ -645,9 +635,9 @@ async fn process_envelope(
     };
     let had_read_receipt_context = read_receipt_context.is_some();
     let read_receipt = read_receipt_context.and_then(|ctx| {
-        read_receipt_reservation
-            .as_mut()
-            .and_then(|reservation| reservation.claim(ctx))
+        state
+            .activity_service()
+            .try_claim_read_receipt("signal", ctx)
     });
 
     debug!(
@@ -1802,17 +1792,8 @@ mod tests {
             .is_some_and(|request| request.contains("send_read_receipts=false")));
 
         let runs = state.agent_run_registry.lock().snapshot_runs();
-        let first = runs
-            .iter()
-            .find(|run| run.message == "first")
-            .expect("first inbound run");
-        assert_eq!(first.status, crate::server::ws::AgentRunStatus::Queued);
-
-        let second = runs
-            .iter()
-            .find(|run| run.message == "second")
-            .expect("second inbound run");
-        assert_eq!(second.status, crate::server::ws::AgentRunStatus::Queued);
+        assert!(runs.iter().any(|run| run.message == "first"));
+        assert!(runs.iter().any(|run| run.message == "second"));
         let receipt_tasks = state.activity_service().read_receipt_queue().list();
         assert_eq!(receipt_tasks.len(), 1);
         assert_eq!(
@@ -2067,10 +2048,7 @@ mod tests {
             }),
         };
 
-        let mut read_receipt_reservation = state
-            .activity_service()
-            .reserve_available_read_receipt_ownership("signal");
-        process_envelope(&envelope, &state, true, &mut read_receipt_reservation).await;
+        process_envelope(&envelope, &state, true).await;
 
         assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 0);
         assert!(state
@@ -2107,10 +2085,7 @@ mod tests {
             }),
         };
 
-        let mut read_receipt_reservation = state
-            .activity_service()
-            .reserve_available_read_receipt_ownership("signal");
-        process_envelope(&envelope, &state, true, &mut read_receipt_reservation).await;
+        process_envelope(&envelope, &state, true).await;
 
         assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 0);
         assert!(state
@@ -2126,7 +2101,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_process_envelope_uses_reserved_poll_capacity_when_other_claims_are_blocked() {
+    async fn test_process_envelope_claims_receipt_dynamically_and_respects_backpressure() {
         let activity_service =
             Arc::new(crate::channels::activity::ActivityService::with_limits_for_test(8, 1));
         let plugin_registry = Arc::new(PluginRegistry::new());
@@ -2145,7 +2120,7 @@ mod tests {
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
-        let mut poll_snapshot = snapshot_signal_receive_poll(
+        let poll_snapshot = snapshot_signal_receive_poll(
             &url::Url::parse("http://localhost:8080").unwrap(),
             "+15551234567",
             &activity_policy,
@@ -2156,49 +2131,132 @@ mod tests {
         .await;
         assert!(
             poll_snapshot.carapace_manages_read_receipts(),
-            "poll snapshot should reserve the only available ownership slot"
+            "poll snapshot should enable read receipt management without blocking other claims"
         );
         assert!(
-            activity_service
-                .try_claim_read_receipt(
-                    "signal",
-                    ReadReceiptContext {
-                        recipient: "+15551230000".to_string(),
-                        timestamp: Some(1),
-                        ..Default::default()
-                    },
-                )
-                .is_none(),
-            "other claims should be blocked while the poll reservation owns the slot"
+            activity_service.can_accept_read_receipt_ownership("signal"),
+            "snapshot should not hold a static batch reservation while the stream is idle"
         );
-        let envelope = SignalEnvelope {
+
+        // Simulate backpressure by claiming the 1 available slot.
+        let held_claim = activity_service
+            .try_claim_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15550000000".to_string(),
+                    timestamp: Some(100),
+                    ..Default::default()
+                },
+            )
+            .expect("should claim the only available slot");
+
+        assert!(
+            !activity_service.can_accept_read_receipt_ownership("signal"),
+            "backlog should reach high-water mark when capacity is held"
+        );
+
+        // An envelope arriving while capacity is exhausted is dispatched without claiming a receipt.
+        let envelope1 = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             timestamp: Some(1706745600000),
             data_message: Some(SignalDataMessage {
-                message: Some("hello".to_string()),
+                message: Some("hello 1".to_string()),
                 timestamp: Some(1706745600000),
                 group_info: None,
             }),
         };
 
         let carapace_manages_read_receipts = poll_snapshot.carapace_manages_read_receipts();
-        process_envelope(
-            &envelope,
-            &state,
-            carapace_manages_read_receipts,
-            &mut poll_snapshot.read_receipt_reservation,
-        )
-        .await;
+        process_envelope(&envelope1, &state, carapace_manages_read_receipts).await;
 
         let runs = state.agent_run_registry.lock().snapshot_runs();
-        assert!(runs.iter().any(|run| run.message == "hello"));
+        assert!(runs.iter().any(|run| run.message == "hello 1"));
+        // No receipt was claimed because of backpressure.
+        assert!(state.activity_service().read_receipt_queue().list().is_empty());
+
+        // Now release the held claim so capacity opens up.
+        assert!(activity_service.withhold_claimed_read_receipt(&held_claim));
+        assert!(
+            activity_service.can_accept_read_receipt_ownership("signal"),
+            "capacity should be available again after releasing held claim"
+        );
+
+        // A second envelope now claims and completes receipt ownership dynamically.
+        let envelope2 = SignalEnvelope {
+            source_uuid: None,
+            source_number: Some("+15559876543".to_string()),
+            timestamp: Some(1706745600001),
+            data_message: Some(SignalDataMessage {
+                message: Some("hello 2".to_string()),
+                timestamp: Some(1706745600001),
+                group_info: None,
+            }),
+        };
+        process_envelope(&envelope2, &state, carapace_manages_read_receipts).await;
+
+        let runs = state.agent_run_registry.lock().snapshot_runs();
+        assert!(runs.iter().any(|run| run.message == "hello 2"));
         let receipt_tasks = state.activity_service().read_receipt_queue().list();
         assert_eq!(receipt_tasks.len(), 1);
         assert_eq!(
             receipt_tasks[0].payload["context"]["timestamp"].as_u64(),
-            Some(1706745600000)
+            Some(1706745600001)
         );
+
+        state.shutdown_activity_service().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_envelope_processes_unbounded_stream_messages_without_capacity_exhaustion()
+    {
+        let notify = Arc::new(Notify::new());
+        let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), signal_channel.clone());
+        // Configure watermark limit of 1
+        let activity_service =
+            Arc::new(crate::channels::activity::ActivityService::with_limits_for_test(8, 1));
+        let state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_llm_provider(Arc::new(StaticTestProvider))
+                .with_plugin_registry(plugin_registry)
+                .with_activity_service(activity_service.clone()),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        state
+            .activity_service()
+            .spawn_read_receipt_worker(state.clone(), shutdown_rx);
+
+        // Send 5 messages sequentially across the same stream session.
+        // Each message claims a receipt, worker completes it, releasing capacity for the next message.
+        for i in 0..5 {
+            let timestamp = 1706745600000 + i;
+            let envelope = SignalEnvelope {
+                source_uuid: None,
+                source_number: Some("+15559876543".to_string()),
+                timestamp: Some(timestamp),
+                data_message: Some(SignalDataMessage {
+                    message: Some(format!("message {}", i)),
+                    timestamp: Some(timestamp),
+                    group_info: None,
+                }),
+            };
+
+            process_envelope(&envelope, &state, true).await;
+
+            tokio::time::timeout(Duration::from_secs(1), notify.notified())
+                .await
+                .expect("receipt should be sent by worker for message");
+            assert_eq!(
+                signal_channel.mark_read_count.load(Ordering::Relaxed),
+                (i + 1) as u32
+            );
+        }
+
+        shutdown_tx.send(true).unwrap();
+        state.shutdown_activity_service().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2228,10 +2286,7 @@ mod tests {
             }),
         };
 
-        let mut read_receipt_reservation = state
-            .activity_service()
-            .reserve_available_read_receipt_ownership("signal");
-        process_envelope(&envelope, &state, true, &mut read_receipt_reservation).await;
+        process_envelope(&envelope, &state, true).await;
 
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
@@ -2264,7 +2319,7 @@ mod tests {
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
-        let mut read_receipt_reservation = can_manage_signal_read_receipts(
+        let carapace_manages_read_receipts = can_manage_signal_read_receipts(
             &activity_policy,
             state.activity_service(),
             state.as_ref(),
@@ -2272,8 +2327,8 @@ mod tests {
         )
         .await;
         assert!(
-            read_receipt_reservation.is_some(),
-            "LLM provider presence should not affect receipt ownership at poll time"
+            carapace_manages_read_receipts,
+            "LLM provider presence should not affect receipt ownership at connect time"
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2293,12 +2348,10 @@ mod tests {
             }),
         };
 
-        let carapace_manages_read_receipts = read_receipt_reservation.is_some();
         process_envelope(
             &envelope,
             &state,
             carapace_manages_read_receipts,
-            &mut read_receipt_reservation,
         )
         .await;
 
