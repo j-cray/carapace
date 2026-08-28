@@ -2118,7 +2118,10 @@ mod tests {
             }
         })
         .await;
-        assert!(connected.is_ok(), "receive loop should have opened TCP connection");
+        assert!(
+            connected.is_ok(),
+            "receive loop should have opened TCP connection"
+        );
 
         assert_eq!(
             channel_registry.get_status("signal"),
@@ -2195,7 +2198,10 @@ mod tests {
             }
         })
         .await;
-        assert!(first_connected.is_ok(), "receive loop should connect first time");
+        assert!(
+            first_connected.is_ok(),
+            "receive loop should connect first time"
+        );
 
         // Update configuration while stalled in connect
         let reloaded_config = serde_json::json!({
@@ -2379,7 +2385,11 @@ mod tests {
         let runs = state.agent_run_registry.lock().snapshot_runs();
         assert!(runs.iter().any(|run| run.message == "hello 1"));
         // No receipt was claimed because of backpressure.
-        assert!(state.activity_service().read_receipt_queue().list().is_empty());
+        assert!(state
+            .activity_service()
+            .read_receipt_queue()
+            .list()
+            .is_empty());
 
         // Now release the held claim so capacity opens up.
         assert!(activity_service.withhold_claimed_read_receipt(&held_claim));
@@ -2554,12 +2564,7 @@ mod tests {
             }),
         };
 
-        process_envelope(
-            &envelope,
-            &state,
-            carapace_manages_read_receipts,
-        )
-        .await;
+        process_envelope(&envelope, &state, carapace_manages_read_receipts).await;
 
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
