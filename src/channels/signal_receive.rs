@@ -380,12 +380,12 @@ pub async fn signal_receive_loop(
         let ws_url_str = poll_snapshot.receive_url.as_str();
         channel_registry.update_status("signal", ChannelStatus::Connecting);
 
-        let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-            max_message_size: Some(16 * 1024 * 1024),
-            max_frame_size: Some(16 * 1024 * 1024),
-            ..Default::default()
-        };
-        match tokio_tungstenite::connect_async_with_config(ws_url_str, Some(ws_config), false).await {
+        let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        ws_config.max_message_size = Some(16 * 1024 * 1024);
+        ws_config.max_frame_size = Some(16 * 1024 * 1024);
+        match tokio_tungstenite::connect_async_with_config(ws_url_str, Some(ws_config), false).await
+        {
+            Ok((ws_stream, _response)) => {
                 if consecutive_errors > 0 {
                     info!(
                         "Signal receive loop recovered after {} errors",
