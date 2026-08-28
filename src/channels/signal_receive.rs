@@ -1,7 +1,7 @@
 //! Signal inbound receive loop.
 //!
-//! Connects to the signal-cli-rest-api WebSocket stream at `ws://{base_url}/v1/receive/{number}`
-//! (or `wss://...`) and routes inbound messages in real time into the chat pipeline.
+//! Connects to the signal-cli-rest-api WebSocket stream at `{base_url}/v1/receive/{number}`
+//! (rewriting `http`→`ws` and `https`→`wss`) and routes inbound messages in real time into the chat pipeline.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
