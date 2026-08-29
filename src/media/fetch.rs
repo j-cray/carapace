@@ -188,19 +188,22 @@ impl MediaFetcher {
             // Attackers could redirect from a public URL to a private IP
             .redirect(reqwest::redirect::Policy::none());
 
-        // If host is not already an IP, resolve DNS and pin validated IP
+        // If host is not already an IP, resolve DNS and pin validated IPs
         if host.parse::<IpAddr>().is_err() {
-            let validated_ip = self
+            let validated_ips = self
                 .resolve_and_validate_dns(&host, &config.ssrf_config)
                 .await?;
-            // Pin the validated IP to prevent DNS rebinding
-            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
-            client_builder = client_builder.resolve(&host, socket_addr);
+            // Pin the validated IPs to prevent DNS rebinding
+            let socket_addrs: Vec<std::net::SocketAddr> = validated_ips
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .collect();
+            client_builder = client_builder.resolve_to_addrs(&host, &socket_addrs);
 
             tracing::debug!(
                 url = %url,
                 host = %host,
-                resolved_ip = %validated_ip,
+                resolved_ips = ?socket_addrs,
                 "DNS resolved and validated for media fetch"
             );
         }
@@ -247,12 +250,12 @@ impl MediaFetcher {
 
     /// Resolve DNS and validate all IPs for SSRF protection
     ///
-    /// Returns the first validated IP to be pinned for the actual request.
+    /// Returns all validated IPs to be pinned for the actual request.
     async fn resolve_and_validate_dns(
         &self,
         host: &str,
         ssrf_config: &SsrfConfig,
-    ) -> Result<IpAddr, FetchError> {
+    ) -> Result<Vec<IpAddr>, FetchError> {
         let resolver = TokioResolver::builder_tokio()
             .and_then(|builder| builder.build())
             .map_err(|e| {
@@ -264,18 +267,19 @@ impl MediaFetcher {
             .await
             .map_err(|e| FetchError::DnsResolution(format!("{}: {}", host, e)))?;
 
-        let mut validated_ip: Option<IpAddr> = None;
+        let mut validated_ips = Vec::new();
 
         for ip in lookup.iter() {
             // Validate each resolved IP against SSRF rules
             SsrfProtection::validate_resolved_ip_with_config(&ip, host, ssrf_config)?;
-            if validated_ip.is_none() {
-                validated_ip = Some(ip);
-            }
+            validated_ips.push(ip);
         }
 
-        validated_ip
-            .ok_or_else(|| FetchError::DnsResolution(format!("No addresses returned for {}", host)))
+        if validated_ips.is_empty() {
+            return Err(FetchError::DnsResolution(format!("No addresses returned for {}", host)));
+        }
+
+        Ok(validated_ips)
     }
 
     /// Read response body with streaming size limit
