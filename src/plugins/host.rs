@@ -561,9 +561,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .redirect(reqwest::redirect::Policy::none());
 
         if host.parse::<IpAddr>().is_err() {
-            let validated_ip = self.resolve_and_validate_dns(host).await?;
-            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
-            client_builder = client_builder.resolve(host, socket_addr);
+            let validated_ips = self.resolve_and_validate_dns(host).await?;
+            let socket_addrs: Vec<std::net::SocketAddr> = validated_ips
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .collect();
+            client_builder = client_builder.resolve_to_addrs(host, &socket_addrs);
         }
 
         client_builder
@@ -609,10 +612,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// Resolve DNS and validate all IPs for SSRF protection
     ///
     /// Resolves the hostname and validates that all resolved IPs are safe.
-    /// Returns the first validated IP to be pinned for the actual request.
+    /// Returns all validated IPs to be pinned for the actual request.
     /// This prevents DNS rebinding attacks where an attacker's DNS initially
     /// returns a public IP but later returns a private IP.
-    async fn resolve_and_validate_dns(&self, host: &str) -> Result<IpAddr, HostError> {
+    async fn resolve_and_validate_dns(&self, host: &str) -> Result<Vec<IpAddr>, HostError> {
         // Create a resolver
         let resolver = TokioResolver::builder_tokio()
             .and_then(|builder| builder.build())
@@ -626,18 +629,21 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         })?;
 
         // Collect IPs and validate each one
-        let mut validated_ip: Option<IpAddr> = None;
+        let mut validated_ips = Vec::new();
         for ip in lookup.iter() {
             SsrfProtection::validate_resolved_ip_with_config(&ip, host, &self.ssrf_config)?;
-            if validated_ip.is_none() {
-                validated_ip = Some(ip);
-            }
+            validated_ips.push(ip);
         }
 
         // Ensure at least one IP was resolved and validated
-        validated_ip.ok_or_else(|| {
-            HostError::DnsResolution(format!("resolution returned no addresses for {}", host))
-        })
+        if validated_ips.is_empty() {
+            return Err(HostError::DnsResolution(format!(
+                "resolution returned no addresses for {}",
+                host
+            )));
+        }
+
+        Ok(validated_ips)
     }
 
     // ============== Media Functions ==============
@@ -836,7 +842,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .redirect(reqwest::redirect::Policy::none());
 
         if host.parse::<IpAddr>().is_err() {
-            let validated_ip = self
+            let validated_ips = self
                 .resolve_and_validate_dns(&host)
                 .await
                 .map_err(|e| match e {
@@ -845,8 +851,11 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
                     }
                     other => other,
                 })?;
-            let socket_addr = std::net::SocketAddr::new(validated_ip, port);
-            client_builder = client_builder.resolve(&host, socket_addr);
+            let socket_addrs: Vec<std::net::SocketAddr> = validated_ips
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .collect();
+            client_builder = client_builder.resolve_to_addrs(&host, &socket_addrs);
         }
 
         client_builder
@@ -973,7 +982,7 @@ async fn send_http_request(
     request_builder
         .send()
         .await
-        .map_err(|e| HostError::Http(format!("Request failed: {}", e.without_url())))
+        .map_err(|e| HostError::Http(format!("Request failed: {:#}", e)))
 }
 
 #[cfg(test)]
@@ -1395,5 +1404,27 @@ mod tests {
         };
 
         assert!(ctx.validate_http_request(&req).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_and_validate_dns_blocks_localhost() {
+        let ctx = create_test_context("test-plugin").await;
+        let result = ctx.resolve_and_validate_dns("localhost").await;
+        assert!(matches!(
+            result,
+            Err(HostError::Capability(CapabilityError::SsrfBlocked(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_and_validate_dns_returns_multiple_ips() {
+        let ctx = create_test_context("test-plugin").await;
+        // dns.google or one.one.one.one returns multiple IPs (both IPv4 and IPv6)
+        let result = ctx.resolve_and_validate_dns("dns.google").await;
+        if let Ok(ips) = result {
+            assert!(!ips.is_empty(), "Should resolve to at least one valid IP");
+            // If dual-stack DNS resolution worked, we will have multiple IPs
+            println!("Resolved {} IPs for dns.google: {:?}", ips.len(), ips);
+        }
     }
 }

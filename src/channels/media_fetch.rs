@@ -68,9 +68,12 @@ pub(crate) fn fetch_media_bytes_with_ssrf_config(
         .redirect(reqwest::redirect::Policy::none());
 
     if host.parse::<IpAddr>().is_err() {
-        let validated_ip = resolve_and_validate_dns(&host, ssrf_config)?;
-        let socket_addr = std::net::SocketAddr::new(validated_ip, port);
-        client_builder = client_builder.resolve(&host, socket_addr);
+        let validated_ips = resolve_and_validate_dns(&host, ssrf_config)?;
+        let socket_addrs: Vec<std::net::SocketAddr> = validated_ips
+            .into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .collect();
+        client_builder = client_builder.resolve_to_addrs(&host, &socket_addrs);
     }
 
     let client = client_builder
@@ -156,7 +159,7 @@ pub(crate) fn fetch_media_bytes_with_ssrf_config(
 fn resolve_and_validate_dns(
     host: &str,
     ssrf_config: &SsrfConfig,
-) -> Result<IpAddr, DeliveryResult> {
+) -> Result<Vec<IpAddr>, DeliveryResult> {
     let host = host.to_string();
     let ssrf_config = ssrf_config.clone();
     let fut = async move {
@@ -169,7 +172,7 @@ fn resolve_and_validate_dns(
             ResolveDnsError::Retryable(format!("DNS resolution failed: {host}: {e}"))
         })?;
 
-        let mut validated_ip: Option<IpAddr> = None;
+        let mut validated_ips = Vec::new();
         for ip in lookup.iter() {
             if let Err(e) =
                 SsrfProtection::validate_resolved_ip_with_config(&ip, &host, &ssrf_config)
@@ -178,13 +181,14 @@ fn resolve_and_validate_dns(
                     "SSRF protection: {e}"
                 )));
             }
-            if validated_ip.is_none() {
-                validated_ip = Some(ip);
-            }
+            validated_ips.push(ip);
         }
 
-        validated_ip
-            .ok_or_else(|| ResolveDnsError::Retryable(format!("DNS resolution failed: {host}")))
+        if validated_ips.is_empty() {
+            return Err(ResolveDnsError::Retryable(format!("DNS resolution failed: {host}")));
+        }
+
+        Ok(validated_ips)
     };
 
     run_sync_blocking_send(fut).map_err(|err| match err {
