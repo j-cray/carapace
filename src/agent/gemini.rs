@@ -320,6 +320,65 @@ pub(crate) fn build_gemini_contents(messages: &[LlmMessage]) -> Vec<Value> {
         }));
     }
 
+    // Normalize Gemini / Vertex AI conversational turn structure:
+    // 1. Ensure contents is not empty.
+    if contents.is_empty() {
+        contents.push(json!({
+            "role": "user",
+            "parts": [{ "text": "" }]
+        }));
+        return contents;
+    }
+
+    // 2. The first turn must have role "user". If history begins with a model turn,
+    //    prepend a user turn.
+    if contents
+        .first()
+        .and_then(|t| t.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("model")
+    {
+        contents.insert(
+            0,
+            json!({
+                "role": "user",
+                "parts": [{ "text": "Hello" }]
+            }),
+        );
+    }
+
+    // 3. The last turn must have role "user". If history ends with a model turn,
+    //    append a user turn. If the model turn contained function calls that have
+    //    not yet received a response, synthesize function response parts; otherwise
+    //    append a user continuation turn.
+    if let Some(last) = contents.last() {
+        if last.get("role").and_then(|r| r.as_str()) == Some("model") {
+            let mut response_parts = Vec::new();
+            if let Some(parts) = last.get("parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    if let Some(fc) = part.get("functionCall") {
+                        let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                        response_parts.push(json!({
+                            "functionResponse": {
+                                "name": name,
+                                "response": {
+                                    "result": "interrupted"
+                                }
+                            }
+                        }));
+                    }
+                }
+            }
+            if response_parts.is_empty() {
+                response_parts.push(json!({ "text": "Continue" }));
+            }
+            contents.push(json!({
+                "role": "user",
+                "parts": response_parts,
+            }));
+        }
+    }
+
     contents
 }
 
@@ -1224,13 +1283,29 @@ mod tests {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
             model: "gemini-2.5-flash".to_string(),
-            messages: vec![LlmMessage {
-                role: LlmRole::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "I am a model response.".to_string(),
-                    metadata: None,
-                }],
-            }],
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Hi".to_string(),
+                        metadata: None,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "I am a model response.".to_string(),
+                        metadata: None,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Thanks".to_string(),
+                        metadata: None,
+                    }],
+                },
+            ],
             system: None,
             tools: vec![],
             max_tokens: 1024,
@@ -1239,7 +1314,11 @@ mod tests {
         };
         let body = provider.build_body(&request);
         let contents = body["contents"].as_array().unwrap();
-        assert_eq!(contents[0]["role"], "model");
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["text"], "I am a model response.");
+        assert_eq!(contents[2]["role"], "user");
     }
 
     #[test]
@@ -1247,15 +1326,31 @@ mod tests {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
             model: "gemini-2.5-flash".to_string(),
-            messages: vec![LlmMessage {
-                role: LlmRole::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "Hidden reasoning".to_string(),
-                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
-                        "sig-text".to_string(),
-                    )),
-                }],
-            }],
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Question".to_string(),
+                        metadata: None,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "Hidden reasoning".to_string(),
+                        metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                            "sig-text".to_string(),
+                        )),
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Next".to_string(),
+                        metadata: None,
+                    }],
+                },
+            ],
             system: None,
             tools: vec![],
             max_tokens: 1024,
@@ -1264,9 +1359,10 @@ mod tests {
         };
 
         let body = provider.build_body(&request);
-        assert_eq!(body["contents"][0]["parts"][0]["text"], "Hidden reasoning");
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents[1]["parts"][0]["text"], "Hidden reasoning");
         assert_eq!(
-            body["contents"][0]["parts"][0]["thoughtSignature"],
+            contents[1]["parts"][0]["thoughtSignature"],
             "sig-text"
         );
     }
@@ -1277,6 +1373,13 @@ mod tests {
         let request = CompletionRequest {
             model: "gemini-2.5-flash".to_string(),
             messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "What's the weather?".to_string(),
+                        metadata: None,
+                    }],
+                },
                 LlmMessage {
                     role: LlmRole::Assistant,
                     content: vec![ContentBlock::ToolUse {
@@ -1305,14 +1408,117 @@ mod tests {
         };
 
         let body = provider.build_body(&request);
+        let contents = body["contents"].as_array().unwrap();
         assert_eq!(
-            body["contents"][0]["parts"][0]["functionCall"]["name"],
+            contents[1]["parts"][0]["functionCall"]["name"],
             "get_weather"
         );
         assert_eq!(
-            body["contents"][0]["parts"][0]["thoughtSignature"],
+            contents[1]["parts"][0]["thoughtSignature"],
             "sig-tool"
         );
+    }
+
+    #[test]
+    fn test_build_gemini_contents_normalizes_trailing_assistant_text() {
+        let messages = vec![
+            LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                    metadata: None,
+                }],
+            },
+            LlmMessage {
+                role: LlmRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "Hi there!".to_string(),
+                    metadata: None,
+                }],
+            },
+        ];
+
+        let contents = build_gemini_contents(&messages);
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "Hello");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["text"], "Hi there!");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["text"], "Continue");
+    }
+
+    #[test]
+    fn test_build_gemini_contents_normalizes_trailing_assistant_tool_call() {
+        let messages = vec![
+            LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Check weather".to_string(),
+                    metadata: None,
+                }],
+            },
+            LlmMessage {
+                role: LlmRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: json!({"city": "SF"}),
+                    metadata: None,
+                }],
+            },
+        ];
+
+        let contents = build_gemini_contents(&messages);
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"]["result"],
+            "interrupted"
+        );
+    }
+
+    #[test]
+    fn test_build_gemini_contents_normalizes_leading_assistant() {
+        let messages = vec![
+            LlmMessage {
+                role: LlmRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "Initial assistant greeting".to_string(),
+                    metadata: None,
+                }],
+            },
+            LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "User reply".to_string(),
+                    metadata: None,
+                }],
+            },
+        ];
+
+        let contents = build_gemini_contents(&messages);
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "Hello");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["text"], "Initial assistant greeting");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["text"], "User reply");
+    }
+
+    #[test]
+    fn test_build_gemini_contents_normalizes_empty() {
+        let contents = build_gemini_contents(&[]);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "");
     }
 
     // ==================== SSE parsing tests ====================

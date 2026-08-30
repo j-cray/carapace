@@ -2069,15 +2069,31 @@ mod tests {
     fn test_gemini_adapter_build_body_preserves_text_thought_signature() {
         let request = CompletionRequest {
             model: "gemini-1.5-pro".to_string(),
-            messages: vec![LlmMessage {
-                role: LlmRole::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "Hello".to_string(),
-                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
-                        "sig-text".to_string(),
-                    )),
-                }],
-            }],
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Prompt".to_string(),
+                        metadata: None,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "Hello".to_string(),
+                        metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                            "sig-text".to_string(),
+                        )),
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Next".to_string(),
+                        metadata: None,
+                    }],
+                },
+            ],
             system: None,
             temperature: None,
             max_tokens: 100,
@@ -2086,9 +2102,10 @@ mod tests {
         };
 
         let body = build_gemini_body(&request);
-        assert_eq!(body["contents"][0]["parts"][0]["text"], "Hello");
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents[1]["parts"][0]["text"], "Hello");
         assert_eq!(
-            body["contents"][0]["parts"][0]["thoughtSignature"],
+            contents[1]["parts"][0]["thoughtSignature"],
             "sig-text"
         );
     }
@@ -2098,6 +2115,13 @@ mod tests {
         let request = CompletionRequest {
             model: "gemini-1.5-pro".to_string(),
             messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "What's the weather?".to_string(),
+                        metadata: None,
+                    }],
+                },
                 LlmMessage {
                     role: LlmRole::Assistant,
                     content: vec![ContentBlock::ToolUse {
@@ -2126,14 +2150,51 @@ mod tests {
         };
 
         let body = build_gemini_body(&request);
+        let contents = body["contents"].as_array().unwrap();
         assert_eq!(
-            body["contents"][0]["parts"][0]["functionCall"]["name"],
+            contents[1]["parts"][0]["functionCall"]["name"],
             "get_weather"
         );
         assert_eq!(
-            body["contents"][0]["parts"][0]["thoughtSignature"],
+            contents[1]["parts"][0]["thoughtSignature"],
             "sig-tool"
         );
+    }
+
+    #[test]
+    fn test_gemini_adapter_build_body_normalizes_trailing_assistant_turn() {
+        let request = CompletionRequest {
+            model: "vertex:gemini-1.5-pro".to_string(),
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Hello".to_string(),
+                        metadata: None,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "Hi there!".to_string(),
+                        metadata: None,
+                    }],
+                },
+            ],
+            system: None,
+            temperature: None,
+            max_tokens: 100,
+            tools: vec![],
+            extra: None,
+        };
+
+        let body = build_gemini_body(&request);
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["text"], "Continue");
     }
 
     #[test]
